@@ -12,6 +12,8 @@ from enum import IntEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
+import numpy as np
+
 if TYPE_CHECKING:
     from .stm_client import STMClient
 
@@ -31,6 +33,25 @@ class Channel:
     LOCKIN_X = "Lock-in X"
     LOCKIN_Y = "Lock-in Y"
     LOCKIN_R = "Lock-in R"
+
+
+# DATA.SCAN channel codes (verified against CreaTec example 4_Data_Analysis.py)
+class ScanDataChannel(IntEnum):
+    TOPOGRAPHY_FWD = 1
+    CURRENT_FWD = 2
+    CURRENT_BWD = 3
+    TOPOGRAPHY_BWD = 4
+    DF_FWD = 7
+    DAMPING_FWD = 8
+    AMPLITUDE_FWD = 9
+
+
+class ScanDataUnit(IntEnum):
+    """Unit codes accepted by getp('DATA.SCAN', (ch, unit))."""
+    NM = 4          # nanometres (topography)
+    AMPERE = 3      # amperes (current)
+    HZ = 5          # hertz (DF)
+    VOLT = 1        # volts (raw)
 
 
 @dataclass
@@ -210,3 +231,40 @@ class ScanController:
         if target:
             self.save_dat(target)
         return Path(target) if target else None
+
+    # ------------------------------------------------------------------
+    # Live data access (no disk round-trip — works during a scan)
+    # ------------------------------------------------------------------
+
+    def live_data(
+        self,
+        channel: int = ScanDataChannel.TOPOGRAPHY_FWD,
+        unit: int = ScanDataUnit.NM,
+    ) -> Optional[np.ndarray]:
+        """Pull the most recent scan data for a channel directly from the DSP.
+
+        Returns a 2-D numpy array (rows × cols) in physical units, or None
+        if no data is available yet. Works whether the scan is finished or
+        still in progress — partial rows show as zeros at the bottom.
+
+        Channel codes: see ``ScanDataChannel`` (1=Topo fwd, 2=I fwd, …).
+        Unit codes:    see ``ScanDataUnit`` (4=nm, 3=A, 5=Hz, 1=V).
+        """
+        try:
+            raw = self._c.getp("DATA.SCAN", (int(channel), int(unit)))
+        except Exception:
+            return None
+        if raw is None or len(raw) == 0:
+            return None
+        arr = np.asarray(raw, dtype=float)
+        nx, ny = self.pixels
+        if arr.size == nx * ny:
+            return arr.reshape(ny, nx)
+        return arr  # unexpected length — return flat for caller to inspect
+
+    def live_bitmap(self) -> Optional[bytes]:
+        """Pre-rendered RGB bitmap of the current scan from the DSP."""
+        try:
+            return self._c.raw.scandatabitmap()
+        except Exception:
+            return None

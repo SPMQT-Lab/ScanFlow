@@ -51,6 +51,8 @@ class AutomationRunner(QThread):
     drift_corrected = Signal(float, float)
     state_changed = Signal(object)
     error = Signal(str)
+    live_frame = Signal(object)         # numpy 2-D array, emitted ~2 Hz during scan
+    settling = Signal(int, str)         # remaining seconds, label
 
     def __init__(self, stm: STMClient, recipe: MeasurementRecipe, parent=None) -> None:
         super().__init__(parent)
@@ -147,6 +149,12 @@ class AutomationRunner(QThread):
                 )
                 self._stm.scan.apply(params)
 
+                # Settling delay (allow lock-in / amplitude controllers to settle)
+                if step.settling_s > 0:
+                    self._sleep_with_progress(step.settling_s, f"Settling: {label}")
+                    if self._stop_requested:
+                        return
+
                 # Alignment scan + drift correction before the data scan
                 if recipe.drift_correction and self._reference_array is not None:
                     self._do_alignment_scan(recipe)
@@ -161,12 +169,24 @@ class AutomationRunner(QThread):
                         self._reference_timestamp = time.time()
 
                 if recipe.inter_step_delay_s > 0:
-                    time.sleep(recipe.inter_step_delay_s)
+                    self._sleep_with_progress(
+                        recipe.inter_step_delay_s, f"Inter-step pause"
+                    )
+
+    def _sleep_with_progress(self, seconds: float, label: str) -> None:
+        """Sleep emitting per-second updates so the GUI can show a countdown."""
+        end = time.time() + seconds
+        while True:
+            remaining = end - time.time()
+            if remaining <= 0 or self._stop_requested:
+                break
+            self.settling.emit(max(0, int(remaining)), label)
+            time.sleep(min(1.0, remaining))
 
     def _scan_and_save(self, recipe: MeasurementRecipe) -> Optional[Path]:
         scan = self._stm.scan
         scan.start()
-        if not scan.wait_until_done():
+        if not self._wait_for_scan_with_live_emit():
             return None
         save_target = ""
         if recipe.save_folder:
@@ -178,6 +198,36 @@ class AutomationRunner(QThread):
             scan.save_dat(str(self._stm.raw.savedatfilename))
         path = scan.last_saved_path()
         return path
+
+    def _wait_for_scan_with_live_emit(self, poll_interval_s: float = 0.5) -> bool:
+        """Wait for the active scan to finish, emitting live frames as it runs.
+
+        Uses the event bridge as a wake-up signal when available; otherwise
+        falls back to fixed-interval polling. Emits ``live_frame`` at most
+        once per ``poll_interval_s``.
+        """
+        scan = self._stm.scan
+        bridge = self._stm.events
+        # Give the DSP a moment to flip into SCANNING
+        for _ in range(3):
+            if scan.is_running:
+                break
+            bridge.consume_flag(timeout=poll_interval_s)
+        while scan.is_running:
+            if self._stop_requested:
+                scan.stop()
+                return False
+            self._wait_if_paused()
+            # Pull one live frame
+            try:
+                frame = scan.live_data()
+                if frame is not None:
+                    self.live_frame.emit(frame)
+            except Exception:
+                log.debug("live_data() raised", exc_info=True)
+            # Either wake on an event or sleep the polling interval
+            bridge.consume_flag(timeout=poll_interval_s)
+        return True
 
     def _do_alignment_scan(self, recipe: MeasurementRecipe) -> None:
         align_path = self._scan_and_save(recipe)

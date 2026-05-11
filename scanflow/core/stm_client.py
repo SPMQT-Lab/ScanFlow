@@ -42,6 +42,7 @@ class STMClient:
         from .afm import AFMController
         from .tipform import TipFormController
         from .temperature import TemperatureMonitor
+        from .events import EventBridge
 
         self.scan = ScanController(self)
         self.feedback = FeedbackController(self)
@@ -51,6 +52,7 @@ class STMClient:
         self.afm = AFMController(self)
         self.tipform = TipFormController(self)
         self.temperature = TemperatureMonitor(self)
+        self.events = EventBridge()
 
     # ------------------------------------------------------------------
     # Connection
@@ -65,6 +67,8 @@ class STMClient:
             status = self._stm.getp("STMAFM.SCANSTATUS", "")
             log.info("Connected to STMAFM (scanstatus=%s)", status)
             self._enable_dst_protection()
+            # Best-effort event subscription
+            self.events.attach()
             return True
         except Exception as e:
             log.warning("Could not connect to STMAFM: %s", e)
@@ -72,6 +76,7 @@ class STMClient:
             return False
 
     def disconnect(self) -> None:
+        self.events.detach()
         self._stm = None
 
     @property

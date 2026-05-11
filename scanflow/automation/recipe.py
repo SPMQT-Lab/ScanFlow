@@ -37,6 +37,7 @@ class ScanStep:
     const_height: bool = False
     channels: tuple[str, ...] = DEFAULT_CHANNELS
     preamp_exponent: int = 9
+    settling_s: float = 0.0    # delay after applying params before starting scan
     label: str = ""
     memo: str = ""
 

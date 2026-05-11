@@ -19,6 +19,8 @@ from scanflow.gui.panels.automation_panel import AutomationPanel
 from scanflow.gui.panels.spectroscopy_panel import SpectroscopyPanel
 from scanflow.gui.panels.drift_panel import DriftPanel
 from scanflow.gui.panels.log_panel import LogPanel
+from scanflow.gui.panels.live_view_panel import LiveViewPanel
+from scanflow.gui.panels.afm_tuning_panel import AFMTuningPanel
 from scanflow.gui.widgets.temperature_widget import TemperatureWidget
 from scanflow.gui import theme as _theme
 
@@ -72,14 +74,18 @@ class MainWindow(QMainWindow):
 
         self._coarse = CoarsePanel(self._stm)
         self._control = ControlPanel(self._stm)
+        self._live = LiveViewPanel(self._stm)
         self._spec = SpectroscopyPanel(self._stm)
+        self._afm_tuning = AFMTuningPanel(self._stm)
         self._automation = AutomationPanel(self._stm, session)
         self._drift = DriftPanel()
         self._log = LogPanel()
 
         self._tabs.addTab(self._coarse, "Coarse / Approach")
         self._tabs.addTab(self._control, "Scan Control")
+        self._tabs.addTab(self._live, "Live View")
         self._tabs.addTab(self._spec, "Spectroscopy")
+        self._tabs.addTab(self._afm_tuning, "AFM Tuning")
         self._tabs.addTab(self._automation, "Automation")
         self._tabs.addTab(self._drift, "Drift Monitor")
         self._tabs.addTab(self._log, "Log")
@@ -87,9 +93,12 @@ class MainWindow(QMainWindow):
         # Wire signals
         self._coarse.log_message.connect(self._log.append)
         self._spec.log_message.connect(self._log.append)
+        self._live.log_message.connect(self._log.append)
+        self._afm_tuning.log_message.connect(self._log.append)
         self._automation.runner_drift_measured.connect(self._drift.update_drift)
         self._automation.runner_scan_completed.connect(self._log.append)
         self._automation.runner_error.connect(self._log.append_error)
+        self._automation.runner_live_frame.connect(self._live.show_frame)
 
         # -- Status bar --
         self._status_bar = QStatusBar()

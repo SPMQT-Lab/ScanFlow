@@ -19,6 +19,8 @@ class AutomationPanel(QWidget):
     runner_scan_completed = Signal(str)
     runner_drift_measured = Signal(object)
     runner_error = Signal(str)
+    runner_live_frame = Signal(object)
+    runner_settling = Signal(int, str)
 
     def __init__(self, stm: STMClient, session: Session, parent=None) -> None:
         super().__init__(parent)
@@ -257,6 +259,9 @@ class AutomationPanel(QWidget):
         self._runner.drift_measured.connect(self.runner_drift_measured)
         self._runner.error.connect(self.runner_error)
         self._runner.state_changed.connect(self._on_state)
+        self._runner.live_frame.connect(self.runner_live_frame)
+        self._runner.settling.connect(self.runner_settling)
+        self._runner.settling.connect(self._on_settling)
         self._runner.start()
 
         self._start_btn.setEnabled(False)
@@ -275,6 +280,9 @@ class AutomationPanel(QWidget):
     def _on_progress(self, current: int, total: int, label: str) -> None:
         self._progress.setValue(current)
         self._status.setText(f"{current}/{total}: {label}")
+
+    def _on_settling(self, remaining_s: int, label: str) -> None:
+        self._status.setText(f"{label} ({remaining_s}s)")
 
     def _on_state(self, state) -> None:
         from scanflow.automation import RunnerState
