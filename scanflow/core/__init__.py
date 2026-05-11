@@ -7,6 +7,7 @@ from .spectroscopy import SpectroscopyController, IVTable
 from .afm import AFMController
 from .tipform import TipFormController, TipFormParams
 from .temperature import TemperatureMonitor
+from .lateral import LateralController, LateralParams
 
 __all__ = [
     "STMClient", "STMNotConnectedError",
@@ -18,4 +19,5 @@ __all__ = [
     "AFMController",
     "TipFormController", "TipFormParams",
     "TemperatureMonitor",
+    "LateralController", "LateralParams",
 ]

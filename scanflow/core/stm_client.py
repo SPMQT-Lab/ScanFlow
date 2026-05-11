@@ -12,7 +12,7 @@ raises STMNotConnectedError so the GUI can run in offline mode.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
 log = logging.getLogger(__name__)
 
@@ -31,8 +31,11 @@ class STMClient:
 
     PROG_ID = "pstmafm.stmafmrem"
 
+    USER_PROG_ID = "pstmafm.stmafmuser"  # crosscorr, getxypos, mtip_*
+
     def __init__(self) -> None:
         self._stm: Any = None
+        self._user: Any = None
         # Sub-controllers are created lazily to avoid circular imports
         from .scan import ScanController
         from .feedback import FeedbackController
@@ -42,6 +45,7 @@ class STMClient:
         from .afm import AFMController
         from .tipform import TipFormController
         from .temperature import TemperatureMonitor
+        from .lateral import LateralController
         from .events import EventBridge
 
         self.scan = ScanController(self)
@@ -52,6 +56,7 @@ class STMClient:
         self.afm = AFMController(self)
         self.tipform = TipFormController(self)
         self.temperature = TemperatureMonitor(self)
+        self.lateral = LateralController(self)
         self.events = EventBridge()
 
     # ------------------------------------------------------------------
@@ -67,17 +72,25 @@ class STMClient:
             status = self._stm.getp("STMAFM.SCANSTATUS", "")
             log.info("Connected to STMAFM (scanstatus=%s)", status)
             self._enable_dst_protection()
+            # Best-effort secondary dispatch for user-extension methods
+            try:
+                self._user = win32com.client.Dispatch(self.USER_PROG_ID)
+            except Exception as e:
+                log.info("User dispatch unavailable: %s", e)
+                self._user = None
             # Best-effort event subscription
             self.events.attach()
             return True
         except Exception as e:
             log.warning("Could not connect to STMAFM: %s", e)
             self._stm = None
+            self._user = None
             return False
 
     def disconnect(self) -> None:
         self.events.detach()
         self._stm = None
+        self._user = None
 
     @property
     def connected(self) -> bool:
@@ -116,6 +129,41 @@ class STMClient:
         """Return the underlying COM object for advanced/legacy calls."""
         self._require()
         return self._stm
+
+    @property
+    def user(self) -> Any:
+        """Return the ``pstmafm.stmafmuser`` COM object (crosscorr, getxypos, …).
+
+        Returns None if the secondary dispatch couldn't be acquired —
+        callers must guard accordingly.
+        """
+        return self._user
+
+    def crosscorr(self) -> Optional[Any]:
+        """Trigger the manufacturer's own cross-correlation drift detection.
+
+        Returns whatever the COM call returns (typically a tuple of shifts)
+        or None if the user dispatch is unavailable.
+        """
+        if self._user is None:
+            return None
+        try:
+            return self._user.crosscorr()
+        except Exception as e:
+            log.warning("crosscorr() failed: %s", e)
+            return None
+
+    def tip_xy_position(self) -> Optional[tuple[float, float]]:
+        """Read the current tip XY position via the user-extension COM."""
+        if self._user is None:
+            return None
+        try:
+            result = self._user.getxypos()
+            if result is None:
+                return None
+            return (float(result[0]), float(result[1]))
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
     # Misc
