@@ -8,6 +8,7 @@ from .afm import AFMController
 from .tipform import TipFormController, TipFormParams
 from .temperature import TemperatureMonitor
 from .lateral import LateralController, LateralParams
+from .safety import SafetyMonitor, SafetyConfig, SafetyStatus, SafetyViolation
 
 __all__ = [
     "STMClient", "STMNotConnectedError",
@@ -20,4 +21,5 @@ __all__ = [
     "TipFormController", "TipFormParams",
     "TemperatureMonitor",
     "LateralController", "LateralParams",
+    "SafetyMonitor", "SafetyConfig", "SafetyStatus", "SafetyViolation",
 ]

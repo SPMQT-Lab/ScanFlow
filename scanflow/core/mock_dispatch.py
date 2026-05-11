@@ -125,6 +125,33 @@ class MockDispatch:
         self._lock = threading.RLock()
         self.savedatfilename = "/tmp/mock_scan.dat"
         self.savevertfilename = "/tmp/mock_spec.VERT"
+        # Test hook: when non-None, getadcvalf returns this voltage so safety
+        # tests can simulate a tip crash without modifying the scan data.
+        self.mock_current_override_V: Optional[float] = None
+
+    # Test helpers -----------------------------------------------------
+
+    def simulate_tip_crash(self, current_nA: float = 5.0) -> None:
+        """Make the next current readings indicate the given crash level."""
+        preamp_exp = int(self._params.get("SCAN.PREAMPGAIN.EXPONENT", 9))
+        # current_A = V / 10^exp  → V = current_A * 10^exp
+        self.mock_current_override_V = (current_nA * 1e-9) * (10 ** preamp_exp)
+
+    def clear_tip_crash(self) -> None:
+        self.mock_current_override_V = None
+
+    def getadcvalf(self, board: int, channel: int) -> float:
+        """ADC0 channel0 = current preamp output (volts).
+
+        Tests override this via ``mock_current_override_V`` to simulate
+        a tip crash.
+        """
+        if self.mock_current_override_V is not None:
+            return float(self.mock_current_override_V)
+        # Idle current ~ setpoint, expressed at preamp output
+        setpoint_A = float(self._params.get("SCAN.SETPOINT.AMPERE", 1e-10))
+        preamp_exp = int(self._params.get("SCAN.PREAMPGAIN.EXPONENT", 9))
+        return setpoint_A * (10 ** preamp_exp) * (1.0 + 0.01 * (time.time() % 1))
 
     # ------------------------------------------------------------------
     # Core API

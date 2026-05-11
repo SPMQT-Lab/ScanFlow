@@ -119,6 +119,9 @@ class MainWindow(QMainWindow):
         self._automation.runner_scan_completed.connect(self._log.append)
         self._automation.runner_error.connect(self._log.append_error)
         self._automation.runner_live_frame.connect(self._live.show_frame)
+        self._automation.runner_safety_violation.connect(
+            lambda msg, _i: self._log.append_error(f"SAFETY ABORT: {msg}")
+        )
 
         # -- Status bar --
         self._status_bar = QStatusBar()

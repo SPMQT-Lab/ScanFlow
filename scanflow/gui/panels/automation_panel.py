@@ -21,6 +21,8 @@ class AutomationPanel(QWidget):
     runner_error = Signal(str)
     runner_live_frame = Signal(object)
     runner_settling = Signal(int, str)
+    runner_safety_violation = Signal(str, float)
+    runner_safety_reading = Signal(float)
 
     def __init__(self, stm: STMClient, session: Session, parent=None) -> None:
         super().__init__(parent)
@@ -120,6 +122,28 @@ class AutomationPanel(QWidget):
         self._dst_chk.setChecked(True)
         g.addWidget(self._dst_chk, 6, 0, 1, 4)
 
+        # Tip-crash safety controls
+        self._safety_chk = QCheckBox("Tip-crash safety abort")
+        self._safety_chk.setChecked(True)
+        g.addWidget(self._safety_chk, 9, 0, 1, 2)
+
+        g.addWidget(QLabel("|I| threshold (nA)"), 9, 2)
+        self._safety_threshold_nA = QDoubleSpinBox()
+        self._safety_threshold_nA.setRange(0.001, 1000.0)
+        self._safety_threshold_nA.setDecimals(3)
+        self._safety_threshold_nA.setValue(1.0)
+        g.addWidget(self._safety_threshold_nA, 9, 3)
+
+        g.addWidget(QLabel("Retract on abort (nm)"), 10, 0, 1, 2)
+        self._safety_retract_nm = QDoubleSpinBox()
+        self._safety_retract_nm.setRange(0.5, 1000.0)
+        self._safety_retract_nm.setDecimals(1)
+        self._safety_retract_nm.setValue(10.0)
+        g.addWidget(self._safety_retract_nm, 10, 2)
+
+        self._safety_label = QLabel("Live |I|: —")
+        g.addWidget(self._safety_label, 10, 3)
+
         g.addWidget(QLabel("Save folder"), 7, 0)
         self._save_folder = QLineEdit()
         self._save_folder.setPlaceholderText("(leave empty for STMAFM default)")
@@ -130,15 +154,15 @@ class AutomationPanel(QWidget):
 
         build = QPushButton("Build Recipe")
         build.clicked.connect(self._build_recipe)
-        g.addWidget(build, 8, 0, 1, 2)
+        g.addWidget(build, 11, 0, 1, 2)
 
         save = QPushButton("Save Recipe…")
         save.clicked.connect(self._save_recipe)
-        g.addWidget(save, 8, 2)
+        g.addWidget(save, 11, 2)
 
         load = QPushButton("Load Recipe…")
         load.clicked.connect(self._load_recipe)
-        g.addWidget(load, 8, 3)
+        g.addWidget(load, 11, 3)
 
         return box
 
@@ -213,6 +237,9 @@ class AutomationPanel(QWidget):
 
         self._recipe.suppress_dst_change = self._dst_chk.isChecked()
         self._recipe.save_folder = self._save_folder.text()
+        self._recipe.safety_enable = self._safety_chk.isChecked()
+        self._recipe.safety_max_current_A = self._safety_threshold_nA.value() * 1e-9
+        self._recipe.safety_retract_nm = self._safety_retract_nm.value()
         self._populate_table()
         self._status.setText(f"Recipe built: {self._recipe.name}")
 
@@ -262,6 +289,10 @@ class AutomationPanel(QWidget):
         self._runner.live_frame.connect(self.runner_live_frame)
         self._runner.settling.connect(self.runner_settling)
         self._runner.settling.connect(self._on_settling)
+        self._runner.safety_violation.connect(self.runner_safety_violation)
+        self._runner.safety_violation.connect(self._on_safety_violation)
+        self._runner.safety_reading.connect(self.runner_safety_reading)
+        self._runner.safety_reading.connect(self._on_safety_reading)
         self._runner.start()
 
         self._start_btn.setEnabled(False)
@@ -283,6 +314,35 @@ class AutomationPanel(QWidget):
 
     def _on_settling(self, remaining_s: int, label: str) -> None:
         self._status.setText(f"{label} ({remaining_s}s)")
+
+    def _on_safety_reading(self, current_A: float) -> None:
+        nA = current_A * 1e9
+        threshold_nA = self._safety_threshold_nA.value()
+        # Colour the readout: green well under, amber near threshold, red over
+        if nA >= threshold_nA:
+            colour = "#C75100"
+        elif nA >= 0.5 * threshold_nA:
+            colour = "#B58100"
+        else:
+            colour = "#1E7A1E"
+        self._safety_label.setText(
+            f"<span style='color:{colour}'>Live |I|: {nA:.3f} nA</span>"
+        )
+
+    def _on_safety_violation(self, message: str, current_A: float) -> None:
+        nA = current_A * 1e9
+        self._safety_label.setText(
+            f"<b><span style='color:#C75100'>⚠ SAFETY ABORT — "
+            f"|I|={nA:.3f} nA</span></b>"
+        )
+        self._status.setText(f"SAFETY ABORT: {message}")
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.critical(
+            self, "Tip-crash safety triggered",
+            f"{message}\n\n"
+            f"The scan has been stopped and the Z-limit activated to retract "
+            f"the tip. Investigate the surface before resuming."
+        )
 
     def _on_state(self, state) -> None:
         from scanflow.automation import RunnerState

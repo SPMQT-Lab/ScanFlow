@@ -148,6 +148,12 @@ class MeasurementRecipe:
     suppress_dst_change: bool = True
     stop_on_error: bool = True
 
+    # Tip-crash safety
+    safety_max_current_A: float = 1e-9        # 1 nA — tip-crash indicator
+    safety_enable: bool = True
+    safety_retract_nm: float = 10.0
+    safety_poll_interval_s: float = 0.5
+
     # ------------------------------------------------------------------
 
     def add_step(self, step: RecipeStep) -> None:

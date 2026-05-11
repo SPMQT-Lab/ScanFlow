@@ -16,7 +16,10 @@ import numpy as np
 
 from PySide6.QtCore import QThread, Signal
 
-from scanflow.core import STMClient, STMNotConnectedError, ScanParams, IVTable
+from scanflow.core import (
+    STMClient, STMNotConnectedError, ScanParams, IVTable,
+    SafetyMonitor, SafetyConfig, SafetyViolation,
+)
 from scanflow.automation.recipe import (
     MeasurementRecipe, ScanStep, SpectroscopyStep, ApproachStep, WaitStep,
 )
@@ -55,6 +58,8 @@ class AutomationRunner(QThread):
     error = Signal(str)
     live_frame = Signal(object)         # numpy 2-D array, emitted ~2 Hz during scan
     settling = Signal(int, str)         # remaining seconds, label
+    safety_violation = Signal(str, float)  # message, |I| in amperes
+    safety_reading = Signal(float)      # latest |I| reading in amperes
 
     def __init__(self, stm: STMClient, recipe: MeasurementRecipe, parent=None) -> None:
         super().__init__(parent)
@@ -66,6 +71,11 @@ class AutomationRunner(QThread):
         self._detector: Optional[DriftDetector] = None
         self._reference_array: Optional[np.ndarray] = None
         self._reference_timestamp: Optional[float] = None
+        self._safety = SafetyMonitor(SafetyConfig(
+            max_current_A=recipe.safety_max_current_A,
+            enable_current_check=recipe.safety_enable,
+            retract_on_violation_nm=recipe.safety_retract_nm,
+        ))
 
     # ------------------------------------------------------------------
     # Public controls
@@ -93,6 +103,14 @@ class AutomationRunner(QThread):
         self._set_state(RunnerState.RUNNING)
         try:
             self._execute()
+        except SafetyViolation as e:
+            log.error("SAFETY: %s", e)
+            self._safety.emergency_stop(self._stm)
+            current = e.current_A if e.current_A is not None else 0.0
+            self.safety_violation.emit(str(e), current)
+            self.error.emit(f"SAFETY ABORT: {e}")
+            self._set_state(RunnerState.ERROR)
+            return
         except STMNotConnectedError as e:
             log.error("STM disconnected: %s", e)
             self.error.emit(f"STM disconnected: {e}")
@@ -255,15 +273,19 @@ class AutomationRunner(QThread):
         path = scan.last_saved_path()
         return path
 
-    def _wait_for_scan_with_live_emit(self, poll_interval_s: float = 0.5) -> bool:
+    def _wait_for_scan_with_live_emit(self, poll_interval_s: Optional[float] = None) -> bool:
         """Wait for the active scan to finish, emitting live frames as it runs.
 
         Uses the event bridge as a wake-up signal when available; otherwise
         falls back to fixed-interval polling. Emits ``live_frame`` at most
-        once per ``poll_interval_s``.
+        once per ``poll_interval_s``. Checks the safety monitor every
+        iteration and raises ``SafetyViolation`` if the threshold is hit.
         """
         scan = self._stm.scan
         bridge = self._stm.events
+        recipe = self._recipe
+        if poll_interval_s is None:
+            poll_interval_s = recipe.safety_poll_interval_s
         # Give the DSP a moment to flip into SCANNING
         for _ in range(3):
             if scan.is_running:
@@ -274,7 +296,9 @@ class AutomationRunner(QThread):
                 scan.stop()
                 return False
             self._wait_if_paused()
-            # Pull one live frame
+            # Safety check — raises SafetyViolation if threshold exceeded
+            self._check_safety()
+            # Pull one live frame for the viewer
             try:
                 frame = scan.live_data()
                 if frame is not None:
@@ -284,6 +308,15 @@ class AutomationRunner(QThread):
             # Either wake on an event or sleep the polling interval
             bridge.consume_flag(timeout=poll_interval_s)
         return True
+
+    def _check_safety(self) -> None:
+        """Raise SafetyViolation if the current threshold is exceeded."""
+        status = self._safety.check(self._stm)
+        if status.measured_current_A is not None:
+            self.safety_reading.emit(abs(status.measured_current_A))
+        if not status.ok:
+            raise SafetyViolation(status.reason,
+                                  current_A=status.measured_current_A)
 
     def _do_alignment_scan(self, recipe: MeasurementRecipe) -> None:
         align_path = self._scan_and_save(recipe)
