@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scanflow"
+version = "0.1.0"
+description = "Semi-automated STM control and drift-corrected measurement portal for CreaTec instruments"
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6>=6.6",
+    "numpy>=1.24",
+    "scikit-image>=0.21",
+    "pyqtgraph>=0.13",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+createc = ["pywin32==228"]   # Windows-only, CreaTec COM interface
+dev = ["pytest", "pytest-qt", "ruff"]
+
+[project.scripts]
+scanflow = "scanflow.gui.app:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["scanflow*"]
+
+[tool.ruff]
+line-length = 100
