@@ -24,6 +24,7 @@ from scanflow.gui.panels.afm_tuning_panel import AFMTuningPanel
 from scanflow.gui.panels.advanced_spec_panel import AdvancedSpecPanel
 from scanflow.gui.panels.timespec_panel import TimeSpecPanel
 from scanflow.gui.panels.lateral_panel import LateralPanel
+from scanflow.gui.panels.parameter_panel import ParameterPanel
 from scanflow.gui.widgets.temperature_widget import TemperatureWidget
 from scanflow.gui import theme as _theme
 
@@ -61,6 +62,10 @@ class MainWindow(QMainWindow):
         connect_action.triggered.connect(self._connect_stm)
         toolbar.addAction(connect_action)
 
+        mock_action = QAction("Connect Mock", self)
+        mock_action.triggered.connect(self._connect_mock)
+        toolbar.addAction(mock_action)
+
         disconnect_action = QAction("Disconnect", self)
         disconnect_action.triggered.connect(self._disconnect_stm)
         toolbar.addAction(disconnect_action)
@@ -85,6 +90,7 @@ class MainWindow(QMainWindow):
         self._afm_tuning = AFMTuningPanel(self._stm)
         self._automation = AutomationPanel(self._stm, session)
         self._drift = DriftPanel()
+        self._params_panel = ParameterPanel(self._stm)
         self._log = LogPanel()
 
         self._tabs.addTab(self._coarse, "Coarse / Approach")
@@ -97,6 +103,7 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._afm_tuning, "AFM Tuning")
         self._tabs.addTab(self._automation, "Automation")
         self._tabs.addTab(self._drift, "Drift Monitor")
+        self._tabs.addTab(self._params_panel, "Parameters")
         self._tabs.addTab(self._log, "Log")
 
         # Wire signals
@@ -107,6 +114,7 @@ class MainWindow(QMainWindow):
         self._adv_spec.log_message.connect(self._log.append)
         self._timespec.log_message.connect(self._log.append)
         self._lateral.log_message.connect(self._log.append)
+        self._params_panel.log_message.connect(self._log.append)
         self._automation.runner_drift_measured.connect(self._drift.update_drift)
         self._automation.runner_scan_completed.connect(self._log.append)
         self._automation.runner_error.connect(self._log.append_error)
@@ -152,12 +160,22 @@ class MainWindow(QMainWindow):
                 "ScanFlow will continue in offline mode.",
             )
 
+    def _connect_mock(self) -> None:
+        ok = self._stm.connect_mock()
+        if ok:
+            self._stm_label.setText("STM: mock")
+            self._log.append("Mock STM connected — offline simulation mode")
+            self._control.refresh()
+
     def _disconnect_stm(self) -> None:
         self._stm.disconnect()
         self._stm_label.setText("STM: disconnected")
         self._log.append("STM disconnected")
 
     def _refresh_status(self) -> None:
+        if self._stm.is_mock:
+            self._stm_label.setText("STM: mock")
+            return
         connected = self._stm.connected
         self._stm_label.setText(f"STM: {'connected' if connected else 'disconnected'}")
 

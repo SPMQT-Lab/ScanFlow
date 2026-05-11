@@ -16,8 +16,10 @@ import numpy as np
 
 from PySide6.QtCore import QThread, Signal
 
-from scanflow.core import STMClient, STMNotConnectedError, ScanParams
-from scanflow.automation.recipe import MeasurementRecipe
+from scanflow.core import STMClient, STMNotConnectedError, ScanParams, IVTable
+from scanflow.automation.recipe import (
+    MeasurementRecipe, ScanStep, SpectroscopyStep, ApproachStep, WaitStep,
+)
 from scanflow.drift import DriftDetector, DriftResult
 
 log = logging.getLogger(__name__)
@@ -134,44 +136,98 @@ class AutomationRunner(QThread):
                 self.progress.emit(step_idx, total, label)
                 log.info("Starting %s", label)
 
-                # Apply scan parameters
-                params = ScanParams(
-                    bias_V=step.bias_V,
-                    setpoint_A=step.setpoint_A,
-                    size_nm=step.size_nm,
-                    speed_nm_s=step.speed_nm_s,
-                    pixels=step.pixels,
-                    rotation_deg=step.rotation_deg,
-                    const_height=step.const_height,
-                    channels=step.channels,
-                    preamp_exponent=step.preamp_exponent,
-                    memo=step.memo or label,
-                )
-                self._stm.scan.apply(params)
-
-                # Settling delay (allow lock-in / amplitude controllers to settle)
-                if step.settling_s > 0:
-                    self._sleep_with_progress(step.settling_s, f"Settling: {label}")
-                    if self._stop_requested:
-                        return
-
-                # Alignment scan + drift correction before the data scan
-                if recipe.drift_correction and self._reference_array is not None:
-                    self._do_alignment_scan(recipe)
-
-                # Data scan
-                dat_path = self._scan_and_save(recipe)
-                if dat_path:
-                    log.info("Saved: %s", dat_path)
-                    self.scan_completed.emit(str(dat_path))
-                    if self._reference_array is None and recipe.drift_correction:
-                        self._reference_array = self._load_channel(dat_path, recipe.drift_channel)
-                        self._reference_timestamp = time.time()
+                kind = getattr(step, "kind", "scan")
+                if kind == "scan":
+                    self._do_scan_step(step, recipe, label)
+                elif kind == "spectroscopy":
+                    self._do_spec_step(step, label)
+                elif kind == "approach":
+                    self._do_approach_step(step, label)
+                elif kind == "wait":
+                    self._sleep_with_progress(
+                        step.seconds, label or "Wait")
+                else:
+                    log.warning("Unknown step kind: %s — skipping", kind)
 
                 if recipe.inter_step_delay_s > 0:
                     self._sleep_with_progress(
-                        recipe.inter_step_delay_s, f"Inter-step pause"
+                        recipe.inter_step_delay_s, "Inter-step pause"
                     )
+
+    def _do_scan_step(self, step: ScanStep,
+                      recipe: MeasurementRecipe, label: str) -> None:
+        params = ScanParams(
+            bias_V=step.bias_V,
+            setpoint_A=step.setpoint_A,
+            size_nm=step.size_nm,
+            speed_nm_s=step.speed_nm_s,
+            pixels=step.pixels,
+            rotation_deg=step.rotation_deg,
+            const_height=step.const_height,
+            channels=step.channels,
+            preamp_exponent=step.preamp_exponent,
+            memo=step.memo or label,
+        )
+        self._stm.scan.apply(params)
+
+        if step.settling_s > 0:
+            self._sleep_with_progress(step.settling_s, f"Settling: {label}")
+            if self._stop_requested:
+                return
+
+        if recipe.drift_correction and self._reference_array is not None:
+            self._do_alignment_scan(recipe)
+
+        dat_path = self._scan_and_save(recipe)
+        if dat_path:
+            log.info("Saved: %s", dat_path)
+            self.scan_completed.emit(str(dat_path))
+            if self._reference_array is None and recipe.drift_correction:
+                self._reference_array = self._load_channel(
+                    dat_path, recipe.drift_channel)
+                self._reference_timestamp = time.time()
+
+    def _do_spec_step(self, step: SpectroscopyStep, label: str) -> None:
+        table = IVTable(
+            bias_start_V=step.bias_start_V,
+            bias_end_V=step.bias_end_V,
+            points=step.points,
+            backward_sweep=step.backward_sweep,
+        )
+        self._stm.spec.configure(
+            table=table,
+            channels=step.channels,
+            duration_s=step.duration_s,
+            repeat_count=step.repeat_count,
+            average_count=step.average_count,
+            lat_speed_nm_s=step.lat_speed_nm_s,
+            preamp_exponent=step.preamp_exponent,
+        )
+        if step.settling_s > 0:
+            self._sleep_with_progress(step.settling_s, f"Settling: {label}")
+            if self._stop_requested:
+                return
+        if len(step.positions) == 1:
+            x, y = step.positions[0]
+            self._stm.spec.single_at_pixel(int(x), int(y))
+        else:
+            self._stm.spec.multi_at_pixels(list(step.positions))
+        log.info("Spec step finished: %s", label)
+
+    def _do_approach_step(self, step: ApproachStep, label: str) -> None:
+        from scanflow.core import ApproachConfig
+        cfg = ApproachConfig(
+            bias_V=step.bias_V,
+            target_current_A=step.setpoint_A,
+            burst_count=step.burst_count,
+            retry_count=step.retry_count,
+            period_s=step.period_s,
+        )
+        self._stm.coarse.configure_approach(cfg)
+        self._stm.coarse.start_approach()
+        if not self._stm.coarse.wait_for_approach(timeout_s=step.timeout_s):
+            self.error.emit(f"Approach timed out: {label}")
+        log.info("Approach step finished: %s", label)
 
     def _sleep_with_progress(self, seconds: float, label: str) -> None:
         """Sleep emitting per-second updates so the GUI can show a countdown."""

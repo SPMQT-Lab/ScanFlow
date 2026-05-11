@@ -80,6 +80,7 @@ class STMClient:
                 self._user = None
             # Best-effort event subscription
             self.events.attach()
+            self._is_mock = False
             return True
         except Exception as e:
             log.warning("Could not connect to STMAFM: %s", e)
@@ -87,10 +88,24 @@ class STMClient:
             self._user = None
             return False
 
+    def connect_mock(self) -> bool:
+        """Attach to an in-process MockDispatch — works on any OS."""
+        from .mock_dispatch import MockDispatch, MockUserDispatch
+        self._stm = MockDispatch()
+        self._user = MockUserDispatch()
+        self._is_mock = True
+        log.info("Connected to MockSTM (offline simulation)")
+        return True
+
+    @property
+    def is_mock(self) -> bool:
+        return getattr(self, "_is_mock", False)
+
     def disconnect(self) -> None:
         self.events.detach()
         self._stm = None
         self._user = None
+        self._is_mock = False
 
     @property
     def connected(self) -> bool:
