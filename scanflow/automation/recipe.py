@@ -56,6 +56,18 @@ class ScanStep:
     memo: str = ""
     kind: str = "scan"
 
+    def estimate_duration_s(self) -> float:
+        """Estimate wall-clock duration for this scan in seconds.
+
+        Time per line = 2 × size_x / speed (forward + backward trace).
+        Total = lines × line_time + settling + a few seconds of overhead
+        (save, repositioning).
+        """
+        line_time_s = 2.0 * self.size_nm[0] / max(self.speed_nm_s, 0.01)
+        n_lines = self.pixels[1]
+        overhead_s = 4.0
+        return line_time_s * n_lines + overhead_s + self.settling_s
+
 
 @dataclass
 class SpectroscopyStep:
@@ -161,6 +173,29 @@ class MeasurementRecipe:
 
     def total_steps(self) -> int:
         return len(self.steps) * self.repetitions
+
+    def estimate_duration_s(self) -> float:
+        """Sum estimated durations of every step across all repetitions.
+
+        Includes an extra alignment-scan worth of time per step when
+        drift correction is enabled (the runner takes a quick alignment
+        image before each data scan).
+        """
+        per_iter = 0.0
+        for step in self.steps:
+            if hasattr(step, "estimate_duration_s"):
+                t = step.estimate_duration_s()
+            elif getattr(step, "kind", "") == "wait":
+                t = float(getattr(step, "seconds", 0.0))
+            elif getattr(step, "kind", "") == "approach":
+                t = float(getattr(step, "timeout_s", 30.0)) * 0.1  # typical
+            else:
+                t = 0.0
+            per_iter += t
+            if self.drift_correction and getattr(step, "kind", "scan") == "scan":
+                per_iter += t * 0.5
+            per_iter += self.inter_step_delay_s
+        return per_iter * self.repetitions
 
     def to_yaml(self) -> str:
         data = asdict(self)
@@ -299,3 +334,16 @@ class MeasurementRecipe:
             size_nm=size_nm, pixels=pixels, label="Overview after",
         ))
         return recipe
+
+
+def format_duration(seconds: float) -> str:
+    """Format a duration in seconds as e.g. '2 h 14 min' or '45 s'."""
+    if seconds < 60:
+        return f"{int(seconds)} s"
+    if seconds < 3600:
+        m = int(seconds // 60)
+        s = int(seconds % 60)
+        return f"{m} min {s} s"
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    return f"{h} h {m} min"
