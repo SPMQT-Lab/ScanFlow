@@ -20,7 +20,6 @@ from scanflow.core import STMClient
 from scanflow.io import Session
 from scanflow.gui.panels.sweep_panel import SweepPanel
 from scanflow.gui.panels.log_panel import LogPanel
-from scanflow.gui.widgets.temperature_widget import TemperatureWidget
 from scanflow.gui import theme as _theme
 
 _LOGO = Path(__file__).parents[2] / "Logo.png"
@@ -87,8 +86,6 @@ class MainWindow(QMainWindow):
         # -- Status bar --
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
-        self._temp_widget = TemperatureWidget(self._stm)
-        self._status_bar.addPermanentWidget(self._temp_widget)
         self._stm_label = QLabel("STM: disconnected")
         self._status_bar.addPermanentWidget(self._stm_label)
 
