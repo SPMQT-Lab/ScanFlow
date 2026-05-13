@@ -63,28 +63,37 @@ class SweepPanel(QWidget):
     def _build_scan_group(self) -> QGroupBox:
         box = QGroupBox("Scan frame")
         g = QGridLayout(box)
-        g.addWidget(QLabel("Size (nm)"), 0, 0)
-        self._size = QDoubleSpinBox()
-        self._size.setRange(0.1, 50000.0)
-        self._size.setDecimals(2)
-        self._size.setValue(50.0)
-        self._size.valueChanged.connect(self._refresh_estimate)
-        g.addWidget(self._size, 0, 1)
 
-        g.addWidget(QLabel("Speed (nm/s)"), 0, 2)
+        g.addWidget(QLabel("Size X (nm)"), 0, 0)
+        self._size_x = QDoubleSpinBox()
+        self._size_x.setRange(0.1, 50000.0)
+        self._size_x.setDecimals(2)
+        self._size_x.setValue(50.0)
+        self._size_x.valueChanged.connect(self._refresh_estimate)
+        g.addWidget(self._size_x, 0, 1)
+
+        g.addWidget(QLabel("Size Y (nm)"), 0, 2)
+        self._size_y = QDoubleSpinBox()
+        self._size_y.setRange(0.1, 50000.0)
+        self._size_y.setDecimals(2)
+        self._size_y.setValue(50.0)
+        self._size_y.valueChanged.connect(self._refresh_estimate)
+        g.addWidget(self._size_y, 0, 3)
+
+        g.addWidget(QLabel("Speed (nm/s)"), 1, 0)
         self._speed = QDoubleSpinBox()
         self._speed.setRange(0.01, 1000.0)
         self._speed.setDecimals(2)
         self._speed.setValue(50.0)
         self._speed.valueChanged.connect(self._refresh_estimate)
-        g.addWidget(self._speed, 0, 3)
+        g.addWidget(self._speed, 1, 1)
 
-        g.addWidget(QLabel("Pixels"), 1, 0)
+        g.addWidget(QLabel("Pixels"), 1, 2)
         self._pixels = QSpinBox()
         self._pixels.setRange(8, 8192)
         self._pixels.setValue(256)
         self._pixels.valueChanged.connect(self._refresh_estimate)
-        g.addWidget(self._pixels, 1, 1)
+        g.addWidget(self._pixels, 1, 3)
         return box
 
     def _build_sweep_group(self) -> QGroupBox:
@@ -197,9 +206,18 @@ class SweepPanel(QWidget):
         self._stop_btn.setEnabled(False)
         self._stop_btn.clicked.connect(self._stop_run)
         g.addWidget(self._stop_btn, 0, 2)
+        self._force_quit_btn = QPushButton("Force Quit")
+        self._force_quit_btn.setProperty("accent", "true")
+        self._force_quit_btn.setEnabled(False)
+        self._force_quit_btn.setToolTip(
+            "Hard-terminate the automation thread. Use only if Stop hangs — "
+            "the STM may be left in an unclean state."
+        )
+        self._force_quit_btn.clicked.connect(self._force_quit_run)
+        g.addWidget(self._force_quit_btn, 0, 3)
         save_btn = QPushButton("Save recipe…")
         save_btn.clicked.connect(self._save_recipe)
-        g.addWidget(save_btn, 0, 3)
+        g.addWidget(save_btn, 0, 4)
         return box
 
     # ------------------------------------------------------------------
@@ -240,7 +258,7 @@ class SweepPanel(QWidget):
         return int(abs(b - a) / s + 1e-9) + 1
 
     def _build_recipe(self) -> MeasurementRecipe:
-        size = (self._size.value(), self._size.value())
+        size = (self._size_x.value(), self._size_y.value())
         pixels = (self._pixels.value(), self._pixels.value())
         speed = self._speed.value()
         drift = self._drift_chk.isChecked()
@@ -280,6 +298,33 @@ class SweepPanel(QWidget):
         self._count_label.setText(f"Number of scans: {recipe.total_steps()}")
         self._estimate_label.setText(
             f"Estimated total time: {format_duration(recipe.estimate_duration_s())}"
+        )
+
+    def load_from_stm(self) -> None:
+        """Read current Createc scan parameters and populate the panel fields."""
+        try:
+            params = self._stm.scan.read()
+        except Exception:
+            return
+        # Block signals while loading to avoid redundant estimate refreshes
+        for w in (self._size_x, self._size_y, self._speed, self._pixels):
+            w.blockSignals(True)
+        self._size_x.setValue(params.size_nm[0])
+        self._size_y.setValue(params.size_nm[1])
+        self._speed.setValue(params.speed_nm_s)
+        self._pixels.setValue(params.pixels[0])
+        # Populate setpoint or bias fixed value depending on current sweep kind
+        if self._kind.currentIndex() == 0:  # Bias ramp — fixed param is setpoint (pA)
+            self._fixed_value.setValue(params.setpoint_A * 1e12)
+        else:                               # Current ramp — fixed param is bias (V)
+            self._fixed_value.setValue(params.bias_V)
+        for w in (self._size_x, self._size_y, self._speed, self._pixels):
+            w.blockSignals(False)
+        self._refresh_estimate()
+        self.log_message.emit(
+            f"Loaded from Createc: "
+            f"X={params.size_nm[0]:.1f} nm  Y={params.size_nm[1]:.1f} nm  "
+            f"speed={params.speed_nm_s:.1f} nm/s  pixels={params.pixels[0]}"
         )
 
     # ------------------------------------------------------------------
@@ -341,6 +386,7 @@ class SweepPanel(QWidget):
         self._start_btn.setEnabled(False)
         self._pause_btn.setEnabled(True)
         self._stop_btn.setEnabled(True)
+        self._force_quit_btn.setEnabled(True)
 
     def _pause_run(self) -> None:
         if not self._runner:
@@ -353,8 +399,28 @@ class SweepPanel(QWidget):
             self._pause_btn.setText("Resume")
 
     def _stop_run(self) -> None:
-        if self._runner:
-            self._runner.stop()
+        if not self._runner:
+            return
+        # First click: graceful. Second: emergency retract.
+        stop_count_before = self._runner._stop_count
+        self._runner.stop()
+        if stop_count_before == 0:
+            self._stop_btn.setText("Emergency Stop")
+            self._status.setText("Stopping…")
+        else:
+            self._status.setText("Emergency stop — retracting tip…")
+
+    def _force_quit_run(self) -> None:
+        if not self._runner:
+            return
+        ans = QMessageBox.question(
+            self, "Force-terminate runner?",
+            "Hard-terminate the automation thread? The STM may be left in "
+            "an unclean state — only use this if Stop is not responding.",
+        )
+        if ans == QMessageBox.Yes:
+            self._status.setText("Force-terminating…")
+            self._runner.force_stop()
 
     # ── runner callbacks ────────────────────────────────────────────────
 
@@ -368,7 +434,9 @@ class SweepPanel(QWidget):
             self._start_btn.setEnabled(True)
             self._pause_btn.setEnabled(False)
             self._stop_btn.setEnabled(False)
+            self._force_quit_btn.setEnabled(False)
             self._pause_btn.setText("Pause")
+            self._stop_btn.setText("Stop")
 
     def _on_error(self, msg: str) -> None:
         self.error_message.emit(msg)

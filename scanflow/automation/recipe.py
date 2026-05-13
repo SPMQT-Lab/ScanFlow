@@ -26,6 +26,11 @@ from typing import Optional, List, Union
 
 DEFAULT_CHANNELS = ("TOPOGRAPHY", "CURRENT")
 
+# Minimum |bias| (V) allowed in constant-current mode. The feedback loop drives
+# the tip into the surface near 0 V because the tunnelling current cannot reach
+# the setpoint — leaving such a step in a ramp would crash the tip.
+MIN_CONST_CURRENT_BIAS_V = 5e-3  # 5 mV
+
 
 def _tuples_to_lists(obj):
     """Recursively convert tuples to lists so PyYAML's safe_dump can handle them."""
@@ -122,15 +127,27 @@ _STEP_CLASSES = {
 def _step_from_dict(d: dict) -> RecipeStep:
     kind = d.get("kind", "scan")
     cls = _STEP_CLASSES.get(kind, ScanStep)
-    # Coerce list → tuple for fixed-arity fields
     if cls is ScanStep:
-        d["size_nm"] = tuple(d.get("size_nm", (50.0, 50.0)))
-        d["pixels"] = tuple(d.get("pixels", (256, 256)))
+        d["size_nm"] = tuple(float(v) for v in d.get("size_nm", (50.0, 50.0)))
+        d["pixels"] = tuple(int(v) for v in d.get("pixels", (256, 256)))
         d["channels"] = tuple(d.get("channels", DEFAULT_CHANNELS))
+        for k in ("bias_V", "setpoint_A", "speed_nm_s", "rotation_deg", "settling_s"):
+            if k in d:
+                d[k] = float(d[k])
     elif cls is SpectroscopyStep:
-        d["positions"] = [tuple(p) for p in d.get("positions", [(128, 128)])]
+        d["positions"] = [tuple(int(v) for v in p) for p in d.get("positions", [(128, 128)])]
         d["channels"] = tuple(d.get("channels",
                                     ("Current(filtered)", "Lock-in X", "Lock-in Y")))
+        for k in ("bias_start_V", "bias_end_V", "duration_s", "lat_speed_nm_s", "settling_s"):
+            if k in d:
+                d[k] = float(d[k])
+    elif cls is ApproachStep:
+        for k in ("bias_V", "setpoint_A", "period_s", "timeout_s"):
+            if k in d:
+                d[k] = float(d[k])
+    elif cls is WaitStep:
+        if "seconds" in d:
+            d["seconds"] = float(d["seconds"])
     return cls(**d)
 
 
@@ -150,6 +167,8 @@ class MeasurementRecipe:
     drift_channel: int = 0
     drift_reposition_delay_s: float = 3.0
     drift_template: str = ""
+    # "phase" | "features" | "hybrid" — see scanflow.drift.detector.DriftDetector.
+    drift_method: str = "hybrid"
 
     # Execution
     repetitions: int = 1
@@ -213,6 +232,10 @@ class MeasurementRecipe:
         data = yaml.safe_load(text)
         steps_raw = data.pop("steps", [])
         steps = [_step_from_dict(dict(s)) for s in steps_raw]
+        for k in ("drift_reposition_delay_s", "inter_step_delay_s",
+                  "safety_max_current_A", "safety_retract_nm", "safety_poll_interval_s"):
+            if k in data:
+                data[k] = float(data[k])
         return cls(steps=steps, **data)
 
     @classmethod
@@ -235,11 +258,17 @@ class MeasurementRecipe:
         pixels: tuple[int, int] = (256, 256),
         drift_correction: bool = True,
         channels: tuple[str, ...] = DEFAULT_CHANNELS,
+        const_height: bool = False,
     ) -> "MeasurementRecipe":
         import numpy as np
         recipe = cls(name=f"Bias ramp {start_V:.2f}–{end_V:.2f} V",
                      drift_correction=drift_correction)
         for bias in np.linspace(start_V, end_V, steps):
+            # Constant-current scans at 0 V can never reach the setpoint —
+            # the feedback loop pushes the tip into the surface. Skip
+            # silently so the rest of the ramp still runs.
+            if not const_height and abs(float(bias)) < MIN_CONST_CURRENT_BIAS_V:
+                continue
             recipe.add_step(ScanStep(
                 bias_V=float(bias),
                 setpoint_A=setpoint_A,
@@ -247,6 +276,7 @@ class MeasurementRecipe:
                 speed_nm_s=speed_nm_s,
                 pixels=pixels,
                 channels=channels,
+                const_height=const_height,
                 label=f"{bias*1000:.1f} mV",
             ))
         return recipe

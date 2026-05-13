@@ -11,10 +11,28 @@ def test_overnight_recipe():
 
 
 def test_bias_ramp_recipe():
+    # 0 V is dropped automatically in constant-current mode — it would crash
+    # the tip — so a 11-point symmetric ramp produces 10 steps.
     r = MeasurementRecipe.bias_ramp(start_V=-0.5, end_V=0.5, steps=11, setpoint_A=100e-12)
-    assert len(r.steps) == 11
+    assert len(r.steps) == 10
     assert r.steps[0].bias_V == -0.5
     assert r.steps[-1].bias_V == 0.5
+    assert all(abs(s.bias_V) >= 1e-3 for s in r.steps)
+
+
+def test_bias_ramp_skips_zero():
+    """0 V is unreachable in constant-current mode; the runner skips it."""
+    r = MeasurementRecipe.bias_ramp(start_V=-0.01, end_V=0.01, steps=3, setpoint_A=50e-12)
+    biases = [s.bias_V for s in r.steps]
+    assert 0.0 not in biases
+    assert -0.01 in biases and 0.01 in biases
+
+
+def test_bias_ramp_const_height_keeps_zero():
+    """Constant-height scans CAN run at 0 V — feedback isn't engaged."""
+    r = MeasurementRecipe.bias_ramp(start_V=-0.01, end_V=0.01, steps=3,
+                                    setpoint_A=50e-12, const_height=True)
+    assert any(s.bias_V == 0.0 for s in r.steps)
 
 
 def test_current_ramp_recipe():

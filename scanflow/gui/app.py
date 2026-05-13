@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QLocale
 from PySide6.QtGui import QIcon
 
 from scanflow.io import Session
@@ -18,6 +19,9 @@ _LOGO = Path(__file__).parents[2] / "Logo.png"
 def main() -> None:
     session = Session.load()
     app = QApplication.instance() or QApplication(sys.argv)
+    # Force period as decimal separator regardless of system locale so that
+    # QDoubleSpinBox accepts "0.5" on any platform (German, French, etc. use comma).
+    QLocale.setDefault(QLocale(QLocale.Language.English, QLocale.Country.UnitedStates))
     app.setApplicationName("ScanFlow")
     app.setOrganizationName("SPMQT-Lab")
     app.setStyleSheet(STYLESHEET)

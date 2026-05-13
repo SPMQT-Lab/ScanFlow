@@ -22,6 +22,7 @@ from scanflow.core import (
 )
 from scanflow.automation.recipe import (
     MeasurementRecipe, ScanStep, SpectroscopyStep, ApproachStep, WaitStep,
+    MIN_CONST_CURRENT_BIAS_V,
 )
 from scanflow.drift import DriftDetector, DriftResult
 
@@ -67,6 +68,8 @@ class AutomationRunner(QThread):
         self._recipe = recipe
         self._state = RunnerState.IDLE
         self._stop_requested = False
+        self._stop_count = 0
+        self._emergency_stop_requested = False
         self._pause_requested = False
         self._detector: Optional[DriftDetector] = None
         self._reference_array: Optional[np.ndarray] = None
@@ -82,7 +85,24 @@ class AutomationRunner(QThread):
     # ------------------------------------------------------------------
 
     def stop(self) -> None:
+        """Request a graceful stop. A second call escalates to emergency stop.
+
+        Both flags are checked by the worker thread on every poll. The worker
+        thread does the actual scan.stop()/z_limit calls — COM proxies are
+        apartment-bound and cannot be touched from the GUI thread.
+        """
+        self._stop_count += 1
         self._stop_requested = True
+        if self._stop_count >= 2:
+            self._emergency_stop_requested = True
+
+    def force_stop(self) -> None:
+        """Hard-terminate the runner thread. Last resort if soft stop hangs."""
+        self._stop_requested = True
+        self._emergency_stop_requested = True
+        if self.isRunning():
+            self.terminate()
+            self.wait(2000)
 
     def pause(self) -> None:
         self._pause_requested = True
@@ -100,6 +120,10 @@ class AutomationRunner(QThread):
 
     def run(self) -> None:
         self._stop_requested = False
+        # COM proxies are apartment-bound — re-dispatch them on this worker
+        # thread before any setp/getp, otherwise the first call raises
+        # RPC_E_WRONG_THREAD ("interface marshalled for a different thread").
+        self._stm.bind_thread()
         self._set_state(RunnerState.RUNNING)
         try:
             self._execute()
@@ -121,6 +145,8 @@ class AutomationRunner(QThread):
             self.error.emit(str(e))
             self._set_state(RunnerState.ERROR)
             return
+        finally:
+            self._stm.unbind_thread()
         self._set_state(RunnerState.FINISHED)
 
     def _execute(self) -> None:
@@ -136,7 +162,10 @@ class AutomationRunner(QThread):
                 pass
 
         if recipe.drift_correction:
-            self._detector = DriftDetector(continuous=True)
+            self._detector = DriftDetector(
+                continuous=True,
+                method=getattr(recipe, "drift_method", "hybrid"),
+            )
 
         if recipe.drift_correction and recipe.drift_template:
             self._reference_array = self._load_channel(
@@ -174,6 +203,15 @@ class AutomationRunner(QThread):
 
     def _do_scan_step(self, step: ScanStep,
                       recipe: MeasurementRecipe, label: str) -> None:
+        # Hard guard against 0 V in constant-current mode — the feedback loop
+        # would drive the tip into the surface. Skip the step entirely.
+        if not step.const_height and abs(step.bias_V) < MIN_CONST_CURRENT_BIAS_V:
+            msg = (f"Skipping {label}: |bias|={abs(step.bias_V)*1000:.2f} mV "
+                   f"< {MIN_CONST_CURRENT_BIAS_V*1000:.2f} mV — constant-current "
+                   "scan at 0 V would crash the tip.")
+            log.warning(msg)
+            self.error.emit(msg)
+            return
         params = ScanParams(
             bias_V=step.bias_V,
             setpoint_A=step.setpoint_A,
@@ -195,6 +233,8 @@ class AutomationRunner(QThread):
 
         if recipe.drift_correction and self._reference_array is not None:
             self._do_alignment_scan(recipe)
+            if self._stop_requested:
+                return
 
         dat_path = self._scan_and_save(recipe)
         if dat_path:
@@ -292,6 +332,10 @@ class AutomationRunner(QThread):
                 break
             bridge.consume_flag(timeout=poll_interval_s)
         while scan.is_running:
+            if self._emergency_stop_requested:
+                log.warning("Emergency stop requested — retracting tip")
+                self._safety.emergency_stop(self._stm)
+                return False
             if self._stop_requested:
                 scan.stop()
                 return False
@@ -319,11 +363,18 @@ class AutomationRunner(QThread):
                                   current_A=status.measured_current_A)
 
     def _do_alignment_scan(self, recipe: MeasurementRecipe) -> None:
-        align_path = self._scan_and_save(recipe)
-        if not align_path or self._reference_array is None:
+        """Run a tracking scan and nudge the offset to keep features centred.
+
+        The alignment frame is captured via ``live_data()`` and *not* saved to
+        disk — previously every recipe step produced two .dat files at the
+        same bias (one alignment, one data), polluting the output series.
+        """
+        scan = self._stm.scan
+        scan.start()
+        if not self._wait_for_scan_with_live_emit():
             return
-        current_array = self._load_channel(align_path, recipe.drift_channel)
-        if current_array is None:
+        current_array = scan.live_data()
+        if current_array is None or self._reference_array is None:
             return
         cur_ts = time.time()
         result = self._detector.measure(
@@ -340,7 +391,8 @@ class AutomationRunner(QThread):
             result.magnitude_angstrom, result.confidence,
         )
         self._stm.scan.nudge_offset_pixels(result.dx_pixels, result.dy_pixels)
-        time.sleep(recipe.drift_reposition_delay_s)
+        self._sleep_with_progress(recipe.drift_reposition_delay_s,
+                                  "Drift reposition")
         self.drift_corrected.emit(result.dx_pixels, result.dy_pixels)
 
     def _wait_if_paused(self) -> None:

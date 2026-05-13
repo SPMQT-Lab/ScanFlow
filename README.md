@@ -16,10 +16,14 @@ hard tip-crash safety abort.
 
 - **Bias ramp** at constant tunneling current — sweep `V_start → V_end` in steps of e.g. 10 mV.
 - **Current ramp** at constant bias — sweep `I_start → I_end` in pA steps.
-- **Drift correction** between scans via phase cross-correlation.
-- **Tip-crash safety**: aborts the run and retracts the tip the moment `|I|` exceeds a configurable threshold (default 1 nA).
+- **Drift correction** between scans — hybrid algorithm tries feature-centroid tracking first (robust for sparse molecule images), falls back to phase cross-correlation if fewer than 3 features match.
+- **0 V bias guard** — steps at |V| < 5 mV are silently skipped in constant-current mode; the feedback loop cannot reach setpoint at zero bias and would crash the tip.
+- **Tip-crash safety** — aborts the run and retracts the tip the moment `|I|` exceeds a configurable threshold (default 1 nA).
+- **Independent X/Y scan frame sizes** — set non-square frames directly in the GUI.
+- **Auto-sync from Createc** — connecting to the STM reads the current scan size, speed, pixels, and setpoint directly from STMAFM and pre-fills the GUI.
+- **Emergency stop and Force Quit** — first Stop click is graceful; second click retracts the tip immediately; Force Quit hard-terminates the runner thread as a last resort.
 - **Time estimate** shown before every run.
-- **Mock STM** for offline testing.
+- **Mock STM** for offline testing on any OS.
 
 Two ways to use it:
 
@@ -44,8 +48,10 @@ python -m scanflow
 ```
 
 Two tabs:
-- **Sweep** — scan frame, sweep range, drift + safety toggles, Start/Pause/Stop.
-- **Log** — running events and errors.
+- **Sweep** — scan frame (Size X / Size Y independently), sweep range, drift + safety toggles, Start / Pause / Stop / Force Quit.
+- **Log** — running events, drift readings, and errors.
+
+**On connect**, ScanFlow reads the active STMAFM parameters (frame size, speed, pixel count, setpoint) and pre-fills the panel so you don't have to re-enter them.
 
 ### CLI
 
@@ -67,7 +73,7 @@ Common flags:
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--size` | Scan side length (nm) | 50 |
+| `--size` | Scan side length (nm, square) | 50 |
 | `--speed` | Scan speed (nm/s) | 50 |
 | `--pixels` | Resolution per side | 256 |
 | `--safety-nA` | Tip-crash threshold | 1.0 |
@@ -82,15 +88,29 @@ Every command prints the plan and estimated total time before starting:
 ```
 === ScanFlow plan: Bias ramp -1.00–1.00 V ===
   Mode      : Bias ramp -1.000 → 1.000 V  step 10.0 mV  @ 50.00 pA
-  Scans     : 201
+  Scans     : 200  (0 V step skipped automatically)
   Frame     : 50.0 × 50.0 nm, 256 × 256 px @ 50.0 nm/s
   Per scan  : ≈ 8 min 36 s
   Drift     : on   (adds ~50% alignment time)
   Safety    : on, threshold 1.000 nA
-  Estimated total time: 43 h 12 min
+  Estimated total time: 43 h 0 min
 
 Proceed? [y/N]
 ```
+
+## Drift correction
+
+When enabled, each data scan is preceded by an unpublished **alignment scan**:
+
+1. A full scan runs at the same parameters but is not saved to disk.
+2. The alignment frame is compared to the first scan of the series (the reference).
+3. A pixel-shift `(dx, dy)` is computed — first by matching molecule centroids (feature tracking), falling back to phase cross-correlation if fewer than 3 features can be matched reliably.
+4. The scan-frame XY offset is nudged by the measured shift.
+5. A short settle delay (3 s by default) lets the piezo stabilise before the data scan starts.
+
+This keeps the imaged region spatially registered across the whole sweep — essential for pixel-by-pixel comparison of bias-dependent images.
+
+The method is set per-recipe via `drift_method`: `"phase"`, `"features"`, or `"hybrid"` (default).
 
 ## Architecture
 
@@ -99,21 +119,21 @@ scanflow/
 ├── __main__.py            # entry point: GUI if no args, else CLI
 ├── cli.py                 # argparse-driven sweeps
 ├── core/                  # CreaTec COM facade (setp/getp API)
-│   ├── stm_client.py      #   STMClient — connect, sub-controllers
-│   ├── scan.py            #   ScanController — params, start/stop/save
+│   ├── stm_client.py      #   STMClient — thread-local COM proxies, connect/bind
+│   ├── scan.py            #   ScanController — params, start/stop/save, nudge offset
 │   ├── feedback.py        #   FeedbackController — bias, setpoint, ramps
-│   ├── safety.py          #   SafetyMonitor — current-threshold abort
-│   ├── mock_dispatch.py   #   Mock STM for offline development
-│   └── (others used by Python API: coarse, lockin, spectroscopy, afm, …)
+│   ├── safety.py          #   SafetyMonitor — current-threshold abort + retract
+│   ├── mock_dispatch.py   #   Mock STM for offline development / CI
+│   └── (others: coarse, lockin, spectroscopy, afm, lateral, …)
 ├── drift/
-│   └── detector.py        # Phase cross-correlation
+│   └── detector.py        # Hybrid drift: feature tracking + phase cross-correlation
 ├── automation/
 │   ├── recipe.py          # MeasurementRecipe (bias_ramp, current_ramp, …)
-│   └── runner.py          # QThread runner with safety hooks
+│   └── runner.py          # QThread runner — drift, safety, emergency stop
 ├── gui/
-│   ├── main_window.py     # Two tabs: Sweep + Log
+│   ├── main_window.py     # Two tabs: Sweep + Log; auto-sync on connect
 │   └── panels/
-│       ├── sweep_panel.py
+│       ├── sweep_panel.py # Size X/Y, sweep range, drift/safety, load_from_stm()
 │       └── log_panel.py
 └── io/
     └── session.py
@@ -126,7 +146,7 @@ pip install -e ".[dev]"
 pytest -v
 ```
 
-25 tests covering recipes, drift detection, mock STM, and the safety monitor.
+29 tests covering recipes, drift detection (phase and feature tracking), mock STM, safety monitor, and 0 V bias guard.
 
 ## License
 
