@@ -241,9 +241,16 @@ class AutomationRunner(QThread):
             log.info("Saved: %s", dat_path)
             self.scan_completed.emit(str(dat_path))
             if self._reference_array is None and recipe.drift_correction:
-                self._reference_array = self._load_channel(
-                    dat_path, recipe.drift_channel)
+                # live_data() is always available immediately after a scan —
+                # no createc file library dependency. Fall back to disk only
+                # if the DSP buffer is empty for some reason.
+                self._reference_array = self._stm.scan.live_data()
+                if self._reference_array is None:
+                    self._reference_array = self._load_channel(
+                        dat_path, recipe.drift_channel)
                 self._reference_timestamp = time.time()
+                if self._reference_array is not None:
+                    log.info("Drift reference captured — correction active from next scan")
 
     def _do_spec_step(self, step: SpectroscopyStep, label: str) -> None:
         table = IVTable(

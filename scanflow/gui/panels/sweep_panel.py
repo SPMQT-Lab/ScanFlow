@@ -467,9 +467,14 @@ class SweepPanel(QWidget):
 
     def _on_drift(self, result) -> None:
         try:
+            x_dir = "→" if result.dx_angstrom >= 0 else "←"
+            y_dir = "↓" if result.dy_angstrom >= 0 else "↑"
             self.log_message.emit(
-                f"drift: dx={result.dx_angstrom:+.3f} Å  dy={result.dy_angstrom:+.3f} Å  "
-                f"|d|={result.magnitude_angstrom:.3f} Å"
+                f"drift correction:  "
+                f"X {x_dir} {abs(result.dx_angstrom):.2f} Å  "
+                f"Y {y_dir} {abs(result.dy_angstrom):.2f} Å  "
+                f"total {result.magnitude_angstrom:.2f} Å  "
+                f"[{result.method}]"
             )
         except AttributeError:
             pass
