@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-createc = ["pywin32==228"]   # Windows-only, CreaTec COM interface
+createc = ["pywin32>=306"]   # Windows-only, CreaTec COM interface
 dev = ["pytest", "pytest-qt", "ruff"]
 
 [project.scripts]
