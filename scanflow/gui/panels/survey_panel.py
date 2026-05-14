@@ -224,9 +224,13 @@ class SurveyPanel(QWidget):
         self._stop_btn.clicked.connect(self._stop_run)
         g.addWidget(self._stop_btn, 0, 1)
 
-        self._export_btn = QPushButton("Export PPTX…")
+        self._export_btn = QPushButton("Open in ProbeFlow")
         self._export_btn.setEnabled(False)
-        self._export_btn.clicked.connect(self._export_pptx)
+        self._export_btn.setToolTip(
+            "Hand off the survey to ProbeFlow for visual enhancement of each "
+            "feature, then export to PPTX from there."
+        )
+        self._export_btn.clicked.connect(self._open_in_probeflow)
         g.addWidget(self._export_btn, 0, 2)
         return box
 
@@ -305,25 +309,22 @@ class SurveyPanel(QWidget):
             self._runner.stop()
             self._status.setText("Stopping…")
 
-    def _export_pptx(self) -> None:
+    def _open_in_probeflow(self) -> None:
         if self._last_manifest_path is None or not self._last_manifest_path.exists():
             QMessageBox.warning(self, "No survey", "Run a survey first.")
             return
-        default = str(self._last_manifest_path.with_suffix(".pptx"))
-        path, _ = QFileDialog.getSaveFileName(self, "Save PPTX", default,
-                                              "PowerPoint (*.pptx)")
-        if not path:
-            return
-        try:
-            from scanflow.automation import SurveyManifest
-            from scanflow.io import export_pptx
-            manifest = SurveyManifest.load(self._last_manifest_path)
-            export_pptx(manifest, Path(path))
-            self.log_message.emit(f"PPTX exported: {path}")
-            QMessageBox.information(self, "PPTX saved",
-                                    f"Wrote {Path(path).name}.")
-        except Exception as e:
-            self.error_message.emit(f"PPTX export failed: {e}")
+        from scanflow.io import open_survey_in_probeflow
+        if open_survey_in_probeflow(self._last_manifest_path):
+            self.log_message.emit(
+                f"Handing off to ProbeFlow: {self._last_manifest_path}"
+            )
+        else:
+            QMessageBox.warning(
+                self, "ProbeFlow not found",
+                "Could not launch ProbeFlow automatically.<br><br>"
+                "Open ProbeFlow yourself and load:<br>"
+                f"<code>{self._last_manifest_path}</code>"
+            )
 
     # ── runner callbacks ───────────────────────────────────────────────
 
