@@ -26,6 +26,7 @@ from scanflow.automation.recipe import (
 )
 from scanflow.automation.survey import SurveyConfig, FeatureRecord, SurveyManifest
 from scanflow.automation.feature_discovery import discover_features, FeatureCandidate
+from scanflow.automation.scan_metrics import compute_z_stability, format_z_stability
 from scanflow.drift import DriftDetector, DriftResult
 
 log = logging.getLogger(__name__)
@@ -69,6 +70,7 @@ class AutomationRunner(QThread):
     # (idx, total, char_dim_nm, dx_tip_nm, dy_tip_nm)
     survey_feature_done = Signal(object)                  # FeatureRecord
     survey_finished = Signal(str)                         # manifest path
+    z_stability = Signal(object)                          # dict from compute_z_stability
 
     def __init__(self, stm: STMClient, recipe: MeasurementRecipe, parent=None) -> None:
         super().__init__(parent)
@@ -250,6 +252,9 @@ class AutomationRunner(QThread):
         if dat_path:
             log.info("Saved: %s", dat_path)
             self.scan_completed.emit(str(dat_path))
+            # Z-stability snapshot: emit before reference handling so the GUI
+            # sees one line per data scan regardless of drift state.
+            self._emit_z_stability()
             if self._reference_array is None and recipe.drift_correction:
                 # live_data() is always available immediately after a scan —
                 # no createc file library dependency. Fall back to disk only
@@ -443,6 +448,11 @@ class AutomationRunner(QThread):
                 record.drift_log_angstrom.append((0.0, 0.0))
                 continue
 
+            # Z-stability for this iteration's data scan
+            stability = compute_z_stability(img)
+            self.z_stability.emit(stability)
+            record.z_stability_per_iter.append(stability)
+
             if output is not None:
                 preview = _save_image_preview(img, output / png_name)
                 if preview:
@@ -482,6 +492,20 @@ class AutomationRunner(QThread):
                     log.warning("nudge_offset_pixels failed: %s", e)
 
         return record
+
+    def _emit_z_stability(self) -> None:
+        """Pull the just-completed scan's topography and emit a stability metric."""
+        try:
+            img = self._stm.scan.live_data()
+        except Exception:
+            return
+        if img is None:
+            return
+        try:
+            metrics = compute_z_stability(img)
+            self.z_stability.emit(metrics)
+        except Exception:
+            log.debug("compute_z_stability failed", exc_info=True)
 
     def _scan_and_save_to(self, output: Optional[Path], filename: str) -> Optional[Path]:
         """Run one scan, save under ``output/filename`` if given, return path."""

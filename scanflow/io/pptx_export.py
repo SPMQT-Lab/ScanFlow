@@ -121,6 +121,20 @@ def export_pptx(
             value=f"dx = {rec.final_residual_angstrom[0]:+.2f} Å,  "
                   f"dy = {rec.final_residual_angstrom[1]:+.2f} Å",
         )
+
+        # Z stability — show the best (smallest RMS) of the iteration scans
+        z_iters = getattr(rec, "z_stability_per_iter", None) or []
+        if z_iters:
+            best = min(z_iters, key=lambda m: m.get("rms_pm", float("inf")))
+            _add_meta_line(
+                tf,
+                "Z stability",
+                value=(
+                    f"{best.get('rms_pm', 0):.1f} pm RMS  "
+                    f"({best.get('rating', '?')}, "
+                    f"{int(best.get('jumps', 0))} jump(s))"
+                ),
+            )
         if rec.scan_paths:
             _add_meta_line(tf, "Source", value=Path(rec.scan_paths[-1]).name, small=True)
 

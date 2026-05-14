@@ -66,6 +66,7 @@ class FeatureRecord:
     preview_paths: List[str] = field(default_factory=list)          # PNG previews
     drift_log_angstrom: List[Tuple[float, float]] = field(default_factory=list)
     final_residual_angstrom: Tuple[float, float] = (0.0, 0.0)
+    z_stability_per_iter: List[dict] = field(default_factory=list)  # one dict per scan
 
 
 @dataclass
@@ -97,6 +98,7 @@ class SurveyManifest:
             f["zoom_size_nm"] = tuple(f.get("zoom_size_nm", (5.0, 5.0)))
             f["drift_log_angstrom"] = [tuple(p) for p in f.get("drift_log_angstrom", [])]
             f["final_residual_angstrom"] = tuple(f.get("final_residual_angstrom", (0.0, 0.0)))
+            f.setdefault("z_stability_per_iter", [])
             features.append(FeatureRecord(**f))
         d["wide_size_nm"] = tuple(d.get("wide_size_nm", (120.0, 120.0)))
         d["wide_pixels"] = tuple(d.get("wide_pixels", (512, 512)))

@@ -295,6 +295,7 @@ class SurveyPanel(QWidget):
         self._runner.survey_feature_started.connect(self._on_feature_started)
         self._runner.survey_feature_done.connect(self._on_feature_done)
         self._runner.survey_finished.connect(self._on_survey_finished)
+        self._runner.z_stability.connect(self._on_z_stability)
         self._runner.scan_completed.connect(
             lambda p: self.log_message.emit(f"saved: {p}")
         )
@@ -364,6 +365,10 @@ class SurveyPanel(QWidget):
         self.log_message.emit(
             f"[{record.index:02d}] done — zoom {record.zoom_size_nm[0]:.1f} nm — {iters}"
         )
+
+    def _on_z_stability(self, metrics) -> None:
+        from scanflow.automation.scan_metrics import format_z_stability
+        self.log_message.emit(format_z_stability(metrics))
 
     def _on_survey_finished(self, manifest_path: str) -> None:
         self._last_manifest_path = Path(manifest_path)

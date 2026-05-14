@@ -380,6 +380,7 @@ class SweepPanel(QWidget):
         self._runner.safety_violation.connect(self._on_safety_violation)
         self._runner.safety_reading.connect(self._on_safety_reading)
         self._runner.drift_measured.connect(self._on_drift)
+        self._runner.z_stability.connect(self._on_z_stability)
         self._runner.start()
 
         self._progress.setMaximum(recipe.total_steps())
@@ -464,6 +465,10 @@ class SweepPanel(QWidget):
             f"{message}\n\n"
             f"Scan stopped, Z-limit activated. Investigate before resuming."
         )
+
+    def _on_z_stability(self, metrics) -> None:
+        from scanflow.automation.scan_metrics import format_z_stability
+        self.log_message.emit(format_z_stability(metrics))
 
     def _on_drift(self, result) -> None:
         try:
