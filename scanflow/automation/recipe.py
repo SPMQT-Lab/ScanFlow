@@ -23,6 +23,8 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional, List, Union
 
+from scanflow.automation.survey import SurveyConfig
+
 
 DEFAULT_CHANNELS = ("TOPOGRAPHY", "CURRENT")
 
@@ -114,13 +116,30 @@ class WaitStep:
     kind: str = "wait"
 
 
-RecipeStep = Union[ScanStep, SpectroscopyStep, ApproachStep, WaitStep]
+@dataclass
+class SurveyStep:
+    """Wide scan + auto feature discovery + per-feature zoom campaign."""
+    config: "SurveyConfig" = field(default_factory=lambda: SurveyConfig())
+    label: str = ""
+    kind: str = "survey"
+
+    def estimate_duration_s(self) -> float:
+        cfg = self.config
+        wide_t = (2.0 * cfg.wide_size_nm[0] / max(cfg.wide_speed_nm_s, 0.01)
+                  * cfg.wide_pixels[1] + 4.0)
+        zoom_t = (2.0 * cfg.min_zoom_nm / max(cfg.zoom_speed_nm_s, 0.01)
+                  * cfg.zoom_pixels[1] + 4.0)
+        return wide_t + cfg.max_features * cfg.zoom_iterations * zoom_t
+
+
+RecipeStep = Union[ScanStep, SpectroscopyStep, ApproachStep, WaitStep, SurveyStep]
 
 _STEP_CLASSES = {
     "scan": ScanStep,
     "spectroscopy": SpectroscopyStep,
     "approach": ApproachStep,
     "wait": WaitStep,
+    "survey": SurveyStep,
 }
 
 

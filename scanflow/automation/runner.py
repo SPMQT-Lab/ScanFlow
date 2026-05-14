@@ -22,8 +22,10 @@ from scanflow.core import (
 )
 from scanflow.automation.recipe import (
     MeasurementRecipe, ScanStep, SpectroscopyStep, ApproachStep, WaitStep,
-    MIN_CONST_CURRENT_BIAS_V,
+    SurveyStep, MIN_CONST_CURRENT_BIAS_V,
 )
+from scanflow.automation.survey import SurveyConfig, FeatureRecord, SurveyManifest
+from scanflow.automation.feature_discovery import discover_features, FeatureCandidate
 from scanflow.drift import DriftDetector, DriftResult
 
 log = logging.getLogger(__name__)
@@ -61,6 +63,12 @@ class AutomationRunner(QThread):
     settling = Signal(int, str)         # remaining seconds, label
     safety_violation = Signal(str, float)  # message, |I| in amperes
     safety_reading = Signal(float)      # latest |I| reading in amperes
+    # Survey campaign signals
+    survey_discovered = Signal(int)                       # number of features found
+    survey_feature_started = Signal(int, int, float, float, float)
+    # (idx, total, char_dim_nm, dx_tip_nm, dy_tip_nm)
+    survey_feature_done = Signal(object)                  # FeatureRecord
+    survey_finished = Signal(str)                         # manifest path
 
     def __init__(self, stm: STMClient, recipe: MeasurementRecipe, parent=None) -> None:
         super().__init__(parent)
@@ -193,6 +201,8 @@ class AutomationRunner(QThread):
                 elif kind == "wait":
                     self._sleep_with_progress(
                         step.seconds, label or "Wait")
+                elif kind == "survey":
+                    self._do_survey_step(step, label)
                 else:
                     log.warning("Unknown step kind: %s — skipping", kind)
 
@@ -278,6 +288,220 @@ class AutomationRunner(QThread):
         else:
             self._stm.spec.multi_at_pixels(list(step.positions))
         log.info("Spec step finished: %s", label)
+
+    def _do_survey_step(self, step: SurveyStep, label: str) -> None:
+        """Wide scan → feature discovery → per-feature zoom campaign.
+
+        Saves each scan plus a quick PNG preview, writes ``survey.json`` after
+        every feature so a partial / interrupted run still leaves usable data.
+        """
+        from datetime import datetime
+        cfg = step.config
+
+        output: Optional[Path] = None
+        if cfg.output_folder:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output = Path(cfg.output_folder) / f"survey_{stamp}"
+            output.mkdir(parents=True, exist_ok=True)
+
+        manifest = SurveyManifest(
+            name=cfg.name,
+            timestamp=datetime.now().isoformat(timespec="seconds"),
+            wide_size_nm=cfg.wide_size_nm,
+            wide_pixels=cfg.wide_pixels,
+        )
+
+        # --- 1. Wide scan -------------------------------------------------
+        self.progress.emit(0, 1, f"{cfg.name}: wide scan")
+        wide_params = ScanParams(
+            bias_V=cfg.bias_V,
+            setpoint_A=cfg.setpoint_A,
+            size_nm=cfg.wide_size_nm,
+            pixels=cfg.wide_pixels,
+            speed_nm_s=cfg.wide_speed_nm_s,
+            memo=f"{cfg.name} overview",
+        )
+        self._stm.scan.apply(wide_params)
+        wide_path = self._scan_and_save_to(output, "wide.dat")
+        if wide_path:
+            manifest.wide_scan_path = str(wide_path)
+            self.scan_completed.emit(str(wide_path))
+
+        wide_image = self._stm.scan.live_data()
+        if wide_image is None:
+            self.error.emit("Survey: no wide-scan image available — aborting")
+            return
+
+        if output is not None:
+            preview = _save_image_preview(wide_image, output / "wide.png")
+            if preview:
+                manifest.wide_preview_path = str(preview)
+
+        # --- 2. Discover features ----------------------------------------
+        nm_per_px = cfg.wide_size_nm[0] / max(cfg.wide_pixels[0], 1)
+        candidates = discover_features(
+            wide_image, nm_per_px,
+            min_feature_nm=cfg.min_feature_nm,
+            max_feature_nm=cfg.max_feature_nm,
+            size_multiplier=cfg.size_multiplier,
+            min_zoom_nm=cfg.min_zoom_nm,
+            max_zoom_nm=cfg.max_zoom_nm,
+            merge_distance_nm=cfg.merge_distance_nm,
+            edge_margin_px=cfg.edge_margin_px,
+            max_features=cfg.max_features,
+        )
+        self.survey_discovered.emit(len(candidates))
+        log.info("Survey: discovered %d feature(s)", len(candidates))
+
+        # Re-render the wide preview with numbered bounding boxes overlaid
+        if output is not None and candidates:
+            _save_overview_preview(wide_image, candidates, output / "wide_annotated.png")
+
+        # --- 3. Per-feature zoom loop ------------------------------------
+        for idx, cand in enumerate(candidates, start=1):
+            if self._stop_requested:
+                break
+            self._wait_if_paused()
+            record = self._do_feature_zoom(idx, len(candidates), cand, cfg, output, nm_per_px)
+            if record is not None:
+                manifest.features.append(record)
+                self.survey_feature_done.emit(record)
+            if output is not None:
+                manifest.save(output / "survey.json")
+
+        # --- 4. Finalise -------------------------------------------------
+        if output is not None:
+            manifest_path = output / "survey.json"
+            manifest.save(manifest_path)
+            self.survey_finished.emit(str(manifest_path))
+            log.info("Survey manifest written: %s", manifest_path)
+
+    def _do_feature_zoom(
+        self,
+        idx: int,
+        total: int,
+        cand: FeatureCandidate,
+        cfg: SurveyConfig,
+        output: Optional[Path],
+        wide_nm_per_px: float,
+    ) -> Optional[FeatureRecord]:
+        """Center the scan window on ``cand``, run ``zoom_iterations`` scans,
+        and report residual centering between iterations."""
+        # Tip displacement from wide-scan centre, in nm (just for logging)
+        wide_cx = cfg.wide_pixels[0] / 2.0
+        wide_cy = cfg.wide_pixels[1] / 2.0
+        dx_nm = (cand.cx_px - wide_cx) * wide_nm_per_px
+        dy_nm = (cand.cy_px - wide_cy) * wide_nm_per_px
+
+        self.survey_feature_started.emit(
+            idx, total, cand.char_dim_nm, dx_nm, dy_nm,
+        )
+
+        # Re-center scan window on the feature centroid
+        try:
+            self._stm.scan.set_offset_image_coord(int(cand.cx_px), int(cand.cy_px))
+        except Exception as e:
+            log.warning("set_offset_image_coord failed: %s", e)
+
+        zoom_params = ScanParams(
+            bias_V=cfg.bias_V,
+            setpoint_A=cfg.setpoint_A,
+            size_nm=cand.zoom_nm,
+            pixels=cfg.zoom_pixels,
+            speed_nm_s=cfg.zoom_speed_nm_s,
+            memo=f"{cfg.name} f{idx:02d}",
+        )
+        self._stm.scan.apply(zoom_params)
+
+        record = FeatureRecord(
+            index=idx,
+            centroid_pixels=(cand.cx_px, cand.cy_px),
+            centroid_nm_offset=(dx_nm, dy_nm),
+            char_dim_nm=cand.char_dim_nm,
+            zoom_size_nm=cand.zoom_nm,
+            bias_V=cfg.bias_V,
+            setpoint_A=cfg.setpoint_A,
+        )
+
+        zoom_nm_per_px = cand.zoom_nm[0] / max(cfg.zoom_pixels[0], 1)
+        zoom_cx = cfg.zoom_pixels[0] / 2.0
+        zoom_cy = cfg.zoom_pixels[1] / 2.0
+
+        for it in range(cfg.zoom_iterations):
+            if self._stop_requested:
+                break
+            dat_name = f"feature_{idx:02d}_iter{it+1}.dat"
+            png_name = f"feature_{idx:02d}_iter{it+1}.png"
+
+            path = self._scan_and_save_to(output, dat_name)
+            if path is not None:
+                record.scan_paths.append(str(path))
+                self.scan_completed.emit(str(path))
+
+            img = self._stm.scan.live_data()
+            if img is None:
+                record.drift_log_angstrom.append((0.0, 0.0))
+                continue
+
+            if output is not None:
+                preview = _save_image_preview(img, output / png_name)
+                if preview:
+                    record.preview_paths.append(str(preview))
+
+            # Re-detect dominant feature inside the zoom and measure its offset
+            # from the frame centre. Loose filters because the feature should
+            # fill a large fraction of the frame.
+            inner = discover_features(
+                img, zoom_nm_per_px,
+                min_feature_nm=cfg.min_feature_nm * 0.5,
+                max_feature_nm=cfg.max_feature_nm * 2.0,
+                size_multiplier=1.0,
+                min_zoom_nm=0.1,
+                max_zoom_nm=cand.zoom_nm[0],
+                merge_distance_nm=cfg.merge_distance_nm,
+                edge_margin_px=2,
+                max_features=1,
+            )
+            if not inner:
+                record.drift_log_angstrom.append((0.0, 0.0))
+                continue
+
+            ck = inner[0]
+            dx_px = ck.cx_px - zoom_cx
+            dy_px = ck.cy_px - zoom_cy
+            dx_a = dx_px * zoom_nm_per_px * 10.0  # nm → Å
+            dy_a = dy_px * zoom_nm_per_px * 10.0
+            record.drift_log_angstrom.append((float(dx_a), float(dy_a)))
+            record.final_residual_angstrom = (float(dx_a), float(dy_a))
+
+            # Re-centre for the next iteration (skip on the last one)
+            if it < cfg.zoom_iterations - 1 and (abs(dx_px) + abs(dy_px) > 0.5):
+                try:
+                    self._stm.scan.nudge_offset_pixels(-float(dx_px), -float(dy_px))
+                except Exception as e:
+                    log.warning("nudge_offset_pixels failed: %s", e)
+
+        return record
+
+    def _scan_and_save_to(self, output: Optional[Path], filename: str) -> Optional[Path]:
+        """Run one scan, save under ``output/filename`` if given, return path."""
+        scan = self._stm.scan
+        scan.start()
+        if not self._wait_for_scan_with_live_emit():
+            return None
+        if output is None:
+            try:
+                scan.save_dat(str(self._stm.raw.savedatfilename))
+            except Exception:
+                pass
+            return scan.last_saved_path()
+        target = output / filename
+        try:
+            scan.save_dat(str(target))
+        except Exception as e:
+            log.warning("save_dat failed for %s: %s", target, e)
+            return None
+        return target
 
     def _do_approach_step(self, step: ApproachStep, label: str) -> None:
         from scanflow.core import ApproachConfig
@@ -419,3 +643,60 @@ class AutomationRunner(QThread):
         except Exception as e:
             log.warning("Could not load channel %d from %s: %s", channel, path, e)
             return None
+
+
+def _save_image_preview(arr: np.ndarray, path: Path) -> Optional[Path]:
+    """Render a 2-D scan array as a greyscale PNG using matplotlib."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # headless backend
+        import matplotlib.pyplot as plt
+        from scanflow.drift.detector import _level_correct
+
+        levelled = _level_correct(arr.astype(float))
+        fig, ax = plt.subplots(figsize=(4, 4), dpi=150)
+        ax.imshow(levelled, cmap="afmhot", origin="lower")
+        ax.set_axis_off()
+        fig.tight_layout(pad=0)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(path, bbox_inches="tight", pad_inches=0)
+        plt.close(fig)
+        return path
+    except Exception as e:
+        log.warning("Could not write preview %s: %s", path, e)
+        return None
+
+
+def _save_overview_preview(
+    arr: np.ndarray,
+    candidates: list,
+    path: Path,
+) -> Optional[Path]:
+    """Render the wide scan with numbered boxes around each discovered feature."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+        from scanflow.drift.detector import _level_correct
+
+        levelled = _level_correct(arr.astype(float))
+        fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
+        ax.imshow(levelled, cmap="afmhot", origin="lower")
+        for i, c in enumerate(candidates, start=1):
+            min_row, min_col, max_row, max_col = c.bbox_px
+            rect = Rectangle((min_col, min_row), max_col - min_col, max_row - min_row,
+                             fill=False, edgecolor="cyan", linewidth=1.5)
+            ax.add_patch(rect)
+            ax.text(max_col + 2, min_row, str(i),
+                    color="cyan", fontsize=10, fontweight="bold",
+                    bbox=dict(facecolor="black", alpha=0.5, pad=1, edgecolor="none"))
+        ax.set_axis_off()
+        fig.tight_layout(pad=0)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(path, bbox_inches="tight", pad_inches=0.05)
+        plt.close(fig)
+        return path
+    except Exception as e:
+        log.warning("Could not write overview preview %s: %s", path, e)
+        return None

@@ -19,6 +19,7 @@ from PySide6.QtGui import QAction, QIcon, QPixmap
 from scanflow.core import STMClient
 from scanflow.io import Session
 from scanflow.gui.panels.sweep_panel import SweepPanel
+from scanflow.gui.panels.survey_panel import SurveyPanel
 from scanflow.gui.panels.log_panel import LogPanel
 from scanflow.gui import theme as _theme
 
@@ -75,13 +76,17 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self._tabs)
 
         self._sweep = SweepPanel(self._stm)
+        self._survey = SurveyPanel(self._stm)
         self._log = LogPanel()
 
         self._tabs.addTab(self._sweep, "Sweep")
+        self._tabs.addTab(self._survey, "Survey")
         self._tabs.addTab(self._log, "Log")
 
         self._sweep.log_message.connect(self._log.append)
         self._sweep.error_message.connect(self._log.append_error)
+        self._survey.log_message.connect(self._log.append)
+        self._survey.error_message.connect(self._log.append_error)
 
         # -- Status bar --
         self._status_bar = QStatusBar()
