@@ -236,6 +236,37 @@ class SurveyPanel(QWidget):
 
     # ------------------------------------------------------------------
 
+    def load_from_stm(self) -> None:
+        """Read current Createc scan parameters and pre-fill the wide-scan fields.
+
+        Called by the main window after a successful Connect so the campaign
+        starts from whatever you've already framed up in STMAFM rather than
+        the panel's hard-coded defaults.
+        """
+        try:
+            params = self._stm.scan.read()
+        except Exception:
+            return
+        for w in (self._wide_x, self._wide_y, self._wide_pixels,
+                  self._wide_speed, self._bias, self._setpoint):
+            w.blockSignals(True)
+        try:
+            self._wide_x.setValue(float(params.size_nm[0]))
+            self._wide_y.setValue(float(params.size_nm[1]))
+            self._wide_pixels.setValue(int(params.pixels[0]))
+            self._wide_speed.setValue(float(params.speed_nm_s))
+            self._bias.setValue(float(params.bias_V))
+            self._setpoint.setValue(float(params.setpoint_A) * 1e12)
+        finally:
+            for w in (self._wide_x, self._wide_y, self._wide_pixels,
+                      self._wide_speed, self._bias, self._setpoint):
+                w.blockSignals(False)
+        self.log_message.emit(
+            f"Survey loaded from Createc: "
+            f"X={params.size_nm[0]:.1f} nm  Y={params.size_nm[1]:.1f} nm  "
+            f"pixels={params.pixels[0]}  speed={params.speed_nm_s:.1f} nm/s"
+        )
+
     def _build_config(self) -> SurveyConfig:
         return SurveyConfig(
             wide_size_nm=(self._wide_x.value(), self._wide_y.value()),

@@ -106,6 +106,7 @@ class MainWindow(QMainWindow):
             self._stm_label.setText("STM: connected")
             self._log.append("Connected to STMAFM")
             self._sweep.load_from_stm()
+            self._survey.load_from_stm()
             QMessageBox.information(
                 self, "STM Connected",
                 "Successfully connected to the CreaTec STMAFM software."
