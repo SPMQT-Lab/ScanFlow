@@ -363,11 +363,19 @@ class AutomationRunner(QThread):
             _save_overview_preview(wide_image, candidates, output / "wide_annotated.png")
 
         # --- 3. Per-feature zoom loop ------------------------------------
+        # Track the cumulative wide-pixel target so we can nudge by the
+        # *delta* between consecutive features. We always restore the wide
+        # frame params before nudging, so the nm-per-pixel scale used by
+        # nudge_offset_pixels is the wide image's scale.
+        self._last_wide_px = (cfg.wide_pixels[0] / 2.0, cfg.wide_pixels[1] / 2.0)
+
         for idx, cand in enumerate(candidates, start=1):
             if self._stop_requested:
                 break
             self._wait_if_paused()
-            record = self._do_feature_zoom(idx, len(candidates), cand, cfg, output, nm_per_px)
+            record = self._do_feature_zoom(
+                idx, len(candidates), cand, cfg, output, nm_per_px, wide_params
+            )
             if record is not None:
                 manifest.features.append(record)
                 self.survey_feature_done.emit(record)
@@ -389,25 +397,48 @@ class AutomationRunner(QThread):
         cfg: SurveyConfig,
         output: Optional[Path],
         wide_nm_per_px: float,
+        wide_params: "ScanParams",
     ) -> Optional[FeatureRecord]:
         """Center the scan window on ``cand``, run ``zoom_iterations`` scans,
-        and report residual centering between iterations."""
-        # Tip displacement from wide-scan centre, in nm (just for logging)
+        and report residual centering between iterations.
+
+        Positioning: nudges the XY offset by the wide-frame pixel delta from the
+        previous feature's wide-pixel position. The wide frame params are
+        re-applied first so ``nudge_offset_pixels`` uses the wide nm-per-pixel
+        scale — not the previous feature's zoom scale, which would land the
+        next scan in the wrong place entirely.
+        """
         wide_cx = cfg.wide_pixels[0] / 2.0
         wide_cy = cfg.wide_pixels[1] / 2.0
-        dx_nm = (cand.cx_px - wide_cx) * wide_nm_per_px
-        dy_nm = (cand.cy_px - wide_cy) * wide_nm_per_px
+        dx_nm_log = (cand.cx_px - wide_cx) * wide_nm_per_px
+        dy_nm_log = (cand.cy_px - wide_cy) * wide_nm_per_px
 
         self.survey_feature_started.emit(
-            idx, total, cand.char_dim_nm, dx_nm, dy_nm,
+            idx, total, cand.char_dim_nm, dx_nm_log, dy_nm_log,
         )
 
-        # Re-center scan window on the feature centroid
+        # 1. Restore wide-frame params (preserves XY offset, sets nm-per-pixel
+        # scale so the next nudge is interpreted in wide-image pixels).
         try:
-            self._stm.scan.set_offset_image_coord(int(cand.cx_px), int(cand.cy_px))
+            self._stm.scan.apply(wide_params)
         except Exception as e:
-            log.warning("set_offset_image_coord failed: %s", e)
+            log.warning("could not re-apply wide params before nudge: %s", e)
 
+        # 2. Shift the offset by (target - previous) in wide-pixel units.
+        prev_x, prev_y = getattr(self, "_last_wide_px",
+                                 (wide_cx, wide_cy))
+        dx_px = float(cand.cx_px - prev_x)
+        dy_px = float(cand.cy_px - prev_y)
+        try:
+            self._stm.scan.nudge_offset_pixels(dx_px, dy_px)
+            self._last_wide_px = (float(cand.cx_px), float(cand.cy_px))
+            log.info("Feature %d nudge: Δpx=(%+0.2f, %+0.2f) → Δnm=(%+0.2f, %+0.2f)",
+                     idx, dx_px, dy_px,
+                     dx_px * wide_nm_per_px, dy_px * wide_nm_per_px)
+        except Exception as e:
+            log.warning("nudge_offset_pixels failed: %s", e)
+
+        # 3. Apply zoom params (the XY offset stays where we just placed it).
         zoom_params = ScanParams(
             bias_V=cfg.bias_V,
             setpoint_A=cfg.setpoint_A,
