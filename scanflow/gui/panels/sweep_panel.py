@@ -175,8 +175,19 @@ class SweepPanel(QWidget):
         self._drift_chk.toggled.connect(self._refresh_estimate)
         g.addWidget(self._drift_chk, 1, 0, 1, 2)
 
+        self._fast_align_chk = QCheckBox("Fast alignment (half-pixel)")
+        self._fast_align_chk.setChecked(False)
+        self._fast_align_chk.setToolTip(
+            "Run the alignment scan at half the data-scan pixel count for "
+            "roughly 2× faster alignment (~33% faster sweep overall). The "
+            "reference is downsampled on the fly to match; correlation "
+            "precision is slightly coarser but still sub-pixel."
+        )
+        self._fast_align_chk.toggled.connect(self._refresh_estimate)
+        g.addWidget(self._fast_align_chk, 1, 2, 1, 2)
+
         self._safety_label = QLabel("Live |I|: —")
-        g.addWidget(self._safety_label, 1, 2, 1, 2)
+        g.addWidget(self._safety_label, 3, 2, 1, 2)
 
         g.addWidget(QLabel("Settle before scan (s)"), 2, 0)
         self._settle_s = QDoubleSpinBox()
@@ -279,6 +290,7 @@ class SweepPanel(QWidget):
         n = self._ramp_step_count()
 
         settle = self._settle_s.value()
+        fast_align = self._fast_align_chk.isChecked()
         if self._kind.currentIndex() == 0:
             recipe = MeasurementRecipe.bias_ramp(
                 start_V=self._start.value(),
@@ -288,6 +300,7 @@ class SweepPanel(QWidget):
                 size_nm=size, pixels=pixels, speed_nm_s=speed,
                 drift_correction=drift,
                 settling_s=settle,
+                fast_alignment=fast_align,
             )
         else:
             recipe = MeasurementRecipe.current_ramp(
@@ -298,6 +311,7 @@ class SweepPanel(QWidget):
                 size_nm=size, pixels=pixels, speed_nm_s=speed,
                 drift_correction=drift,
                 settling_s=settle,
+                fast_alignment=fast_align,
             )
 
         recipe.save_folder = self._save_folder.text()

@@ -51,3 +51,42 @@ def test_recipe_yaml_roundtrip(tmp_path):
     assert r2.repetitions == 3
     assert r2.suppress_dst_change is True
     assert r2.steps[0].size_nm == (50.0, 50.0)
+
+
+def test_fast_alignment_defaults_false():
+    """Backward-compat: existing recipes don't set fast_alignment, so it
+    defaults to False and behaves like before."""
+    r = MeasurementRecipe.overnight(bias_V=0.1, setpoint_A=50e-12)
+    assert r.fast_alignment is False
+
+
+def test_fast_alignment_propagates_through_bias_ramp():
+    r = MeasurementRecipe.bias_ramp(
+        start_V=-0.5, end_V=0.5, steps=11, setpoint_A=50e-12,
+        fast_alignment=True,
+    )
+    assert r.fast_alignment is True
+
+
+def test_fast_alignment_shortens_estimate():
+    full = MeasurementRecipe.bias_ramp(
+        start_V=-0.5, end_V=0.5, steps=11, setpoint_A=50e-12,
+        fast_alignment=False,
+    )
+    fast = MeasurementRecipe.bias_ramp(
+        start_V=-0.5, end_V=0.5, steps=11, setpoint_A=50e-12,
+        fast_alignment=True,
+    )
+    assert full.drift_correction and fast.drift_correction
+    assert fast.estimate_duration_s() < full.estimate_duration_s()
+
+
+def test_fast_alignment_persists_through_yaml(tmp_path):
+    r = MeasurementRecipe.bias_ramp(
+        start_V=-0.5, end_V=0.5, steps=11, setpoint_A=50e-12,
+        fast_alignment=True,
+    )
+    path = tmp_path / "recipe.yaml"
+    r.save(path)
+    r2 = MeasurementRecipe.load(path)
+    assert r2.fast_alignment is True

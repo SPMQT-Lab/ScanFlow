@@ -244,7 +244,7 @@ class AutomationRunner(QThread):
                 return
 
         if recipe.drift_correction and self._reference_array is not None:
-            self._do_alignment_scan(recipe)
+            self._do_alignment_scan(recipe, data_params=params)
             if self._stop_requested:
                 return
 
@@ -663,23 +663,69 @@ class AutomationRunner(QThread):
             raise SafetyViolation(status.reason,
                                   current_A=status.measured_current_A)
 
-    def _do_alignment_scan(self, recipe: MeasurementRecipe) -> None:
+    def _do_alignment_scan(
+        self,
+        recipe: MeasurementRecipe,
+        data_params: Optional["ScanParams"] = None,
+    ) -> None:
         """Run a tracking scan and nudge the offset to keep features centred.
 
-        The alignment frame is captured via ``live_data()`` and *not* saved to
-        disk — previously every recipe step produced two .dat files at the
-        same bias (one alignment, one data), polluting the output series.
+        If ``recipe.fast_alignment`` is True and ``data_params`` is given,
+        the alignment scan runs at half the data-scan pixel count (same
+        physical area). The reference is downsampled to match for the
+        correlation, and the data-scan pixels are restored before the
+        caller's data scan starts. Halves the alignment scan's wall-clock
+        time at the cost of slightly coarser cross-correlation precision.
+
+        The alignment frame is captured via ``live_data()`` and *not* saved
+        to disk.
         """
+        from dataclasses import replace as _dc_replace
         scan = self._stm.scan
+
+        fast = bool(getattr(recipe, "fast_alignment", False)) and data_params is not None
+        if fast:
+            align_params = _dc_replace(
+                data_params,
+                pixels=(max(64, int(data_params.pixels[0]) // 2),
+                        max(64, int(data_params.pixels[1]) // 2)),
+                memo=f"{data_params.memo} (fast align)" if data_params.memo else "fast align",
+            )
+            scan.apply(align_params)
+
         scan.start()
         if not self._wait_for_scan_with_live_emit():
+            if fast and data_params is not None:
+                scan.apply(data_params)
             return
         current_array = scan.live_data()
         if current_array is None or self._reference_array is None:
+            if fast and data_params is not None:
+                scan.apply(data_params)
             return
+
+        # Cross-correlation needs matching shapes; downsample the full-res
+        # reference onto the alignment frame's grid if they differ.
+        ref_for_corr = self._reference_array
+        if fast and ref_for_corr.shape != current_array.shape:
+            try:
+                from skimage.transform import resize
+                ref_for_corr = resize(
+                    self._reference_array,
+                    current_array.shape,
+                    mode="reflect",
+                    anti_aliasing=True,
+                    preserve_range=True,
+                )
+            except Exception as e:
+                log.warning("Reference resize failed (%s); skipping alignment", e)
+                if data_params is not None:
+                    scan.apply(data_params)
+                return
+
         cur_ts = time.time()
         result = self._detector.measure(
-            reference=self._reference_array,
+            reference=ref_for_corr,
             current=current_array,
             ref_timestamp=self._reference_timestamp,
             cur_timestamp=cur_ts,
@@ -687,11 +733,22 @@ class AutomationRunner(QThread):
         )
         self.drift_measured.emit(result)
         log.info(
-            "Drift: dx=%.2f Å, dy=%.2f Å, magnitude=%.2f Å, confidence=%.2f",
+            "Drift%s: dx=%.2f Å, dy=%.2f Å, magnitude=%.2f Å, confidence=%.2f",
+            " (fast)" if fast else "",
             result.dx_angstrom, result.dy_angstrom,
             result.magnitude_angstrom, result.confidence,
         )
+
+        # Nudge *while* the alignment frame is still active so the pixel
+        # delta is interpreted in alignment-frame pixels (correct physical
+        # shift either way: dx_align_px × align_nm_per_px = dx_data_px ×
+        # data_nm_per_px, since size_nm is unchanged between modes).
         self._stm.scan.nudge_offset_pixels(result.dx_pixels, result.dy_pixels)
+
+        # Restore data-scan pixels before the caller's data scan starts.
+        if fast and data_params is not None:
+            scan.apply(data_params)
+
         self._sleep_with_progress(recipe.drift_reposition_delay_s,
                                   "Drift reposition")
         self.drift_corrected.emit(result.dx_pixels, result.dy_pixels)
