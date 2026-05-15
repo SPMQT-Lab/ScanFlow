@@ -327,6 +327,10 @@ class AutomationRunner(QThread):
             memo=f"{cfg.name} overview",
         )
         self._stm.scan.apply(wide_params)
+        if cfg.settling_s > 0:
+            self._sleep_with_progress(cfg.settling_s, f"{cfg.name}: wide settle")
+            if self._stop_requested:
+                return
         wide_path = self._scan_and_save_to(output, "wide.dat")
         if wide_path:
             manifest.wide_scan_path = str(wide_path)
@@ -468,6 +472,17 @@ class AutomationRunner(QThread):
                 break
             dat_name = f"feature_{idx:02d}_iter{it+1}.dat"
             png_name = f"feature_{idx:02d}_iter{it+1}.png"
+
+            # Pre-scan settle — lets the piezo / feedback / tip stabilise so
+            # the first scanline doesn't carry residual drift from the
+            # apply()/nudge() commands above.
+            if cfg.settling_s > 0:
+                self._sleep_with_progress(
+                    cfg.settling_s,
+                    f"f{idx:02d} iter{it+1} settle",
+                )
+                if self._stop_requested:
+                    break
 
             path = self._scan_and_save_to(output, dat_name)
             if path is not None:

@@ -199,17 +199,30 @@ class SurveyPanel(QWidget):
         self._setpoint.setValue(50.0)
         g.addWidget(self._setpoint, 0, 3)
 
-        g.addWidget(QLabel("Campaign name"), 1, 0)
-        self._name = QLineEdit("Survey")
-        g.addWidget(self._name, 1, 1, 1, 3)
+        g.addWidget(QLabel("Settle before scan (s)"), 1, 2)
+        self._settle_s = QDoubleSpinBox()
+        self._settle_s.setRange(0.0, 600.0)
+        self._settle_s.setDecimals(1)
+        self._settle_s.setSingleStep(1.0)
+        self._settle_s.setValue(5.0)
+        self._settle_s.setToolTip(
+            "Pause this many seconds before the wide scan and before each "
+            "feature zoom iteration — reduces residual XY drift after the "
+            "scan window has been repositioned."
+        )
+        g.addWidget(self._settle_s, 1, 3)
 
-        g.addWidget(QLabel("Output folder"), 2, 0)
+        g.addWidget(QLabel("Campaign name"), 2, 0)
+        self._name = QLineEdit("Survey")
+        g.addWidget(self._name, 2, 1, 1, 3)
+
+        g.addWidget(QLabel("Output folder"), 3, 0)
         self._output = QLineEdit()
         self._output.setPlaceholderText("(required for PPTX export)")
-        g.addWidget(self._output, 2, 1, 1, 2)
+        g.addWidget(self._output, 3, 1, 1, 2)
         pick = QPushButton("Browse…")
         pick.clicked.connect(self._pick_folder)
-        g.addWidget(pick, 2, 3)
+        g.addWidget(pick, 3, 3)
         return box
 
     def _build_run_group(self) -> QGroupBox:
@@ -285,6 +298,7 @@ class SurveyPanel(QWidget):
             edge_margin_px=self._edge_margin.value(),
             bias_V=self._bias.value(),
             setpoint_A=self._setpoint.value() * 1e-12,
+            settling_s=self._settle_s.value(),
             output_folder=self._output.text(),
             name=self._name.text() or "Survey",
         )
@@ -327,6 +341,7 @@ class SurveyPanel(QWidget):
         self._runner.survey_feature_done.connect(self._on_feature_done)
         self._runner.survey_finished.connect(self._on_survey_finished)
         self._runner.z_stability.connect(self._on_z_stability)
+        self._runner.settling.connect(self._on_settling)
         self._runner.scan_completed.connect(
             lambda p: self.log_message.emit(f"saved: {p}")
         )
@@ -396,6 +411,9 @@ class SurveyPanel(QWidget):
         self.log_message.emit(
             f"[{record.index:02d}] done — zoom {record.zoom_size_nm[0]:.1f} nm — {iters}"
         )
+
+    def _on_settling(self, remaining_s: int, label: str) -> None:
+        self._status.setText(f"{label} — {remaining_s} s")
 
     def _on_z_stability(self, metrics) -> None:
         from scanflow.automation.scan_metrics import format_z_stability

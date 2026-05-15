@@ -45,6 +45,11 @@ class SurveyConfig:
     bias_V: float = 0.1
     setpoint_A: float = 50e-12
 
+    # Pre-scan settle time — pauses after applying scan params and before
+    # acquiring data, letting the piezo / feedback / tip stabilise. Applied
+    # before the wide scan and before *each* zoom iteration of every feature.
+    settling_s: float = 5.0
+
     # Output
     output_folder: str = ""
     name: str = "Survey"

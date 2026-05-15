@@ -177,6 +177,20 @@ class SweepPanel(QWidget):
 
         self._safety_label = QLabel("Live |I|: —")
         g.addWidget(self._safety_label, 1, 2, 1, 2)
+
+        g.addWidget(QLabel("Settle before scan (s)"), 2, 0)
+        self._settle_s = QDoubleSpinBox()
+        self._settle_s.setRange(0.0, 600.0)
+        self._settle_s.setDecimals(1)
+        self._settle_s.setSingleStep(1.0)
+        self._settle_s.setValue(5.0)
+        self._settle_s.setToolTip(
+            "Pause this many seconds after applying scan parameters and "
+            "before each scan starts — lets the piezo and feedback settle "
+            "so the first scanline isn't biased by post-apply drift."
+        )
+        self._settle_s.valueChanged.connect(self._refresh_estimate)
+        g.addWidget(self._settle_s, 2, 1)
         return box
 
     def _build_output_group(self) -> QGroupBox:
@@ -264,6 +278,7 @@ class SweepPanel(QWidget):
         drift = self._drift_chk.isChecked()
         n = self._ramp_step_count()
 
+        settle = self._settle_s.value()
         if self._kind.currentIndex() == 0:
             recipe = MeasurementRecipe.bias_ramp(
                 start_V=self._start.value(),
@@ -272,6 +287,7 @@ class SweepPanel(QWidget):
                 setpoint_A=self._fixed_value.value() * 1e-12,
                 size_nm=size, pixels=pixels, speed_nm_s=speed,
                 drift_correction=drift,
+                settling_s=settle,
             )
         else:
             recipe = MeasurementRecipe.current_ramp(
@@ -281,6 +297,7 @@ class SweepPanel(QWidget):
                 bias_V=self._fixed_value.value(),
                 size_nm=size, pixels=pixels, speed_nm_s=speed,
                 drift_correction=drift,
+                settling_s=settle,
             )
 
         recipe.save_folder = self._save_folder.text()
@@ -381,6 +398,7 @@ class SweepPanel(QWidget):
         self._runner.safety_reading.connect(self._on_safety_reading)
         self._runner.drift_measured.connect(self._on_drift)
         self._runner.z_stability.connect(self._on_z_stability)
+        self._runner.settling.connect(self._on_settling)
         self._runner.start()
 
         self._progress.setMaximum(recipe.total_steps())
@@ -465,6 +483,9 @@ class SweepPanel(QWidget):
             f"{message}\n\n"
             f"Scan stopped, Z-limit activated. Investigate before resuming."
         )
+
+    def _on_settling(self, remaining_s: int, label: str) -> None:
+        self._status.setText(f"{label} — {remaining_s} s")
 
     def _on_z_stability(self, metrics) -> None:
         from scanflow.automation.scan_metrics import format_z_stability

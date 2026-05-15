@@ -129,7 +129,10 @@ class SurveyStep:
                   * cfg.wide_pixels[1] + 4.0)
         zoom_t = (2.0 * cfg.min_zoom_nm / max(cfg.zoom_speed_nm_s, 0.01)
                   * cfg.zoom_pixels[1] + 4.0)
-        return wide_t + cfg.max_features * cfg.zoom_iterations * zoom_t
+        n_zooms = cfg.max_features * cfg.zoom_iterations
+        # One pre-wide settle + one settle per zoom iteration
+        settle_t = cfg.settling_s * (1 + n_zooms)
+        return wide_t + n_zooms * zoom_t + settle_t
 
 
 RecipeStep = Union[ScanStep, SpectroscopyStep, ApproachStep, WaitStep, SurveyStep]
@@ -278,6 +281,7 @@ class MeasurementRecipe:
         drift_correction: bool = True,
         channels: tuple[str, ...] = DEFAULT_CHANNELS,
         const_height: bool = False,
+        settling_s: float = 0.0,
     ) -> "MeasurementRecipe":
         import numpy as np
         recipe = cls(name=f"Bias ramp {start_V:.2f}–{end_V:.2f} V",
@@ -296,6 +300,7 @@ class MeasurementRecipe:
                 pixels=pixels,
                 channels=channels,
                 const_height=const_height,
+                settling_s=settling_s,
                 label=f"{bias*1000:.1f} mV",
             ))
         return recipe
@@ -337,6 +342,7 @@ class MeasurementRecipe:
         speed_nm_s: float = 50.0,
         pixels: tuple[int, int] = (256, 256),
         drift_correction: bool = True,
+        settling_s: float = 0.0,
     ) -> "MeasurementRecipe":
         import numpy as np
         recipe = cls(name=f"Current ramp {start_pA:.1f}–{end_pA:.1f} pA",
@@ -348,6 +354,7 @@ class MeasurementRecipe:
                 size_nm=size_nm,
                 speed_nm_s=speed_nm_s,
                 pixels=pixels,
+                settling_s=settling_s,
                 label=f"{c_pA:.1f} pA",
             ))
         return recipe
