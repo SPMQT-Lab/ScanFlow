@@ -140,6 +140,24 @@ class MockDispatch:
     def clear_tip_crash(self) -> None:
         self.mock_current_override_V = None
 
+    def getdacvalfb(self) -> float:
+        """Synthetic Z piezo DAC value: exponential settle + slow drift + noise.
+
+        Mirrors the real Createc method ``stmafmrem.getdacvalfb()`` so the
+        Z-stability tab works end-to-end in mock mode for development.
+        """
+        t = time.time() - self._epoch
+        # Initial thermal settle: 5 Å decaying with τ ≈ 1 h
+        settle = 5.0 * math.exp(-t / 3600.0)
+        # Slow oscillation: ±0.5 Å, 10-min period
+        osc = 0.5 * math.sin(2 * math.pi * t / 600.0)
+        # Linear drift after settle: 1 Å/h
+        drift = (t / 3600.0) * 1.0
+        # White noise: 0.05 Å rms
+        rng = np.random.default_rng(int(t * 1000) % 1_000_000)
+        noise = float(rng.normal(scale=0.05))
+        return float(settle + osc + drift + noise)
+
     def getadcvalf(self, board: int, channel: int) -> float:
         """ADC0 channel0 = current preamp output (volts).
 
