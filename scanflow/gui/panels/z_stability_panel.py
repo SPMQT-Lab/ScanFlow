@@ -136,13 +136,27 @@ class ZStabilityPanel(QWidget):
             return
         t0 = float(ts[0])
         t_min_full = (ts - t0) / 60.0
-        zs_centered = zs - float(np.mean(zs))
+        latest_min = float(t_min_full[-1])
+
         if self._window_s:
-            cutoff = (float(ts[-1]) - t0) / 60.0 - self._window_s / 60.0
-            mask = t_min_full >= cutoff
+            # Show only samples in the last `window_s` and *pin* the X axis
+            # to that span so the user sees the window size even when the
+            # buffer is shorter than it.
+            window_min = float(self._window_s) / 60.0
+            cutoff_min = latest_min - window_min
+            mask = t_min_full >= cutoff_min
+            # Center on the visible mean so the y-zero matches the window
+            zs_visible = zs[mask]
+            zero = float(np.mean(zs_visible)) if zs_visible.size else float(np.mean(zs))
+            zs_centered = zs - zero
             self._curve.setData(t_min_full[mask], zs_centered[mask])
+            self._plot.setXRange(cutoff_min, latest_min, padding=0.02)
+            self._plot.enableAutoRange(axis='y', enable=True)
         else:
+            zs_centered = zs - float(np.mean(zs))
             self._curve.setData(t_min_full, zs_centered)
+            self._plot.enableAutoRange(axis='x', enable=True)
+            self._plot.enableAutoRange(axis='y', enable=True)
 
     def _refresh_stats(self) -> None:
         for row, sec in [(2, 5 * 60), (3, 60 * 60), (4, 3 * 60 * 60)]:
