@@ -17,12 +17,14 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QGridLayout,
     QLabel, QDoubleSpinBox, QSpinBox, QPushButton, QComboBox,
     QCheckBox, QProgressBar, QLineEdit, QFileDialog, QMessageBox,
+    QDialog,
 )
 from PySide6.QtCore import Signal, Qt
 
 from scanflow.core import STMClient
 from scanflow.automation import MeasurementRecipe, AutomationRunner, RunnerState
 from scanflow.automation.recipe import format_duration
+from scanflow.gui.widgets.sweep_confirm import SweepConfirmDialog
 
 
 class SweepPanel(QWidget):
@@ -388,17 +390,10 @@ class SweepPanel(QWidget):
             return
         self._recipe = recipe
 
-        # Confirmation dialog with the estimate
-        confirm = QMessageBox.question(
-            self, "Confirm sweep",
-            f"<b>{recipe.name}</b><br><br>"
-            f"Number of scans: {recipe.total_steps()}<br>"
-            f"Estimated total time: <b>{format_duration(recipe.estimate_duration_s())}</b><br>"
-            f"Drift correction: {'on' if recipe.drift_correction else 'off'}<br>"
-            f"Safety threshold: {recipe.safety_max_current_A*1e9:.3f} nA<br><br>"
-            f"Start now?"
-        )
-        if confirm != QMessageBox.Yes:
+        # Editable preview + voltage warnings; modifies recipe.steps in-place
+        # if the user tweaks anything, then returns Accepted/Rejected.
+        dlg = SweepConfirmDialog(recipe, parent=self)
+        if dlg.exec() != QDialog.Accepted:
             return
 
         self._runner = AutomationRunner(self._stm, recipe)
