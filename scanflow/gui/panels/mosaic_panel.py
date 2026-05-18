@@ -32,6 +32,7 @@ from scanflow.automation import (
     AutomationRunner, MeasurementRecipe, MosaicConfig, MosaicStep,
     RunnerState,
 )
+from scanflow.automation.recipe import format_duration
 
 
 class MosaicPanel(QWidget):
@@ -59,6 +60,18 @@ class MosaicPanel(QWidget):
         root.addWidget(self._build_wide_group())
         root.addWidget(self._build_tile_group())
         root.addWidget(self._build_shared_group())
+
+        # Live count + duration estimate, refreshed on any spinbox change.
+        estimate_row = QHBoxLayout()
+        self._count_label = QLabel("Scans: 0")
+        self._count_label.setStyleSheet("font-weight: bold;")
+        estimate_row.addWidget(self._count_label)
+        estimate_row.addStretch(1)
+        self._estimate_label = QLabel("Estimated total time: —")
+        self._estimate_label.setStyleSheet("font-weight: bold;")
+        estimate_row.addWidget(self._estimate_label)
+        root.addLayout(estimate_row)
+
         root.addWidget(self._build_run_group())
 
         self._progress = QProgressBar()
@@ -68,6 +81,15 @@ class MosaicPanel(QWidget):
         self._status = QLabel("Ready")
         root.addWidget(self._status)
         root.addStretch(1)
+
+        # Wire every parameter that affects the time estimate.
+        for w in (self._wide_x, self._wide_y, self._wide_pixels,
+                  self._wide_speed, self._tile_x, self._tile_y,
+                  self._tile_pixels, self._tile_speed, self._iters,
+                  self._settle):
+            w.valueChanged.connect(self._refresh_estimate)
+        self._auto_tile_check.toggled.connect(self._refresh_estimate)
+        self._refresh_estimate()
 
     def _build_wide_group(self) -> QGroupBox:
         box = QGroupBox("Wide overview (before + after)")
@@ -214,6 +236,26 @@ class MosaicPanel(QWidget):
         self._tile_x.setEnabled(not auto)
         self._tile_y.setEnabled(not auto)
 
+    def _refresh_estimate(self) -> None:
+        try:
+            cfg = self._build_config()
+            step = MosaicStep(config=cfg)
+            n_tiles = cfg.total_tiles()
+            n_iter = max(1, cfg.iterations_per_tile)
+            total = step.estimate_duration_s()
+        except Exception:
+            self._count_label.setText("Scans: —")
+            self._estimate_label.setText("Estimated total time: —")
+            return
+        n_scans = 2 + n_tiles * n_iter   # 2 wide + tiles × iters
+        self._count_label.setText(
+            f"Scans: <b>{n_scans}</b>  "
+            f"(2 wide + {n_tiles} tiles × {n_iter} iter)"
+        )
+        self._estimate_label.setText(
+            f"Estimated total time: <b>{format_duration(total)}</b>"
+        )
+
     def _build_config(self) -> MosaicConfig:
         return MosaicConfig(
             wide_size_nm=(self._wide_x.value(), self._wide_y.value()),
@@ -245,6 +287,8 @@ class MosaicPanel(QWidget):
         recipe.add_step(MosaicStep(config=cfg, label=cfg.name))
 
         n_tiles = cfg.total_tiles()
+        step_for_estimate = MosaicStep(config=cfg)
+        total_s = step_for_estimate.estimate_duration_s()
         confirm = QMessageBox.question(
             self, "Start mosaic",
             f"<b>{cfg.name}</b><br><br>"
@@ -254,7 +298,8 @@ class MosaicPanel(QWidget):
             f"= {n_tiles * cfg.iterations_per_tile} small scans<br>"
             f"Tile size: {cfg.resolved_tile_size_nm()[0]:.2f} × "
             f"{cfg.resolved_tile_size_nm()[1]:.2f} nm<br>"
-            f"Bias {cfg.bias_V:.3f} V, setpoint {cfg.setpoint_A * 1e12:.1f} pA<br><br>"
+            f"Bias {cfg.bias_V:.3f} V, setpoint {cfg.setpoint_A * 1e12:.1f} pA<br>"
+            f"Estimated total time: <b>{format_duration(total_s)}</b><br><br>"
             f"Start?",
         )
         if confirm != QMessageBox.Yes:
