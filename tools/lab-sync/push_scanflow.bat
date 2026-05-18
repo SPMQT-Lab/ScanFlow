@@ -17,8 +17,11 @@
 ::  delete files that no longer exist on dev), change /E to /MIR below.
 :: =====================================================================
 
-set "SRC=C:\Tools\ScanFlow"
-set "DST=\\LABPC\Tools\ScanFlow"
+set "SRC=C:\Users\ltspm\Desktop\scanflow"
+:: TODO: replace LABPC with the lab PC's hostname or IP, and the share name
+::       with whatever you exposed via Properties → Sharing on the lab PC.
+::       Example: \\LT-SPM-PC\scanflow   or   \\192.168.1.42\scanflow
+set "DST=\\LABPC\scanflow"
 
 :: --- Sanity: source must exist ---------------------------------------
 if not exist "%SRC%" (
