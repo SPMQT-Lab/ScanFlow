@@ -17,7 +17,13 @@
 ::  delete files that no longer exist on dev), change /E to /MIR below.
 :: =====================================================================
 
-set "SRC=C:\Users\ltspm\Desktop\scanflow"
+:: ScanFlow lives inside the WSL Ubuntu-24.04 distro on this dev PC.
+:: \\wsl.localhost\... is the Windows-visible UNC for any WSL filesystem;
+:: robocopy can read from it directly (CMD's 'cd' can't, but that's fine —
+:: this script doesn't cd into SRC). WSL must be running; double-clicking
+:: this .bat will spin it up on demand if needed.
+set "SRC=\\wsl.localhost\Ubuntu-24.04\home\xperiment\Playground-SPMQTLab\ScanFlow"
+
 :: Lab PC hostname is SMP-8HSN6L3. The 'scanflow' bit is the *share name*
 :: assigned when you shared the folder on the lab PC — adjust if you used
 :: a different share label. Test with: dir \\SMP-8HSN6L3\scanflow
