@@ -16,17 +16,25 @@
 
 :: --- Configuration ---------------------------------------------------
 :: Lab PC paths (user 'ltspm', ScanFlow synced to Desktop\scanflow).
-set "PYTHON=C:\Users\ltspm\Desktop\scanflow\venv\Scripts\python.exe"
+:: PYTHON is the system Python (no venv); ensure 'pillow' and 'pywin32'
+:: are installed there with:
+::     pip install pillow pywin32
+set "PYTHON=python"
 set "SCRIPT=C:\Users\ltspm\Desktop\scanflow\tools\lab-monitor\take_screenshots.py"
 set "OUTPUT=C:\ScanflowMonitor\screenshots"
 set "INTERVAL=300"
 :: --------------------------------------------------------------------
 
-if not exist "%PYTHON%" (
-    echo [ERROR] Python venv not found at: %PYTHON%
-    echo Edit this script and point PYTHON at your ScanFlow venv.
-    pause
-    exit /b 1
+:: When PYTHON is a bare command (e.g. "python") we let PATH resolve it
+:: and check via `where`. When it's a full path, fall back to `if exist`.
+where "%PYTHON%" >nul 2>&1
+if errorlevel 1 (
+    if not exist "%PYTHON%" (
+        echo [ERROR] Python not found on PATH or at: %PYTHON%
+        echo Either install Python or edit PYTHON= in this script.
+        pause
+        exit /b 1
+    )
 )
 if not exist "%SCRIPT%" (
     echo [ERROR] take_screenshots.py not found at: %SCRIPT%
