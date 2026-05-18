@@ -15,8 +15,9 @@
 :: =====================================================================
 
 :: --- Configuration ---------------------------------------------------
-set "PYTHON=C:\Tools\venv\Scripts\python.exe"
-set "SCRIPT=C:\Tools\ScanFlow\tools\lab-monitor\take_screenshots.py"
+:: Lab PC paths (user 'ltspm', ScanFlow synced to Desktop\scanflow).
+set "PYTHON=C:\Users\ltspm\Desktop\scanflow\venv\Scripts\python.exe"
+set "SCRIPT=C:\Users\ltspm\Desktop\scanflow\tools\lab-monitor\take_screenshots.py"
 set "OUTPUT=C:\ScanflowMonitor\screenshots"
 set "INTERVAL=300"
 :: --------------------------------------------------------------------
