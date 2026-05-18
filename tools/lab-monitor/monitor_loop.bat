@@ -22,7 +22,7 @@
 set "PYTHON=python"
 set "SCRIPT=C:\Users\ltspm\Desktop\scanflow\tools\lab-monitor\take_screenshots.py"
 set "OUTPUT=C:\ScanflowMonitor\screenshots"
-set "INTERVAL=300"
+set "INTERVAL=600"
 :: --------------------------------------------------------------------
 
 :: When PYTHON is a bare command (e.g. "python") we let PATH resolve it
