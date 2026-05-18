@@ -93,7 +93,8 @@ class ScanController:
 
     @size_nm.setter
     def size_nm(self, value: tuple[float, float]) -> None:
-        self._c.setp("SCAN.IMAGESIZE.NM", tuple(value))
+        self._c.setp("SCAN.IMAGESIZE.NM.X", float(value[0]))
+        self._c.setp("SCAN.IMAGESIZE.NM.Y", float(value[1]))
 
     @property
     def speed_nm_s(self) -> float:
@@ -111,7 +112,8 @@ class ScanController:
 
     @pixels.setter
     def pixels(self, value: tuple[int, int]) -> None:
-        self._c.setp("SCAN.IMAGESIZE.PIXEL", (int(value[0]), int(value[1])))
+        self._c.setp("SCAN.NUM.X", int(value[0]))
+        self._c.setp("SCAN.NUM.Y", int(value[1]))
 
     @property
     def rotation_deg(self) -> float:
@@ -161,22 +163,21 @@ class ScanController:
     def apply(self, params: ScanParams) -> None:
         """Apply a complete ScanParams object to the instrument.
 
-        Belt-and-braces on the size keys: write the tuple form and the
-        per-axis ``.X``/``.Y`` form. The CreaTec software persists X and Y
-        independently and the tuple-set didn't always update the X side —
-        a non-square frame asked for in ScanFlow could land as a 2 nm × Y nm
-        scan because X kept its previous value.
+        Pixels and physical size are written via *per-axis* keys only —
+        ``SCAN.NUM.X/Y`` and ``SCAN.IMAGESIZE.NM.X/Y``. The tuple-form
+        keys (``SCAN.IMAGESIZE.PIXEL`` and ``SCAN.IMAGESIZE.NM``) seem to
+        corrupt the X side on the real CreaTec STMAFM software (it ended
+        up showing X = 2 px / 2 nm after every Mosaic / Sweep apply()).
+        Per-axis writes are the reliable path.
         """
         c = self._c
         c.setp("SCAN.PREAMPGAIN.EXPONENT", int(params.preamp_exponent))
         c.setp("SCAN.BIASVOLTAGE.VOLT", float(params.bias_V))
         c.setp("SCAN.SETPOINT.AMPERE", float(params.setpoint_A))
-        # Pixels: tuple form + per-axis
-        c.setp("SCAN.IMAGESIZE.PIXEL", (int(params.pixels[0]), int(params.pixels[1])))
+        # Pixels — per-axis only
         c.setp("SCAN.NUM.X", int(params.pixels[0]))
         c.setp("SCAN.NUM.Y", int(params.pixels[1]))
-        # Physical size: tuple form + per-axis
-        c.setp("SCAN.IMAGESIZE.NM", (float(params.size_nm[0]), float(params.size_nm[1])))
+        # Physical size — per-axis only
         c.setp("SCAN.IMAGESIZE.NM.X", float(params.size_nm[0]))
         c.setp("SCAN.IMAGESIZE.NM.Y", float(params.size_nm[1]))
         c.setp("SCAN.SPEED.NM/SEC", float(params.speed_nm_s))
