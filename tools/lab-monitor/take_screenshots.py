@@ -1,16 +1,16 @@
-"""Take screenshots of ScanFlow, CreaTec STMAFM, and the whole desktop.
+"""Take screenshots of the lab PC: whole virtual desktop + each monitor.
 
-Runs on the LAB PC. Writes three PNG files per invocation into the
-configured output folder, named with a UTC timestamp so the dev PC's
-relay script can pick them up in order:
+Runs on the LAB PC. Writes ``1 + N`` PNG files per invocation, where N is
+the number of physical monitors detected, named with a UTC timestamp so
+the dev PC's relay script can pick them up in order:
 
-    20260515T143012Z_scanflow.png
-    20260515T143012Z_createc.png
-    20260515T143012Z_desktop.png
+    20260518T143012Z_desktop.png    ← virtual desktop, both monitors combined
+    20260518T143012Z_monitor1.png   ← primary monitor only
+    20260518T143012Z_monitor2.png   ← secondary monitor only
+    ...
 
-A window is grabbed by partial title match (case-insensitive). If the
-target window isn't found or is minimised, that capture is skipped and
-a warning is logged — the script never raises.
+A skipped capture (rare — only on permission errors) is logged as a
+warning; the script never raises.
 
 Dependencies (install on the LAB PC):
     pip install pillow pywin32
@@ -24,7 +24,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Tuple
 
 log = logging.getLogger("scanflow.monitor")
 
@@ -33,48 +33,25 @@ def _utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def find_window(title_substring: str) -> Optional[int]:
-    """Return the HWND of the first top-level window whose title contains
-    ``title_substring`` (case-insensitive). None if no match."""
-    import win32gui
-
-    needle = title_substring.lower()
-    matches: list[int] = []
-
-    def _cb(hwnd: int, _) -> bool:
-        if not win32gui.IsWindowVisible(hwnd):
-            return True
-        title = win32gui.GetWindowText(hwnd) or ""
-        if needle in title.lower():
-            matches.append(hwnd)
-        return True
-
-    win32gui.EnumWindows(_cb, None)
-    return matches[0] if matches else None
-
-
-def grab_window(hwnd: int) -> "Optional[bytes]":
-    """Capture the on-screen pixels of the given window into a PIL image.
-
-    Returns None if the window is minimised / off-screen. Uses ImageGrab.grab
-    on the window's screen rectangle — that's the simplest reliable path
-    that also captures DirectX / GPU-composited frames (a PrintWindow
-    fallback often returns black for hardware-accelerated UIs)."""
-    import win32gui
-    from PIL import ImageGrab
-
-    if win32gui.IsIconic(hwnd):  # minimised
-        return None
-    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-    if right - left < 4 or bottom - top < 4:
-        return None
-    return ImageGrab.grab(bbox=(left, top, right, bottom), all_screens=True)
-
-
 def grab_desktop():
-    """Capture all monitors as a single image."""
+    """Capture all monitors as one image (the Windows 'virtual screen')."""
     from PIL import ImageGrab
     return ImageGrab.grab(all_screens=True)
+
+
+def enumerate_monitors():
+    """Return a list of (index, (left, top, right, bottom)) for each physical
+    monitor, in the order Windows reports them (primary first).
+
+    Coordinates are in the virtual-screen space, so any monitor positioned
+    to the left of the primary will have negative ``left`` — that's fine,
+    PIL's ImageGrab(bbox=…, all_screens=True) accepts negative coords.
+    """
+    import win32api
+    rects = []
+    for idx, (hmon, _hdc, rect) in enumerate(win32api.EnumDisplayMonitors(), start=1):
+        rects.append((idx, tuple(rect)))
+    return rects
 
 
 def save(img, path: Path) -> None:
@@ -83,15 +60,12 @@ def save(img, path: Path) -> None:
     log.info("wrote %s (%d KB)", path.name, path.stat().st_size // 1024)
 
 
-def take_set(output_dir: Path, scanflow_title: str, createc_title: str) -> Tuple[int, int]:
-    """Take all three captures for one cycle.
-
-    Returns ``(n_taken, n_skipped)`` for log reporting.
-    """
+def take_set(output_dir: Path) -> Tuple[int, int]:
+    """Take one trio (or more) of captures. Returns (n_taken, n_skipped)."""
     stamp = _utc_stamp()
     taken, skipped = 0, 0
 
-    # 1. Whole desktop — always succeeds
+    # 1. Whole virtual desktop (both monitors stitched together) ----------
     try:
         save(grab_desktop(), output_dir / f"{stamp}_desktop.png")
         taken += 1
@@ -99,64 +73,43 @@ def take_set(output_dir: Path, scanflow_title: str, createc_title: str) -> Tuple
         log.warning("desktop grab failed: %s", e)
         skipped += 1
 
-    # 2. ScanFlow window
-    hwnd = find_window(scanflow_title)
-    if hwnd is None:
-        log.warning("no window matching %r — ScanFlow open?", scanflow_title)
-        skipped += 1
-    else:
-        try:
-            img = grab_window(hwnd)
-            if img is not None:
-                save(img, output_dir / f"{stamp}_scanflow.png")
-                taken += 1
-            else:
-                log.warning("ScanFlow window minimised or off-screen")
-                skipped += 1
-        except Exception as e:
-            log.warning("scanflow grab failed: %s", e)
-            skipped += 1
+    # 2. Each physical monitor separately ---------------------------------
+    try:
+        from PIL import ImageGrab
+        monitors = enumerate_monitors()
+    except Exception as e:
+        log.warning("monitor enumeration failed: %s", e)
+        return taken, skipped + 1
 
-    # 3. CreaTec STMAFM window
-    hwnd = find_window(createc_title)
-    if hwnd is None:
-        log.warning("no window matching %r — STMAFM open?", createc_title)
-        skipped += 1
-    else:
+    for idx, bbox in monitors:
         try:
-            img = grab_window(hwnd)
-            if img is not None:
-                save(img, output_dir / f"{stamp}_createc.png")
-                taken += 1
-            else:
-                log.warning("STMAFM window minimised or off-screen")
-                skipped += 1
+            img = ImageGrab.grab(bbox=bbox, all_screens=True)
+            save(img, output_dir / f"{stamp}_monitor{idx}.png")
+            taken += 1
         except Exception as e:
-            log.warning("createc grab failed: %s", e)
+            log.warning("monitor %d grab failed: %s", idx, e)
             skipped += 1
 
     return taken, skipped
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Capture ScanFlow / STMAFM / desktop screenshots.")
+    ap = argparse.ArgumentParser(
+        description="Capture full-desktop + per-monitor PNGs of the lab PC."
+    )
     ap.add_argument("--output", type=Path,
                     default=Path(r"C:\ScanflowMonitor\screenshots"),
                     help="Output folder for PNGs (default: %(default)s)")
-    ap.add_argument("--scanflow-title", default="ScanFlow",
-                    help="Substring to identify the ScanFlow window")
-    ap.add_argument("--createc-title", default="STMAFM",
-                    help="Substring to identify the CreaTec window")
     ap.add_argument("--once", action="store_true",
                     help="Take one set and exit (for Task Scheduler)")
-    ap.add_argument("--interval", type=float, default=300.0,
-                    help="Seconds between captures when looping (default: 300 = 5 min)")
+    ap.add_argument("--interval", type=float, default=600.0,
+                    help="Seconds between captures when looping (default: 600 = 10 min)")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     if args.once:
-        taken, skipped = take_set(args.output, args.scanflow_title, args.createc_title)
+        taken, skipped = take_set(args.output)
         log.info("done: %d captured, %d skipped", taken, skipped)
         return 0 if taken else 1
 
@@ -164,8 +117,9 @@ def main() -> int:
     log.info("Ctrl-C to stop.")
     try:
         while True:
-            taken, skipped = take_set(args.output, args.scanflow_title, args.createc_title)
-            log.info("cycle: %d captured, %d skipped — sleeping %.0fs", taken, skipped, args.interval)
+            taken, skipped = take_set(args.output)
+            log.info("cycle: %d captured, %d skipped — sleeping %.0fs",
+                     taken, skipped, args.interval)
             time.sleep(args.interval)
     except KeyboardInterrupt:
         log.info("stopped by user")
