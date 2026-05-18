@@ -18,10 +18,10 @@
 :: =====================================================================
 
 set "SRC=C:\Users\ltspm\Desktop\scanflow"
-:: TODO: replace LABPC with the lab PC's hostname or IP, and the share name
-::       with whatever you exposed via Properties → Sharing on the lab PC.
-::       Example: \\LT-SPM-PC\scanflow   or   \\192.168.1.42\scanflow
-set "DST=\\LABPC\scanflow"
+:: Lab PC hostname is SMP-8HSN6L3. The 'scanflow' bit is the *share name*
+:: assigned when you shared the folder on the lab PC — adjust if you used
+:: a different share label. Test with: dir \\SMP-8HSN6L3\scanflow
+set "DST=\\SMP-8HSN6L3\scanflow"
 
 :: --- Sanity: source must exist ---------------------------------------
 if not exist "%SRC%" (
