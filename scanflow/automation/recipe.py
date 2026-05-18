@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Optional, List, Union
 
 from scanflow.automation.survey import SurveyConfig
+from scanflow.automation.mosaic import MosaicConfig
 
 
 DEFAULT_CHANNELS = ("TOPOGRAPHY", "CURRENT")
@@ -135,7 +136,30 @@ class SurveyStep:
         return wide_t + n_zooms * zoom_t + settle_t
 
 
-RecipeStep = Union[ScanStep, SpectroscopyStep, ApproachStep, WaitStep, SurveyStep]
+@dataclass
+class MosaicStep:
+    """Wide scan + 3×3 zoom tiles + wide scan (a 'before/after' mosaic)."""
+    config: "MosaicConfig" = field(default_factory=lambda: MosaicConfig())
+    label: str = ""
+    kind: str = "mosaic"
+
+    def estimate_duration_s(self) -> float:
+        cfg = self.config
+        # Two wide scans (before + after)
+        wide_t = (2.0 * cfg.wide_size_nm[0] / max(cfg.wide_speed_nm_s, 0.01)
+                  * cfg.wide_pixels[1] + 4.0)
+        # Per-tile scan time (uses the resolved tile size so auto-defaults work)
+        tx, _ty = cfg.resolved_tile_size_nm()
+        tile_t = (2.0 * tx / max(cfg.tile_speed_nm_s, 0.01)
+                  * cfg.tile_pixels[1] + 4.0)
+        n_tiles = cfg.total_tiles()
+        n_iters = cfg.iterations_per_tile
+        # Settle: one before each wide, one before each tile iteration
+        settle_t = cfg.settling_s * (2 + n_tiles * n_iters)
+        return 2 * wide_t + n_tiles * n_iters * tile_t + settle_t
+
+
+RecipeStep = Union[ScanStep, SpectroscopyStep, ApproachStep, WaitStep, SurveyStep, MosaicStep]
 
 _STEP_CLASSES = {
     "scan": ScanStep,
@@ -143,6 +167,7 @@ _STEP_CLASSES = {
     "approach": ApproachStep,
     "wait": WaitStep,
     "survey": SurveyStep,
+    "mosaic": MosaicStep,
 }
 
 

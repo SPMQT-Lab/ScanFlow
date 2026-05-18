@@ -20,6 +20,7 @@ from scanflow.core import STMClient
 from scanflow.io import Session
 from scanflow.gui.panels.sweep_panel import SweepPanel
 from scanflow.gui.panels.survey_panel import SurveyPanel
+from scanflow.gui.panels.mosaic_panel import MosaicPanel
 from scanflow.gui.panels.z_stability_panel import ZStabilityPanel
 from scanflow.gui.panels.log_panel import LogPanel
 from scanflow.core.z_monitor import ZMonitor
@@ -79,6 +80,7 @@ class MainWindow(QMainWindow):
 
         self._sweep = SweepPanel(self._stm)
         self._survey = SurveyPanel(self._stm)
+        self._mosaic = MosaicPanel(self._stm)
         # Z-stability monitor runs continuously; it auto-skips polls while
         # disconnected, so it's safe to construct + start before Connect.
         self._z_monitor = ZMonitor(self._stm, interval_s=1.0)
@@ -88,6 +90,7 @@ class MainWindow(QMainWindow):
 
         self._tabs.addTab(self._sweep, "Sweep")
         self._tabs.addTab(self._survey, "Survey")
+        self._tabs.addTab(self._mosaic, "Mosaic")
         self._tabs.addTab(self._z_stability, "Z Stability")
         self._tabs.addTab(self._log, "Log")
 
@@ -95,6 +98,8 @@ class MainWindow(QMainWindow):
         self._sweep.error_message.connect(self._log.append_error)
         self._survey.log_message.connect(self._log.append)
         self._survey.error_message.connect(self._log.append_error)
+        self._mosaic.log_message.connect(self._log.append)
+        self._mosaic.error_message.connect(self._log.append_error)
         self._z_stability.log_message.connect(self._log.append)
 
         # -- Status bar --

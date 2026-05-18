@@ -22,9 +22,10 @@ from scanflow.core import (
 )
 from scanflow.automation.recipe import (
     MeasurementRecipe, ScanStep, SpectroscopyStep, ApproachStep, WaitStep,
-    SurveyStep, MIN_CONST_CURRENT_BIAS_V,
+    SurveyStep, MosaicStep, MIN_CONST_CURRENT_BIAS_V,
 )
 from scanflow.automation.survey import SurveyConfig, FeatureRecord, SurveyManifest
+from scanflow.automation.mosaic import MosaicConfig, tile_centers_in_wide_pixels
 from scanflow.automation.feature_discovery import discover_features, FeatureCandidate
 from scanflow.automation.scan_metrics import compute_z_stability, format_z_stability
 from scanflow.drift import DriftDetector, DriftResult
@@ -71,6 +72,10 @@ class AutomationRunner(QThread):
     survey_feature_done = Signal(object)                  # FeatureRecord
     survey_finished = Signal(str)                         # manifest path
     z_stability = Signal(object)                          # dict from compute_z_stability
+    # Mosaic campaign signals
+    mosaic_tile_started = Signal(int, int)                # (tile_idx, total)
+    mosaic_tile_done = Signal(int)                        # tile_idx
+    mosaic_finished = Signal(str)                         # output folder path
 
     def __init__(self, stm: STMClient, recipe: MeasurementRecipe, parent=None) -> None:
         super().__init__(parent)
@@ -205,6 +210,8 @@ class AutomationRunner(QThread):
                         step.seconds, label or "Wait")
                 elif kind == "survey":
                     self._do_survey_step(step, label)
+                elif kind == "mosaic":
+                    self._do_mosaic_step(step, label)
                 else:
                     log.warning("Unknown step kind: %s — skipping", kind)
 
@@ -552,6 +559,172 @@ class AutomationRunner(QThread):
             self.z_stability.emit(metrics)
         except Exception:
             log.debug("compute_z_stability failed", exc_info=True)
+
+    def _do_mosaic_step(self, step: MosaicStep, label: str) -> None:
+        """Wide overview → 3×3 zoom tiles (N iterations each) → wide overview.
+
+        Each tile is centered by nudging the XY offset in *wide-frame* pixels
+        — same trick as the Survey path. Drift correction between tile
+        iterations uses cross-correlation against iteration 1.
+        """
+        from datetime import datetime
+        cfg = step.config
+        tile_size_nm = cfg.resolved_tile_size_nm()
+        n_tiles = cfg.total_tiles()
+        n_iter = max(1, cfg.iterations_per_tile)
+
+        output: Optional[Path] = None
+        if cfg.output_folder:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output = Path(cfg.output_folder) / f"mosaic_{stamp}"
+            output.mkdir(parents=True, exist_ok=True)
+
+        # ── 1. Wide overview (before) ─────────────────────────────────
+        wide_params = ScanParams(
+            bias_V=cfg.bias_V,
+            setpoint_A=cfg.setpoint_A,
+            size_nm=cfg.wide_size_nm,
+            pixels=cfg.wide_pixels,
+            speed_nm_s=cfg.wide_speed_nm_s,
+            memo=f"{cfg.name} wide before",
+        )
+        self._stm.scan.apply(wide_params)
+        if cfg.settling_s > 0:
+            self._sleep_with_progress(cfg.settling_s, f"{cfg.name}: wide settle")
+            if self._stop_requested:
+                return
+        self.progress.emit(0, n_tiles + 2, f"{cfg.name}: wide before")
+        wide_before_path = self._scan_and_save_to(output, "wide_before.dat")
+        wide_before_img = self._stm.scan.live_data()
+        if wide_before_path:
+            self.scan_completed.emit(str(wide_before_path))
+        if output is not None and wide_before_img is not None:
+            _save_image_preview(wide_before_img, output / "wide_before.png")
+
+        # ── 2. Tile loop ─────────────────────────────────────────────
+        wide_cx = cfg.wide_pixels[0] / 2.0
+        wide_cy = cfg.wide_pixels[1] / 2.0
+        last_wide_px = (wide_cx, wide_cy)
+
+        for tile_idx, target_x, target_y in tile_centers_in_wide_pixels(cfg):
+            if self._stop_requested:
+                break
+            self._wait_if_paused()
+            self.mosaic_tile_started.emit(tile_idx, n_tiles)
+            self.progress.emit(tile_idx, n_tiles + 2,
+                               f"{cfg.name}: tile {tile_idx}/{n_tiles}")
+
+            # 2a. Restore wide params (sets nm-per-pixel for the nudge).
+            self._stm.scan.apply(wide_params)
+
+            # 2b. Nudge to this tile's centre in wide-frame pixels.
+            dx_px = float(target_x - last_wide_px[0])
+            dy_px = float(target_y - last_wide_px[1])
+            try:
+                self._stm.scan.nudge_offset_pixels(dx_px, dy_px)
+                last_wide_px = (float(target_x), float(target_y))
+            except Exception as e:
+                log.warning("tile %d nudge failed: %s", tile_idx, e)
+
+            # 2c. Apply tile params (offset preserved).
+            tile_params = ScanParams(
+                bias_V=cfg.bias_V,
+                setpoint_A=cfg.setpoint_A,
+                size_nm=tile_size_nm,
+                pixels=cfg.tile_pixels,
+                speed_nm_s=cfg.tile_speed_nm_s,
+                memo=f"{cfg.name} tile {tile_idx:02d}",
+            )
+            self._stm.scan.apply(tile_params)
+
+            # 2d. Iterations with drift correction against iter 1.
+            tile_ref: Optional[np.ndarray] = None
+            for it in range(n_iter):
+                if self._stop_requested:
+                    break
+                if cfg.settling_s > 0:
+                    self._sleep_with_progress(
+                        cfg.settling_s,
+                        f"tile {tile_idx:02d} iter{it + 1} settle",
+                    )
+                    if self._stop_requested:
+                        break
+
+                dat_name = f"tile_{tile_idx:02d}_iter{it + 1}.dat"
+                png_name = f"tile_{tile_idx:02d}_iter{it + 1}.png"
+                path = self._scan_and_save_to(output, dat_name)
+                if path is not None:
+                    self.scan_completed.emit(str(path))
+
+                img = self._stm.scan.live_data()
+                if img is None:
+                    continue
+                if output is not None:
+                    _save_image_preview(img, output / png_name)
+
+                # Z stability per scan
+                try:
+                    self.z_stability.emit(compute_z_stability(img))
+                except Exception:
+                    pass
+
+                # Drift correction: first iteration becomes the reference;
+                # subsequent iterations cross-correlate against it and nudge.
+                if it == 0:
+                    tile_ref = img
+                elif tile_ref is not None:
+                    try:
+                        detector = DriftDetector(
+                            continuous=False,
+                            method=getattr(self._recipe, "drift_method", "hybrid"),
+                        )
+                        result = detector.measure(reference=tile_ref, current=img)
+                        if (abs(result.dx_pixels) + abs(result.dy_pixels)) > 0.5:
+                            self._stm.scan.nudge_offset_pixels(
+                                result.dx_pixels, result.dy_pixels,
+                            )
+                            self.drift_measured.emit(result)
+                    except Exception as e:
+                        log.debug("tile drift step failed: %s", e)
+
+            self.mosaic_tile_done.emit(tile_idx)
+
+        # ── 3. Wide overview (after) ──────────────────────────────────
+        # Re-apply wide params; the XY offset is wherever the last tile
+        # left it — that's fine, we just snap back to the wide frame.
+        wide_after_params = ScanParams(
+            bias_V=cfg.bias_V,
+            setpoint_A=cfg.setpoint_A,
+            size_nm=cfg.wide_size_nm,
+            pixels=cfg.wide_pixels,
+            speed_nm_s=cfg.wide_speed_nm_s,
+            memo=f"{cfg.name} wide after",
+        )
+        # Return to the wide centre by reversing the cumulative nudge,
+        # so the wide_after image is anchored to the same XY as wide_before.
+        try:
+            self._stm.scan.apply(wide_params)  # wide scale for the nudge
+            dx_px = float(wide_cx - last_wide_px[0])
+            dy_px = float(wide_cy - last_wide_px[1])
+            self._stm.scan.nudge_offset_pixels(dx_px, dy_px)
+        except Exception as e:
+            log.warning("return-to-centre nudge failed: %s", e)
+
+        self._stm.scan.apply(wide_after_params)
+        if cfg.settling_s > 0:
+            self._sleep_with_progress(cfg.settling_s, f"{cfg.name}: wide-after settle")
+        if not self._stop_requested:
+            self.progress.emit(n_tiles + 1, n_tiles + 2, f"{cfg.name}: wide after")
+            wide_after_path = self._scan_and_save_to(output, "wide_after.dat")
+            wide_after_img = self._stm.scan.live_data()
+            if wide_after_path:
+                self.scan_completed.emit(str(wide_after_path))
+            if output is not None and wide_after_img is not None:
+                _save_image_preview(wide_after_img, output / "wide_after.png")
+
+        if output is not None:
+            self.mosaic_finished.emit(str(output))
+            log.info("Mosaic finished — output: %s", output)
 
     def _scan_and_save_to(self, output: Optional[Path], filename: str) -> Optional[Path]:
         """Run one scan, save under ``output/filename`` if given, return path."""
