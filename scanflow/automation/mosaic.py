@@ -48,11 +48,14 @@ class MosaicConfig:
     output_folder: str = ""
     name: str = "Mosaic"
 
-    # Debug knob: when True, every tile scans at the *same* offset as
-    # wide_before — no XY repositioning between tiles. Useful for
-    # isolating whether the size-change works independently of the
-    # offset-move logic on a real CreaTec rig.
-    skip_tile_positioning: bool = False
+    # SAFETY DEFAULT: when True (the default), every tile scans at the
+    # *same* XY as wide_before — no offset moves between tiles. Set this
+    # to False only when you've separately verified that
+    # set_offset_image_coord on your rig moves the tip the way you expect.
+    # The XY offset on CreaTec STMAFM has been unreliable from the COM
+    # interface in our tests; pre-positioning the scan manually in STMAFM
+    # is currently the safe path.
+    skip_tile_positioning: bool = True
 
     kind: str = "mosaic"
 

@@ -184,14 +184,16 @@ class MosaicPanel(QWidget):
         g.addWidget(self._iters, 3, 3)
 
         self._skip_positioning_chk = QCheckBox(
-            "DEBUG: skip tile positioning (all tiles at wide centre)"
+            "All tiles at wide centre (no XY repositioning)  [RECOMMENDED]"
         )
-        self._skip_positioning_chk.setChecked(False)
+        self._skip_positioning_chk.setChecked(True)
         self._skip_positioning_chk.setToolTip(
-            "Disable the XY repositioning between tiles. Use to isolate "
-            "whether apply(tile_params) shrinks the frame correctly. "
-            "When ON, all 9 tile scans happen at the wide-image centre — "
-            "if size-change works you'll see 9 small scans of the same area."
+            "When ticked, every tile is scanned at the same XY as the wide "
+            "image — no offset moves are sent to Createc. This is the safe "
+            "default while the CreaTec offset-move command is unreliable.\n\n"
+            "Untick ONLY if you have separately verified that "
+            "set_offset_image_coord on your rig moves the tip as expected. "
+            "Otherwise tiles may land outside the wide field."
         )
         g.addWidget(self._skip_positioning_chk, 4, 0, 1, 4)
         return box
