@@ -163,29 +163,72 @@ class ScanController:
     def apply(self, params: ScanParams) -> None:
         """Apply a complete ScanParams object to the instrument.
 
-        Pixels and physical size are written via *per-axis* keys only —
-        ``SCAN.NUM.X/Y`` and ``SCAN.IMAGESIZE.NM.X/Y``. The tuple-form
-        keys (``SCAN.IMAGESIZE.PIXEL`` and ``SCAN.IMAGESIZE.NM``) seem to
-        corrupt the X side on the real CreaTec STMAFM software (it ended
-        up showing X = 2 px / 2 nm after every Mosaic / Sweep apply()).
-        Per-axis writes are the reliable path.
+        Pixels and physical size are written via both per-axis and tuple
+        forms — empirically on the real CreaTec STMAFM software some
+        writes only update internal state until the tuple-form key
+        triggers the commit, while in other configurations the tuple
+        form silently leaves X stale. Writing both, in per-axis-then-
+        tuple order, is what reliably gets non-square frames through.
+
+        After writing, we read each setting back via ``getp`` and log a
+        warning at the first mismatch so it's obvious from the log
+        whether the issue is at the setp layer or downstream (e.g. an
+        STMAFM mode that ignores parameter updates mid-scan).
         """
+        import logging as _logging
+        log = _logging.getLogger(__name__)
+
         c = self._c
+        px_x, px_y = int(params.pixels[0]), int(params.pixels[1])
+        nm_x, nm_y = float(params.size_nm[0]), float(params.size_nm[1])
+
         c.setp("SCAN.PREAMPGAIN.EXPONENT", int(params.preamp_exponent))
         c.setp("SCAN.BIASVOLTAGE.VOLT", float(params.bias_V))
         c.setp("SCAN.SETPOINT.AMPERE", float(params.setpoint_A))
-        # Pixels — per-axis only
-        c.setp("SCAN.NUM.X", int(params.pixels[0]))
-        c.setp("SCAN.NUM.Y", int(params.pixels[1]))
-        # Physical size — per-axis only
-        c.setp("SCAN.IMAGESIZE.NM.X", float(params.size_nm[0]))
-        c.setp("SCAN.IMAGESIZE.NM.Y", float(params.size_nm[1]))
+
+        # Pixels — per-axis first, then tuple commit
+        c.setp("SCAN.NUM.X", px_x)
+        c.setp("SCAN.NUM.Y", px_y)
+        c.setp("SCAN.IMAGESIZE.PIXEL", (px_x, px_y))
+
+        # Physical size — per-axis first, then tuple commit
+        c.setp("SCAN.IMAGESIZE.NM.X", nm_x)
+        c.setp("SCAN.IMAGESIZE.NM.Y", nm_y)
+        c.setp("SCAN.IMAGESIZE.NM", (nm_x, nm_y))
+
         c.setp("SCAN.SPEED.NM/SEC", float(params.speed_nm_s))
         c.setp("SCAN.ROTATION.DEG", float(params.rotation_deg))
         c.setp("SCAN.CHANNELS", tuple(params.channels))
         c.setp("CHMode", int(params.const_height))
         if params.memo:
             c.setp("MEMO_STMAFM", str(params.memo))
+
+        # Diagnostic readback — surfaces silent mismatches before scanning.
+        self._readback_check(px_x, px_y, nm_x, nm_y, log)
+
+    def _readback_check(self, px_x: int, px_y: int,
+                        nm_x: float, nm_y: float, log) -> None:
+        """Read the four geometry keys back and log a warning per mismatch."""
+        try:
+            got_px_x = int(self._c.getp("SCAN.NUM.X", "") or 0)
+            got_px_y = int(self._c.getp("SCAN.NUM.Y", "") or 0)
+            got_nm_x = float(self._c.getp("SCAN.IMAGESIZE.NM.X", "") or 0)
+            got_nm_y = float(self._c.getp("SCAN.IMAGESIZE.NM.Y", "") or 0)
+        except Exception as e:
+            log.debug("apply() readback failed: %s", e)
+            return
+        if got_px_x != px_x:
+            log.warning("apply() readback: SCAN.NUM.X expected %d, got %d",
+                        px_x, got_px_x)
+        if got_px_y != px_y:
+            log.warning("apply() readback: SCAN.NUM.Y expected %d, got %d",
+                        px_y, got_px_y)
+        if abs(got_nm_x - nm_x) > 0.01:
+            log.warning("apply() readback: SCAN.IMAGESIZE.NM.X expected %.2f, got %.2f",
+                        nm_x, got_nm_x)
+        if abs(got_nm_y - nm_y) > 0.01:
+            log.warning("apply() readback: SCAN.IMAGESIZE.NM.Y expected %.2f, got %.2f",
+                        nm_y, got_nm_y)
 
     def read(self) -> ScanParams:
         """Read the current scan parameters from the instrument."""

@@ -83,10 +83,11 @@ class MosaicPanel(QWidget):
         root.addStretch(1)
 
         # Wire every parameter that affects the time estimate.
-        for w in (self._wide_x, self._wide_y, self._wide_pixels,
-                  self._wide_speed, self._tile_x, self._tile_y,
-                  self._tile_pixels, self._tile_speed, self._iters,
-                  self._settle):
+        for w in (self._wide_x, self._wide_y,
+                  self._wide_pixels_x, self._wide_pixels_y, self._wide_speed,
+                  self._tile_x, self._tile_y,
+                  self._tile_pixels_x, self._tile_pixels_y, self._tile_speed,
+                  self._iters, self._settle):
             w.valueChanged.connect(self._refresh_estimate)
         self._auto_tile_check.toggled.connect(self._refresh_estimate)
         self._refresh_estimate()
@@ -109,18 +110,24 @@ class MosaicPanel(QWidget):
         self._wide_y.setValue(90.0)
         g.addWidget(self._wide_y, 0, 3)
 
-        g.addWidget(QLabel("Pixels"), 1, 0)
-        self._wide_pixels = QSpinBox()
-        self._wide_pixels.setRange(64, 4096)
-        self._wide_pixels.setValue(256)
-        g.addWidget(self._wide_pixels, 1, 1)
+        g.addWidget(QLabel("Pixels X"), 1, 0)
+        self._wide_pixels_x = QSpinBox()
+        self._wide_pixels_x.setRange(64, 4096)
+        self._wide_pixels_x.setValue(256)
+        g.addWidget(self._wide_pixels_x, 1, 1)
 
-        g.addWidget(QLabel("Speed (nm/s)"), 1, 2)
+        g.addWidget(QLabel("Pixels Y"), 1, 2)
+        self._wide_pixels_y = QSpinBox()
+        self._wide_pixels_y.setRange(64, 4096)
+        self._wide_pixels_y.setValue(256)
+        g.addWidget(self._wide_pixels_y, 1, 3)
+
+        g.addWidget(QLabel("Speed (nm/s)"), 2, 0)
         self._wide_speed = QDoubleSpinBox()
         self._wide_speed.setRange(0.1, 5000.0)
         self._wide_speed.setDecimals(1)
         self._wide_speed.setValue(100.0)
-        g.addWidget(self._wide_speed, 1, 3)
+        g.addWidget(self._wide_speed, 2, 1)
         return box
 
     def _build_tile_group(self) -> QGroupBox:
@@ -147,25 +154,26 @@ class MosaicPanel(QWidget):
         self._tile_y.setValue(30.0)
         g.addWidget(self._tile_y, 1, 3)
 
-        g.addWidget(QLabel("Tile pixels"), 2, 0)
-        self._tile_pixels = QSpinBox()
-        self._tile_pixels.setRange(32, 4096)
-        self._tile_pixels.setValue(256)
-        self._tile_pixels.setToolTip(
-            "Pixel resolution per tile. Same as the wide pixels by default — "
-            "since tiles are smaller in nm, that gives ~3× the effective "
-            "spatial resolution."
-        )
-        g.addWidget(self._tile_pixels, 2, 1)
+        g.addWidget(QLabel("Tile pixels X"), 2, 0)
+        self._tile_pixels_x = QSpinBox()
+        self._tile_pixels_x.setRange(32, 4096)
+        self._tile_pixels_x.setValue(256)
+        g.addWidget(self._tile_pixels_x, 2, 1)
 
-        g.addWidget(QLabel("Speed (nm/s)"), 2, 2)
+        g.addWidget(QLabel("Tile pixels Y"), 2, 2)
+        self._tile_pixels_y = QSpinBox()
+        self._tile_pixels_y.setRange(32, 4096)
+        self._tile_pixels_y.setValue(256)
+        g.addWidget(self._tile_pixels_y, 2, 3)
+
+        g.addWidget(QLabel("Speed (nm/s)"), 3, 0)
         self._tile_speed = QDoubleSpinBox()
         self._tile_speed.setRange(0.1, 2000.0)
         self._tile_speed.setDecimals(1)
         self._tile_speed.setValue(20.0)
-        g.addWidget(self._tile_speed, 2, 3)
+        g.addWidget(self._tile_speed, 3, 1)
 
-        g.addWidget(QLabel("Iterations per tile"), 3, 0)
+        g.addWidget(QLabel("Iterations per tile"), 3, 2)
         self._iters = QSpinBox()
         self._iters.setRange(1, 10)
         self._iters.setValue(3)
@@ -173,7 +181,7 @@ class MosaicPanel(QWidget):
             "Number of scans per tile. Iterations 2..N are drift-corrected "
             "against iteration 1, so the final iteration is well-centered."
         )
-        g.addWidget(self._iters, 3, 1)
+        g.addWidget(self._iters, 3, 3)
         return box
 
     def _build_shared_group(self) -> QGroupBox:
@@ -259,10 +267,10 @@ class MosaicPanel(QWidget):
     def _build_config(self) -> MosaicConfig:
         return MosaicConfig(
             wide_size_nm=(self._wide_x.value(), self._wide_y.value()),
-            wide_pixels=(self._wide_pixels.value(), self._wide_pixels.value()),
+            wide_pixels=(self._wide_pixels_x.value(), self._wide_pixels_y.value()),
             wide_speed_nm_s=self._wide_speed.value(),
             tile_size_nm=(self._tile_x.value(), self._tile_y.value()),
-            tile_pixels=(self._tile_pixels.value(), self._tile_pixels.value()),
+            tile_pixels=(self._tile_pixels_x.value(), self._tile_pixels_y.value()),
             tile_speed_nm_s=self._tile_speed.value(),
             iterations_per_tile=self._iters.value(),
             bias_V=self._bias.value(),
