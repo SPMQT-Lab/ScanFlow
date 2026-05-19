@@ -232,6 +232,15 @@ class MosaicPanel(QWidget):
         self._stop_btn.setEnabled(False)
         self._stop_btn.clicked.connect(self._stop_run)
         g.addWidget(self._stop_btn, 0, 1)
+
+        self._force_quit_btn = QPushButton("Force Quit")
+        self._force_quit_btn.setEnabled(False)
+        self._force_quit_btn.setToolTip(
+            "Hard-terminate the runner thread. Use only if Stop hangs — "
+            "the STM may be left mid-scan."
+        )
+        self._force_quit_btn.clicked.connect(self._force_quit_run)
+        g.addWidget(self._force_quit_btn, 0, 2)
         return box
 
     # ------------------------------------------------------------------
@@ -329,11 +338,31 @@ class MosaicPanel(QWidget):
         self._progress.setMaximum(n_tiles + 2)
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
+        self._force_quit_btn.setEnabled(True)
 
     def _stop_run(self) -> None:
-        if self._runner:
-            self._runner.stop()
+        if not self._runner:
+            return
+        # First click: graceful. Second click: emergency stop + tip retract.
+        stop_count_before = self._runner._stop_count
+        self._runner.stop()
+        if stop_count_before == 0:
+            self._stop_btn.setText("Emergency Stop")
             self._status.setText("Stopping…")
+        else:
+            self._status.setText("Emergency stop — retracting tip…")
+
+    def _force_quit_run(self) -> None:
+        if not self._runner:
+            return
+        ans = QMessageBox.question(
+            self, "Force-terminate runner?",
+            "Hard-terminate the runner thread? The STM may be left "
+            "mid-scan — only use if Stop is not responding.",
+        )
+        if ans == QMessageBox.Yes:
+            self._status.setText("Force-terminating…")
+            self._runner.force_stop()
 
     # ── runner callbacks ───────────────────────────────────────────────
 
@@ -348,6 +377,8 @@ class MosaicPanel(QWidget):
         if state in (RunnerState.FINISHED, RunnerState.ERROR, RunnerState.IDLE):
             self._start_btn.setEnabled(True)
             self._stop_btn.setEnabled(False)
+            self._force_quit_btn.setEnabled(False)
+            self._stop_btn.setText("Stop")
 
     def _on_settling(self, remaining_s: int, label: str) -> None:
         self._status.setText(f"{label} — {remaining_s} s")

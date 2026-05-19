@@ -602,10 +602,12 @@ class AutomationRunner(QThread):
             _save_image_preview(wide_before_img, output / "wide_before.png")
 
         # ── 2. Tile loop ─────────────────────────────────────────────
-        wide_cx = cfg.wide_pixels[0] / 2.0
-        wide_cy = cfg.wide_pixels[1] / 2.0
-        last_wide_px = (wide_cx, wide_cy)
-
+        # Position by absolute pixel coordinates within the wide image
+        # frame: each tile re-applies wide_params (so Createc treats the
+        # wide as the active scan frame), then SETXYOFF.IMAGECOORD moves
+        # the offset to the tile's centre pixel. Avoids the cumulative-error
+        # and scale-amplification issues seen with nudge_offset_pixels on
+        # the real Createc — landed tiles outside the wide field entirely.
         for tile_idx, target_x, target_y in tile_centers_in_wide_pixels(cfg):
             if self._stop_requested:
                 break
@@ -614,17 +616,19 @@ class AutomationRunner(QThread):
             self.progress.emit(tile_idx, n_tiles + 2,
                                f"{cfg.name}: tile {tile_idx}/{n_tiles}")
 
-            # 2a. Restore wide params (sets nm-per-pixel for the nudge).
+            # 2a. Restore wide params (sets the configured frame to wide so
+            # SETXYOFF.IMAGECOORD interprets pixel coords in the wide grid).
             self._stm.scan.apply(wide_params)
 
-            # 2b. Nudge to this tile's centre in wide-frame pixels.
-            dx_px = float(target_x - last_wide_px[0])
-            dy_px = float(target_y - last_wide_px[1])
+            # 2b. Absolute-position to this tile's centre in the wide image.
             try:
-                self._stm.scan.nudge_offset_pixels(dx_px, dy_px)
-                last_wide_px = (float(target_x), float(target_y))
+                self._stm.scan.set_offset_image_coord(
+                    int(round(target_x)), int(round(target_y)),
+                )
+                log.info("tile %d positioned at wide-px (%d, %d)",
+                         tile_idx, int(round(target_x)), int(round(target_y)))
             except Exception as e:
-                log.warning("tile %d nudge failed: %s", tile_idx, e)
+                log.warning("tile %d set_offset_image_coord failed: %s", tile_idx, e)
 
             # 2c. Apply tile params (offset preserved).
             tile_params = ScanParams(
@@ -700,15 +704,15 @@ class AutomationRunner(QThread):
             speed_nm_s=cfg.wide_speed_nm_s,
             memo=f"{cfg.name} wide after",
         )
-        # Return to the wide centre by reversing the cumulative nudge,
+        # Return to the wide centre via absolute image-coord positioning,
         # so the wide_after image is anchored to the same XY as wide_before.
         try:
-            self._stm.scan.apply(wide_params)  # wide scale for the nudge
-            dx_px = float(wide_cx - last_wide_px[0])
-            dy_px = float(wide_cy - last_wide_px[1])
-            self._stm.scan.nudge_offset_pixels(dx_px, dy_px)
+            self._stm.scan.apply(wide_params)  # wide frame for IMAGECOORD
+            self._stm.scan.set_offset_image_coord(
+                int(cfg.wide_pixels[0] // 2), int(cfg.wide_pixels[1] // 2),
+            )
         except Exception as e:
-            log.warning("return-to-centre nudge failed: %s", e)
+            log.warning("return-to-centre failed: %s", e)
 
         self._stm.scan.apply(wide_after_params)
         if cfg.settling_s > 0:
