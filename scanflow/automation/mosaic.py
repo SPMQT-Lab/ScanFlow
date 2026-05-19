@@ -48,6 +48,12 @@ class MosaicConfig:
     output_folder: str = ""
     name: str = "Mosaic"
 
+    # Debug knob: when True, every tile scans at the *same* offset as
+    # wide_before — no XY repositioning between tiles. Useful for
+    # isolating whether the size-change works independently of the
+    # offset-move logic on a real CreaTec rig.
+    skip_tile_positioning: bool = False
+
     kind: str = "mosaic"
 
     def resolved_tile_size_nm(self) -> Tuple[float, float]:

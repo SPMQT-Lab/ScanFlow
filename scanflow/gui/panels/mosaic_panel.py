@@ -182,6 +182,18 @@ class MosaicPanel(QWidget):
             "against iteration 1, so the final iteration is well-centered."
         )
         g.addWidget(self._iters, 3, 3)
+
+        self._skip_positioning_chk = QCheckBox(
+            "DEBUG: skip tile positioning (all tiles at wide centre)"
+        )
+        self._skip_positioning_chk.setChecked(False)
+        self._skip_positioning_chk.setToolTip(
+            "Disable the XY repositioning between tiles. Use to isolate "
+            "whether apply(tile_params) shrinks the frame correctly. "
+            "When ON, all 9 tile scans happen at the wide-image centre — "
+            "if size-change works you'll see 9 small scans of the same area."
+        )
+        g.addWidget(self._skip_positioning_chk, 4, 0, 1, 4)
         return box
 
     def _build_shared_group(self) -> QGroupBox:
@@ -287,6 +299,7 @@ class MosaicPanel(QWidget):
             settling_s=self._settle.value(),
             output_folder=self._output.text(),
             name=self._name.text() or "Mosaic",
+            skip_tile_positioning=self._skip_positioning_chk.isChecked(),
         )
 
     def _pick_folder(self) -> None:
