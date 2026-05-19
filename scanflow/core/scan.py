@@ -20,7 +20,22 @@ if TYPE_CHECKING:
 
 class ScanStatus(IntEnum):
     STOPPED = 0
+    # CreaTec returns 1 during pre-scan setup / approach moves / brief
+    # transitional states. It's not "actively scanning" in the sense that
+    # matters to our polling loop, so it gets folded in with STOPPED for
+    # is_running purposes.
+    PAUSED = 1
     SCANNING = 2
+
+    @classmethod
+    def _missing_(cls, value):
+        """Any unrecognised status value falls back to STOPPED so the
+        runner never crashes on a numeric value we haven't catalogued."""
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "Unknown SCANSTATUS %r — treating as STOPPED", value,
+        )
+        return cls.STOPPED
 
 
 class Channel:
