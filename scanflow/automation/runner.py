@@ -10,7 +10,7 @@ import logging
 import time
 from enum import Enum, auto
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -552,6 +552,45 @@ class AutomationRunner(QThread):
 
         return record
 
+    def _log_offset(self, label: str) -> Optional[Tuple[float, float]]:
+        """Read SCAN.OFFSET.{X,Y}.NM, log it at INFO, return the (x,y) tuple.
+
+        Returns None if the read fails. Used to trace where the scan
+        window actually is at each phase of a routine — vital for
+        debugging cases where 'set X, scan there' produces results in
+        a different XY than expected.
+        """
+        try:
+            xy = self._stm.scan.get_offset_nm()
+        except Exception as e:
+            log.warning("offset read failed at %s: %s", label, e)
+            return None
+        if xy is None:
+            log.info("%s: offset (read returned None)", label)
+            return None
+        log.info("%s: offset X=%.3f nm  Y=%.3f nm", label, xy[0], xy[1])
+        return xy
+
+    def _verify_nudge(self, label: str, before: Optional[Tuple[float, float]],
+                      expected_dx_nm: float, expected_dy_nm: float,
+                      tol_nm: float = 0.5) -> None:
+        """Log a WARNING if the actual change in offset disagrees with the
+        commanded shift by more than ``tol_nm``."""
+        if before is None:
+            return
+        after = self._log_offset(f"{label} (after)")
+        if after is None:
+            return
+        actual_dx = after[0] - before[0]
+        actual_dy = after[1] - before[1]
+        if (abs(actual_dx - expected_dx_nm) > tol_nm
+                or abs(actual_dy - expected_dy_nm) > tol_nm):
+            log.warning(
+                "%s: shift verification FAILED — expected (%+.3f, %+.3f) nm, "
+                "got (%+.3f, %+.3f) nm",
+                label, expected_dx_nm, expected_dy_nm, actual_dx, actual_dy,
+            )
+
     def _emit_z_stability(self) -> None:
         """Pull the just-completed scan's topography and emit a stability metric."""
         try:
@@ -595,6 +634,7 @@ class AutomationRunner(QThread):
             memo=f"{cfg.name} wide before",
         )
         self._stm.scan.apply(wide_params)
+        self._log_offset(f"{cfg.name}: wide_before apply")
         if cfg.settling_s > 0:
             self._sleep_with_progress(cfg.settling_s, f"{cfg.name}: wide settle")
             if self._stop_requested:
@@ -606,6 +646,7 @@ class AutomationRunner(QThread):
             self.scan_completed.emit(str(wide_before_path))
         if output is not None and wide_before_img is not None:
             _save_image_preview(wide_before_img, output / "wide_before.png")
+        self._log_offset(f"{cfg.name}: wide_before scan complete")
 
         # Anchor: read the wide-frame's XY centre via SCAN.OFFSET.{X,Y}.NM.
         # Every tile target is wide_centre + tile-offset; the wide_after
@@ -617,7 +658,7 @@ class AutomationRunner(QThread):
                 "to avoid moving the tip blind."
             )
             return
-        log.info("Mosaic wide centre: X=%.3f nm, Y=%.3f nm",
+        log.info("Mosaic wide centre anchored: X=%.3f nm, Y=%.3f nm",
                  wide_centre[0], wide_centre[1])
 
         # Tile pixel-offsets → nm offsets in the wide frame
@@ -651,12 +692,23 @@ class AutomationRunner(QThread):
             try:
                 self._stm.scan.set_offset_nm(target_nm[0], target_nm[1])
                 log.info(
-                    "tile %d: set_offset_nm(%.3f, %.3f) "
+                    "tile %02d: set_offset_nm(%.3f, %.3f) "
                     "[Δ from centre: %+.3f, %+.3f nm]",
                     tile_idx, target_nm[0], target_nm[1], dx_nm, dy_nm,
                 )
+                actual = self._log_offset(f"tile {tile_idx:02d} after positioning")
+                if actual is not None:
+                    err_x = actual[0] - target_nm[0]
+                    err_y = actual[1] - target_nm[1]
+                    if abs(err_x) > 0.5 or abs(err_y) > 0.5:
+                        log.warning(
+                            "tile %02d: positioning mismatch — wanted (%.3f, %.3f), "
+                            "Createc reports (%.3f, %.3f), err (%+.3f, %+.3f) nm",
+                            tile_idx, target_nm[0], target_nm[1],
+                            actual[0], actual[1], err_x, err_y,
+                        )
             except Exception as e:
-                log.warning("tile %d set_offset_nm failed: %s", tile_idx, e)
+                log.warning("tile %02d set_offset_nm failed: %s", tile_idx, e)
 
             # 2c. Apply tile params (offset preserved).
             tile_params = ScanParams(
@@ -668,9 +720,12 @@ class AutomationRunner(QThread):
                 memo=f"{cfg.name} tile {tile_idx:02d}",
             )
             self._stm.scan.apply(tile_params)
+            self._log_offset(f"tile {tile_idx:02d} after apply(tile_params)")
 
             # 2d. Iterations with drift correction against iter 1.
             tile_ref: Optional[np.ndarray] = None
+            zoom_nm_per_px_x = tile_size_nm[0] / max(cfg.tile_pixels[0], 1)
+            zoom_nm_per_px_y = tile_size_nm[1] / max(cfg.tile_pixels[1], 1)
             for it in range(n_iter):
                 if self._stop_requested:
                     break
@@ -682,11 +737,17 @@ class AutomationRunner(QThread):
                     if self._stop_requested:
                         break
 
+                self._log_offset(
+                    f"tile {tile_idx:02d} iter{it + 1} before scan"
+                )
                 dat_name = f"tile_{tile_idx:02d}_iter{it + 1}.dat"
                 png_name = f"tile_{tile_idx:02d}_iter{it + 1}.png"
                 path = self._scan_and_save_to(output, dat_name)
                 if path is not None:
                     self.scan_completed.emit(str(path))
+                self._log_offset(
+                    f"tile {tile_idx:02d} iter{it + 1} after scan"
+                )
 
                 img = self._stm.scan.live_data()
                 if img is None:
@@ -712,8 +773,21 @@ class AutomationRunner(QThread):
                         )
                         result = detector.measure(reference=tile_ref, current=img)
                         if (abs(result.dx_pixels) + abs(result.dy_pixels)) > 0.5:
+                            # Pixel shift the cross-correlation found
+                            # → expected nm shift in current (tile) frame
+                            exp_dx_nm = result.dx_pixels * zoom_nm_per_px_x
+                            exp_dy_nm = result.dy_pixels * zoom_nm_per_px_y
+                            before = self._log_offset(
+                                f"tile {tile_idx:02d} iter{it + 1} drift nudge "
+                                f"({result.dx_pixels:+.2f}, {result.dy_pixels:+.2f}) px "
+                                f"= expected ({exp_dx_nm:+.3f}, {exp_dy_nm:+.3f}) nm"
+                            )
                             self._stm.scan.nudge_offset_pixels(
                                 result.dx_pixels, result.dy_pixels,
+                            )
+                            self._verify_nudge(
+                                f"tile {tile_idx:02d} iter{it + 1} nudge",
+                                before, exp_dx_nm, exp_dy_nm,
                             )
                             self.drift_measured.emit(result)
                     except Exception as e:
@@ -734,24 +808,28 @@ class AutomationRunner(QThread):
         )
         # Return to the wide centre via absolute set_offset_nm(), so
         # wide_after is anchored at the same XY as wide_before.
+        self._log_offset(f"{cfg.name}: before return-to-centre")
         try:
             log.info("wide-after: set_offset_nm(%.3f, %.3f)",
                      wide_centre[0], wide_centre[1])
             self._stm.scan.set_offset_nm(wide_centre[0], wide_centre[1])
         except Exception as e:
             log.warning("return-to-centre failed: %s", e)
+        self._log_offset(f"{cfg.name}: after return-to-centre")
 
         self._stm.scan.apply(wide_after_params)
         if cfg.settling_s > 0:
             self._sleep_with_progress(cfg.settling_s, f"{cfg.name}: wide-after settle")
         if not self._stop_requested:
             self.progress.emit(n_tiles + 1, n_tiles + 2, f"{cfg.name}: wide after")
+            self._log_offset(f"{cfg.name}: wide_after before scan")
             wide_after_path = self._scan_and_save_to(output, "wide_after.dat")
             wide_after_img = self._stm.scan.live_data()
             if wide_after_path:
                 self.scan_completed.emit(str(wide_after_path))
             if output is not None and wide_after_img is not None:
                 _save_image_preview(wide_after_img, output / "wide_after.png")
+            self._log_offset(f"{cfg.name}: wide_after scan complete")
 
         if output is not None:
             self.mosaic_finished.emit(str(output))
