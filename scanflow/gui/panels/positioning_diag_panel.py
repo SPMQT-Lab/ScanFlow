@@ -107,6 +107,15 @@ class PositioningDiagPanel(QWidget):
         read_before_btn = QPushButton("Read auto (if available)")
         read_before_btn.clicked.connect(lambda: self._auto_read(self._before_x, self._before_y))
         bg.addWidget(read_before_btn, 0, 4)
+
+        probe_btn = QPushButton("Probe XY-read keys…")
+        probe_btn.setToolTip(
+            "Try a list of candidate getp keys and getdacval channels; "
+            "log each one's response. Whichever one returns a sensible "
+            "number (matching STMAFM's offset display) is our reader."
+        )
+        probe_btn.clicked.connect(self._probe_xy_keys)
+        bg.addWidget(probe_btn, 1, 0, 1, 5)
         root.addWidget(before_box)
 
         # 2) Command to send
@@ -189,6 +198,92 @@ class PositioningDiagPanel(QWidget):
         button_row.addWidget(save_btn)
         tg.addLayout(button_row)
         root.addWidget(table_box, 1)
+
+    # ------------------------------------------------------------------
+    # Probe for the right XY-position-read mechanism
+    # ------------------------------------------------------------------
+
+    # Candidate getp keys to try when looking for the current XY offset.
+    # Createc's naming isn't documented from outside; this enumerates the
+    # most plausible variations. The first one that returns a number on
+    # the rig is the one we'd hard-wire into tip_xy_position().
+    _CANDIDATE_GETP_KEYS = [
+        ("SCAN.OFFSET.X.NM",     "SCAN.OFFSET.Y.NM"),
+        ("SCAN.OFFSET.X.VOLT",   "SCAN.OFFSET.Y.VOLT"),
+        ("SCAN.XOFFSET.NM",      "SCAN.YOFFSET.NM"),
+        ("SCAN.XOFFSET.VOLT",    "SCAN.YOFFSET.VOLT"),
+        ("STMAFM.OFFSET.X.NM",   "STMAFM.OFFSET.Y.NM"),
+        ("STMAFM.OFFSET.X.VOLT", "STMAFM.OFFSET.Y.VOLT"),
+        ("STMAFM.XYOFF.X.NM",    "STMAFM.XYOFF.Y.NM"),
+        ("STMAFM.XYOFF.X.VOLT",  "STMAFM.XYOFF.Y.VOLT"),
+        ("SCAN.XYOFF.X.NM",      "SCAN.XYOFF.Y.NM"),
+        ("SCAN.XYOFF.X.VOLT",    "SCAN.XYOFF.Y.VOLT"),
+        ("SCAN.X.NM",            "SCAN.Y.NM"),
+        ("SCAN.X.VOLT",          "SCAN.Y.VOLT"),
+    ]
+
+    def _probe_xy_keys(self) -> None:
+        """Try every candidate read mechanism, log the results."""
+        if not self._stm.connected and not self._stm.is_mock:
+            QMessageBox.warning(self, "Not connected",
+                                "Connect to the STM (or Mock) first.")
+            return
+
+        self.log_message.emit("=== Probing XY-read mechanisms ===")
+        self.log_message.emit(
+            "Look at STMAFM's offset display now and note the X, Y values. "
+            "Below, find whichever line returns a number matching that."
+        )
+
+        # 1) Secondary COM (already known to be unavailable on this rig,
+        # but log the attempt anyway so the diagnostic is complete).
+        try:
+            xy = self._stm.tip_xy_position()
+            self.log_message.emit(
+                f"  tip_xy_position()                       → {xy}"
+            )
+        except Exception as e:
+            self.log_message.emit(
+                f"  tip_xy_position()                       → ERROR: {e}"
+            )
+
+        # 2) getp candidate keys.
+        for kx, ky in self._CANDIDATE_GETP_KEYS:
+            x_str = self._safe_getp(kx)
+            y_str = self._safe_getp(ky)
+            self.log_message.emit(
+                f"  getp({kx!r}, {ky!r}) → X={x_str}, Y={y_str}"
+            )
+
+        # 3) Raw DAC channels — common conventions put X / Y on board 0
+        # channels 0..3. Z is on the feedback DAC (getdacvalfb).
+        try:
+            raw = self._stm.raw
+            for board in (0, 1):
+                for ch in range(4):
+                    try:
+                        valf = raw.getdacvalf(board, ch)
+                        self.log_message.emit(
+                            f"  getdacvalf(board={board}, ch={ch})      → {valf}"
+                        )
+                    except Exception as e:
+                        self.log_message.emit(
+                            f"  getdacvalf(board={board}, ch={ch})      → ERROR: {e}"
+                        )
+        except Exception as e:
+            self.log_message.emit(f"  raw DAC access failed: {e}")
+
+        self.log_message.emit("=== End probe — copy this list and report ===")
+
+    def _safe_getp(self, key: str) -> str:
+        """Wrap getp in a try, return a printable result or 'ERROR: …'."""
+        try:
+            v = self._stm.getp(key, None)
+            if v is None or v == "":
+                return "(empty)"
+            return repr(v)
+        except Exception as e:
+            return f"ERROR: {type(e).__name__}: {e}"
 
     # ------------------------------------------------------------------
     # Auto-read (best-effort; falls back to manual when unavailable)
