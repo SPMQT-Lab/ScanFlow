@@ -48,15 +48,6 @@ class MosaicConfig:
     output_folder: str = ""
     name: str = "Mosaic"
 
-    # SAFETY DEFAULT: when True (the default), every tile scans at the
-    # *same* XY as wide_before — no offset moves between tiles. Set this
-    # to False only when you've separately verified that
-    # set_offset_image_coord on your rig moves the tip the way you expect.
-    # The XY offset on CreaTec STMAFM has been unreliable from the COM
-    # interface in our tests; pre-positioning the scan manually in STMAFM
-    # is currently the safe path.
-    skip_tile_positioning: bool = True
-
     kind: str = "mosaic"
 
     def resolved_tile_size_nm(self) -> Tuple[float, float]:

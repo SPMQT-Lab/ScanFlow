@@ -601,17 +601,31 @@ class AutomationRunner(QThread):
         if output is not None and wide_before_img is not None:
             _save_image_preview(wide_before_img, output / "wide_before.png")
 
+        # Anchor: read the wide-frame's XY centre via SCAN.OFFSET.{X,Y}.NM.
+        # Every tile target is wide_centre + tile-offset; the wide_after
+        # scan at the end restores this exact XY.
+        wide_centre = self._stm.scan.get_offset_nm()
+        if wide_centre is None:
+            self.error.emit(
+                "Mosaic: couldn't read SCAN.OFFSET.{X,Y}.NM — aborting "
+                "to avoid moving the tip blind."
+            )
+            return
+        log.info("Mosaic wide centre: X=%.3f nm, Y=%.3f nm",
+                 wide_centre[0], wide_centre[1])
+
+        # Tile pixel-offsets → nm offsets in the wide frame
+        wide_nm_per_px_x = cfg.wide_size_nm[0] / max(cfg.wide_pixels[0], 1)
+        wide_nm_per_px_y = cfg.wide_size_nm[1] / max(cfg.wide_pixels[1], 1)
+        max_excursion_x = cfg.wide_size_nm[0] / 2.0
+        max_excursion_y = cfg.wide_size_nm[1] / 2.0
+
         # ── 2. Tile loop ─────────────────────────────────────────────
-        # Position by absolute pixel coordinates within the wide image
-        # frame: each tile re-applies wide_params (so Createc treats the
-        # wide as the active scan frame), then SETXYOFF.IMAGECOORD moves
-        # the offset to the tile's centre pixel.
-        #
-        # When cfg.skip_tile_positioning is True, the offset move is
-        # skipped entirely — all 9 tiles scan the same area as wide_before.
-        # That's a debug mode to verify whether apply(tile_params) shrinks
-        # the frame correctly, independent of any offset-move bug.
-        for tile_idx, target_x, target_y in tile_centers_in_wide_pixels(cfg):
+        # Absolute positioning: for each tile, compute the target XY in
+        # nm and call set_offset_nm() (which on this rig invokes
+        # setxyoffvolt(x_nm, y_nm) — verified working from the lab
+        # 2026-05-20 probe logs). No accumulation, no scale ambiguity.
+        for tile_idx, target_x_px, target_y_px in tile_centers_in_wide_pixels(cfg):
             if self._stop_requested:
                 break
             self._wait_if_paused()
@@ -619,26 +633,24 @@ class AutomationRunner(QThread):
             self.progress.emit(tile_idx, n_tiles + 2,
                                f"{cfg.name}: tile {tile_idx}/{n_tiles}")
 
-            # 2a. Restore wide params (sets the configured frame to wide so
-            # SETXYOFF.IMAGECOORD interprets pixel coords in the wide grid).
-            self._stm.scan.apply(wide_params)
+            # Pixel-from-wide-centre → nm-from-wide-centre → absolute nm.
+            dx_nm = (target_x_px - cfg.wide_pixels[0] / 2.0) * wide_nm_per_px_x
+            dy_nm = (target_y_px - cfg.wide_pixels[1] / 2.0) * wide_nm_per_px_y
+            # Safety clamp: never request a tile centre more than half a
+            # wide-field away — anything outside is a math typo.
+            dx_nm = max(-max_excursion_x, min(max_excursion_x, dx_nm))
+            dy_nm = max(-max_excursion_y, min(max_excursion_y, dy_nm))
+            target_nm = (wide_centre[0] + dx_nm, wide_centre[1] + dy_nm)
 
-            # 2b. Position to this tile's centre.
-            if cfg.skip_tile_positioning:
-                log.info("tile %d: skip_tile_positioning ON — staying at wide centre",
-                         tile_idx)
-            else:
-                try:
-                    tx, ty = int(round(target_x)), int(round(target_y))
-                    log.info("tile %d: set_offset_image_coord(%d, %d) "
-                             "[wide grid %dx%d px, %.2fx%.2f nm]",
-                             tile_idx, tx, ty,
-                             cfg.wide_pixels[0], cfg.wide_pixels[1],
-                             cfg.wide_size_nm[0], cfg.wide_size_nm[1])
-                    self._stm.scan.set_offset_image_coord(tx, ty)
-                except Exception as e:
-                    log.warning("tile %d set_offset_image_coord failed: %s",
-                                tile_idx, e)
+            try:
+                self._stm.scan.set_offset_nm(target_nm[0], target_nm[1])
+                log.info(
+                    "tile %d: set_offset_nm(%.3f, %.3f) "
+                    "[Δ from centre: %+.3f, %+.3f nm]",
+                    tile_idx, target_nm[0], target_nm[1], dx_nm, dy_nm,
+                )
+            except Exception as e:
+                log.warning("tile %d set_offset_nm failed: %s", tile_idx, e)
 
             # 2c. Apply tile params (offset preserved).
             tile_params = ScanParams(
@@ -714,17 +726,14 @@ class AutomationRunner(QThread):
             speed_nm_s=cfg.wide_speed_nm_s,
             memo=f"{cfg.name} wide after",
         )
-        # Return to the wide centre (skip if positioning was disabled —
-        # in that case we never moved away from wide-centre anyway).
-        if not cfg.skip_tile_positioning:
-            try:
-                self._stm.scan.apply(wide_params)  # wide frame for IMAGECOORD
-                cx = int(cfg.wide_pixels[0] // 2)
-                cy = int(cfg.wide_pixels[1] // 2)
-                log.info("wide-after: set_offset_image_coord(%d, %d)", cx, cy)
-                self._stm.scan.set_offset_image_coord(cx, cy)
-            except Exception as e:
-                log.warning("return-to-centre failed: %s", e)
+        # Return to the wide centre via absolute set_offset_nm(), so
+        # wide_after is anchored at the same XY as wide_before.
+        try:
+            log.info("wide-after: set_offset_nm(%.3f, %.3f)",
+                     wide_centre[0], wide_centre[1])
+            self._stm.scan.set_offset_nm(wide_centre[0], wide_centre[1])
+        except Exception as e:
+            log.warning("return-to-centre failed: %s", e)
 
         self._stm.scan.apply(wide_after_params)
         if cfg.settling_s > 0:
