@@ -28,3 +28,10 @@ Thumbs.db
 # ScanFlow runtime
 ~/.scanflow_session.json
 ~/.scanflow/
+
+# Lab-PC logs pulled by tools/lab-sync/pull_logs.bat — diagnostic only,
+# not source-of-truth, can accumulate to many MB. Keep the two original
+# probe logs that document the SCAN.OFFSET.X.NM finding (already in the
+# repo); ignore anything new.
+/lab-logs/scanflow_*.log
+!/lab-logs/scanflow_20260520*.log
