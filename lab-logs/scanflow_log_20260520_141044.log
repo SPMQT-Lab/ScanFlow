@@ -1,0 +1,58 @@
+[13:59:14] Connected to STMAFM
+[13:59:14] Loaded from Createc: X=120.0 nm  Y=120.0 nm  speed=91.6 nm/s  pixels=256
+[13:59:14] Survey loaded from Createc: X=120.0 nm  Y=120.0 nm  pixels=256  speed=91.6 nm/s
+[14:04:16] Z drift: 5min Δ=0.86 Å  |  1h Δ=0.86 Å, -10.25 Å/h  |  3h Δ=0.86 Å, -10.25 Å/h
+[14:09:16] Z drift: 5min Δ=0.86 Å  |  1h Δ=1.72 Å, -10.32 Å/h  |  3h Δ=1.72 Å, -10.32 Å/h
+[14:09:59] auto-read: getxypos() unavailable on this rig — type the offset STMAFM is showing into the X / Y boxes.
+[14:10:00] Connected to STMAFM
+[14:10:00] Loaded from Createc: X=120.0 nm  Y=120.0 nm  speed=91.6 nm/s  pixels=256
+[14:10:00] Survey loaded from Createc: X=120.0 nm  Y=120.0 nm  pixels=256  speed=91.6 nm/s
+[14:10:03] auto-read: getxypos() unavailable on this rig — type the offset STMAFM is showing into the X / Y boxes.
+[14:10:10] === Probing XY-read mechanisms ===
+[14:10:10] Look at STMAFM's offset display now and note the X, Y values. Below, find whichever line returns a number matching that.
+[14:10:10]   tip_xy_position()                       → None
+[14:10:10]   getp('SCAN.OFFSET.X.NM', 'SCAN.OFFSET.Y.NM') → X='1.183', Y='25.094'
+[14:10:10]   getp('SCAN.OFFSET.X.VOLT', 'SCAN.OFFSET.Y.VOLT') → X='0.12', Y='2.61'
+[14:10:10]   getp('SCAN.XOFFSET.NM', 'SCAN.YOFFSET.NM') → X=(empty), Y=(empty)
+[14:10:10]   getp('SCAN.XOFFSET.VOLT', 'SCAN.YOFFSET.VOLT') → X=(empty), Y=(empty)
+[14:10:10]   getp('STMAFM.OFFSET.X.NM', 'STMAFM.OFFSET.Y.NM') → X=(empty), Y=(empty)
+[14:10:10]   getp('STMAFM.OFFSET.X.VOLT', 'STMAFM.OFFSET.Y.VOLT') → X=(empty), Y=(empty)
+[14:10:10]   getp('STMAFM.XYOFF.X.NM', 'STMAFM.XYOFF.Y.NM') → X=(empty), Y=(empty)
+[14:10:10]   getp('STMAFM.XYOFF.X.VOLT', 'STMAFM.XYOFF.Y.VOLT') → X=(empty), Y=(empty)
+[14:10:10]   getp('SCAN.XYOFF.X.NM', 'SCAN.XYOFF.Y.NM') → X=(empty), Y=(empty)
+[14:10:10]   getp('SCAN.XYOFF.X.VOLT', 'SCAN.XYOFF.Y.VOLT') → X=(empty), Y=(empty)
+[14:10:10]   getp('SCAN.X.NM', 'SCAN.Y.NM') → X=(empty), Y=(empty)
+[14:10:10]   getp('SCAN.X.VOLT', 'SCAN.Y.VOLT') → X=(empty), Y=(empty)
+[14:10:10]   getdacvalf(board=0, ch=0)      → ERROR: '<win32com.gen_py.Pstmafm Library.Istmafmrem instance at 0x1229343563344>' object has no attribute 'getdacvalf'
+[14:10:10]   getdacvalf(board=0, ch=1)      → ERROR: '<win32com.gen_py.Pstmafm Library.Istmafmrem instance at 0x1229343563344>' object has no attribute 'getdacvalf'
+[14:10:10]   getdacvalf(board=0, ch=2)      → ERROR: '<win32com.gen_py.Pstmafm Library.Istmafmrem instance at 0x1229343563344>' object has no attribute 'getdacvalf'
+[14:10:10]   getdacvalf(board=0, ch=3)      → ERROR: '<win32com.gen_py.Pstmafm Library.Istmafmrem instance at 0x1229343563344>' object has no attribute 'getdacvalf'
+[14:10:10]   getdacvalf(board=1, ch=0)      → ERROR: '<win32com.gen_py.Pstmafm Library.Istmafmrem instance at 0x1229343563344>' object has no attribute 'getdacvalf'
+[14:10:10]   getdacvalf(board=1, ch=1)      → ERROR: '<win32com.gen_py.Pstmafm Library.Istmafmrem instance at 0x1229343563344>' object has no attribute 'getdacvalf'
+[14:10:10]   getdacvalf(board=1, ch=2)      → ERROR: '<win32com.gen_py.Pstmafm Library.Istmafmrem instance at 0x1229343563344>' object has no attribute 'getdacvalf'
+[14:10:10]   getdacvalf(board=1, ch=3)      → ERROR: '<win32com.gen_py.Pstmafm Library.Istmafmrem instance at 0x1229343563344>' object has no attribute 'getdacvalf'
+[14:10:10] === End probe — copy this list and report ===
+[14:10:12] === Probing XY-read mechanisms ===
+[14:10:12] Look at STMAFM's offset display now and note the X, Y values. Below, find whichever line returns a number matching that.
+[14:10:12]   tip_xy_position()                       → None
+[14:10:12]   getp('SCAN.OFFSET.X.NM', 'SCAN.OFFSET.Y.NM') → X='1.183', Y='25.094'
+[14:10:12]   getp('SCAN.OFFSET.X.VOLT', 'SCAN.OFFSET.Y.VOLT') → X='0.12', Y='2.61'
+[14:10:12]   getp('SCAN.XOFFSET.NM', 'SCAN.YOFFSET.NM') → X=(empty), Y=(empty)
+[14:10:12]   getp('SCAN.XOFFSET.VOLT', 'SCAN.YOFFSET.VOLT') → X=(empty), Y=(empty)
+[14:10:12]   getp('STMAFM.OFFSET.X.NM', 'STMAFM.OFFSET.Y.NM') → X=(empty), Y=(empty)
+[14:10:12]   getp('STMAFM.OFFSET.X.VOLT', 'STMAFM.OFFSET.Y.VOLT') → X=(empty), Y=(empty)
+[14:10:12]   getp('STMAFM.XYOFF.X.NM', 'STMAFM.XYOFF.Y.NM') → X=(empty), Y=(empty)
+[14:10:12]   getp('STMAFM.XYOFF.X.VOLT', 'STMAFM.XYOFF.Y.VOLT') → X=(empty), Y=(empty)
+[14:10:12]   getp('SCAN.XYOFF.X.NM', 'SCAN.XYOFF.Y.NM') → X=(empty), Y=(empty)
+[14:10:12]   getp('SCAN.XYOFF.X.VOLT', 'SCAN.XYOFF.Y.VOLT') → X=(empty), Y=(empty)
+[14:10:12]   getp('SCAN.X.NM', 'SCAN.Y.NM') → X=(empty), Y=(empty)
+[14:10:12]   getp('SCAN.X.VOLT', 'SCAN.Y.VOLT') → X=(empty), Y=(empty)
+[14:10:12]   getdacvalf(board=0, ch=0)      → ERROR: '<win32com.gen_py.Pstmafm Library.Istmafmrem instance at 0x1229343563344>' object has no attribute 'getdacvalf'
+[14:10:12]   getdacvalf(board=0, ch=1)      → ERROR: '<win32com.gen_py.Pstmafm Library.Istmafmrem instance at 0x1229343563344>' object has no attribute 'getdacvalf'
+[14:10:12]   getdacvalf(board=0, ch=2)      → ERROR: '<win32com.gen_py.Pstmafm Library.Istmafmrem instance at 0x1229343563344>' object has no attribute 'getdacvalf'
+[14:10:12]   getdacvalf(board=0, ch=3)      → ERROR: '<win32com.gen_py.Pstmafm Library.Istmafmrem instance at 0x1229343563344>' object has no attribute 'getdacvalf'
+[14:10:12]   getdacvalf(board=1, ch=0)      → ERROR: '<win32com.gen_py.Pstmafm Library.Istmafmrem instance at 0x1229343563344>' object has no attribute 'getdacvalf'
+[14:10:12]   getdacvalf(board=1, ch=1)      → ERROR: '<win32com.gen_py.Pstmafm Library.Istmafmrem instance at 0x1229343563344>' object has no attribute 'getdacvalf'
+[14:10:12]   getdacvalf(board=1, ch=2)      → ERROR: '<win32com.gen_py.Pstmafm Library.Istmafmrem instance at 0x1229343563344>' object has no attribute 'getdacvalf'
+[14:10:12]   getdacvalf(board=1, ch=3)      → ERROR: '<win32com.gen_py.Pstmafm Library.Istmafmrem instance at 0x1229343563344>' object has no attribute 'getdacvalf'
+[14:10:12] === End probe — copy this list and report ===

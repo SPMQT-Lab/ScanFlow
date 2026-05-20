@@ -1,0 +1,7 @@
+2026-05-20 13:59:08 INFO    [scanflow.gui.app] ScanFlow file logging → C:\ScanflowMonitor\logs\scanflow_20260520.log
+2026-05-20 13:59:14 INFO    [scanflow.core.stm_client] Connected to STMAFM (scanstatus=0)
+2026-05-20 13:59:14 INFO    [scanflow.core.stm_client] User dispatch unavailable: (-2147221005, 'Invalid class string', None, None)
+2026-05-20 13:59:14 INFO    [scanflow.core.events] COM event sink attached: pstmafm.stmafmevent
+2026-05-20 14:10:00 INFO    [scanflow.core.stm_client] Connected to STMAFM (scanstatus=0)
+2026-05-20 14:10:00 INFO    [scanflow.core.stm_client] User dispatch unavailable: (-2147221005, 'Invalid class string', None, None)
+2026-05-20 14:10:00 INFO    [scanflow.core.events] COM event sink attached: pstmafm.stmafmevent

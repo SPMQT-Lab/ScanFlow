@@ -75,6 +75,8 @@ _DEFAULTS: Dict[str, Any] = {
     "SCAN.IMAGESIZE.NM.Y": 50.0,
     "SCAN.NUM.X": 256,
     "SCAN.NUM.Y": 256,
+    "SCAN.OFFSET.X.NM": 0.0,
+    "SCAN.OFFSET.Y.NM": 0.0,
     "SCAN.ROTATION.DEG": 0.0,
     "SCAN.CHANNELS": ("TOPOGRAPHY", "CURRENT"),
     "Sec/Image:": 30.0,
@@ -399,7 +401,18 @@ class MockDispatch:
         pass
 
     def setxyoffpixel(self, x: float, y: float) -> None:
-        pass
+        with self._lock:
+            cx = float(self._params.get("SCAN.OFFSET.X.NM", 0.0))
+            cy = float(self._params.get("SCAN.OFFSET.Y.NM", 0.0))
+            # Treat the pixel delta as a small nm-equivalent shift for the mock.
+            self._params["SCAN.OFFSET.X.NM"] = cx + float(x) * 0.1
+            self._params["SCAN.OFFSET.Y.NM"] = cy + float(y) * 0.1
+
+    def setxyoffvolt(self, x: float, y: float) -> None:
+        """Absolute set in nm (despite the legacy 'volt' name)."""
+        with self._lock:
+            self._params["SCAN.OFFSET.X.NM"] = float(x)
+            self._params["SCAN.OFFSET.Y.NM"] = float(y)
 
     def scandatabitmap(self) -> Optional[bytes]:
         return None

@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import numpy as np
 
@@ -170,6 +170,32 @@ class ScanController:
     def nudge_offset_pixels(self, dx: float, dy: float) -> None:
         """Shift the scan offset by a sub-pixel amount (used for drift correction)."""
         self._c.raw.setxyoffpixel(dx, dy)
+
+    def set_offset_nm(self, x_nm: float, y_nm: float) -> None:
+        """Set the scan-frame XY offset in nanometres (absolute positioning).
+
+        Uses the legacy ``setxyoffvolt`` COM method which, despite the
+        'volt' in its name, takes input in the same units STMAFM
+        displays for the X/Y offset — confirmed empirically on this rig.
+        This is the canonical positioning call for Mosaic / Survey /
+        anything that needs to move the scan window to a known place.
+        """
+        self._c.raw.setxyoffvolt(float(x_nm), float(y_nm))
+
+    def get_offset_nm(self) -> Optional[Tuple[float, float]]:
+        """Read the current scan-frame XY offset in nanometres.
+
+        Reads ``SCAN.OFFSET.X.NM`` / ``SCAN.OFFSET.Y.NM`` via getp.
+        Returns None if either value can't be read.
+        """
+        try:
+            x = self._c.getp("SCAN.OFFSET.X.NM", None)
+            y = self._c.getp("SCAN.OFFSET.Y.NM", None)
+            if x in (None, "") or y in (None, ""):
+                return None
+            return (float(x), float(y))
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
     # Recipe application

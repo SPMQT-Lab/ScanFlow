@@ -266,7 +266,23 @@ class STMClient:
             return None
 
     def tip_xy_position(self) -> Optional[tuple[float, float]]:
-        """Read the current tip XY position via the user-extension COM."""
+        """Read the current tip XY position in nanometres.
+
+        Tries the primary-COM ``SCAN.OFFSET.{X,Y}.NM`` keys first — those
+        match STMAFM's displayed offset and work on every rig we've
+        tested. Falls back to the secondary ``pstmafm.stmafmuser`` COM's
+        ``getxypos()`` when the primary path returns nothing (some older
+        Createc versions only exposed it that way).
+        """
+        # Primary path — getp keys
+        try:
+            x = self.getp("SCAN.OFFSET.X.NM", "")
+            y = self.getp("SCAN.OFFSET.Y.NM", "")
+            if x not in (None, "") and y not in (None, ""):
+                return (float(x), float(y))
+        except Exception:
+            pass
+        # Fallback — secondary COM dispatch
         if self._user is None:
             return None
         try:
