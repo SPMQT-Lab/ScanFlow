@@ -5,3 +5,43 @@
 2026-05-20 14:10:00 INFO    [scanflow.core.stm_client] Connected to STMAFM (scanstatus=0)
 2026-05-20 14:10:00 INFO    [scanflow.core.stm_client] User dispatch unavailable: (-2147221005, 'Invalid class string', None, None)
 2026-05-20 14:10:00 INFO    [scanflow.core.events] COM event sink attached: pstmafm.stmafmevent
+2026-05-20 14:23:29 INFO    [scanflow.gui.app] ScanFlow file logging → C:\ScanflowMonitor\logs\scanflow_20260520.log
+2026-05-20 14:29:07 INFO    [scanflow.core.stm_client] Connected to STMAFM (scanstatus=0)
+2026-05-20 14:29:07 INFO    [scanflow.core.stm_client] User dispatch unavailable: (-2147221005, 'Invalid class string', None, None)
+2026-05-20 14:29:07 INFO    [scanflow.core.events] COM event sink attached: pstmafm.stmafmevent
+2026-05-20 14:31:15 INFO    [scanflow.core.stm_client] STM bound on thread Dummy-1
+2026-05-20 14:31:15 INFO    [scanflow.automation.runner] Starting Mosaic
+2026-05-20 14:39:08 INFO    [scanflow.automation.runner] tile 1: skip_tile_positioning ON — staying at wide centre
+2026-05-20 14:40:01 INFO    [scanflow.core.stm_client] STM bound on thread Dummy-2
+2026-05-20 14:40:01 INFO    [scanflow.automation.runner] Starting Mosaic
+2026-05-20 14:47:54 INFO    [scanflow.automation.runner] tile 1: set_offset_image_coord(43, 43) [wide grid 256x256 px, 90.00x90.00 nm]
+2026-05-20 15:00:55 INFO    [scanflow.automation.runner] tile 2: set_offset_image_coord(128, 43) [wide grid 256x256 px, 90.00x90.00 nm]
+2026-05-20 15:13:57 INFO    [scanflow.automation.runner] tile 3: set_offset_image_coord(213, 43) [wide grid 256x256 px, 90.00x90.00 nm]
+2026-05-20 15:27:01 INFO    [scanflow.automation.runner] tile 4: set_offset_image_coord(43, 128) [wide grid 256x256 px, 90.00x90.00 nm]
+2026-05-20 15:27:14 WARNING [scanflow.automation.runner] Emergency stop requested — retracting tip
+2026-05-20 15:27:14 WARNING [scanflow.core.safety] Safety emergency_stop fired — halting scan and retracting tip
+2026-05-20 15:27:16 INFO    [scanflow.automation.runner] wide-after: set_offset_image_coord(128, 128)
+2026-05-20 15:37:18 INFO    [scanflow.gui.app] ScanFlow file logging → C:\ScanflowMonitor\logs\scanflow_20260520.log
+2026-05-20 15:37:23 INFO    [scanflow.core.stm_client] Connected to STMAFM (scanstatus=2)
+2026-05-20 15:37:23 INFO    [scanflow.core.stm_client] User dispatch unavailable: (-2147221005, 'Invalid class string', None, None)
+2026-05-20 15:37:23 INFO    [scanflow.core.events] COM event sink attached: pstmafm.stmafmevent
+2026-05-20 15:38:52 INFO    [scanflow.core.stm_client] STM bound on thread Dummy-1
+2026-05-20 15:38:52 INFO    [scanflow.automation.runner] Starting Mosaic
+2026-05-20 15:38:53 INFO    [scanflow.automation.runner] Mosaic: wide_before apply: offset X=0.948 nm  Y=-0.765 nm
+2026-05-20 15:44:07 INFO    [scanflow.automation.runner] Mosaic: wide_before scan complete: offset X=0.948 nm  Y=-0.765 nm
+2026-05-20 15:44:07 INFO    [scanflow.automation.runner] Mosaic wide centre anchored: X=0.948 nm, Y=-0.765 nm
+2026-05-20 15:44:09 INFO    [scanflow.automation.runner] tile 01: set_offset_nm(-19.052, -20.765) [Δ from centre: -20.000, -20.000 nm]
+2026-05-20 15:44:09 INFO    [scanflow.automation.runner] tile 01 after positioning: offset X=-182.899 nm  Y=-199.344 nm
+2026-05-20 15:44:09 WARNING [scanflow.automation.runner] tile 01: positioning mismatch — wanted (-19.052, -20.765), Createc reports (-182.899, -199.344), err (-163.847, -178.579) nm
+2026-05-20 15:44:10 INFO    [scanflow.automation.runner] tile 01 after apply(tile_params): offset X=-182.899 nm  Y=-199.344 nm
+2026-05-20 15:44:15 INFO    [scanflow.automation.runner] tile 01 iter1 before scan: offset X=-182.899 nm  Y=-199.344 nm
+2026-05-20 15:46:05 INFO    [scanflow.automation.runner] tile 01 iter1 after scan: offset X=-182.899 nm  Y=-199.344 nm
+2026-05-20 15:46:05 INFO    [scanflow.automation.runner] AutomationRunner.stop() #1 — graceful halt flagged
+2026-05-20 15:46:10 WARNING [scanflow.automation.runner] AutomationRunner.stop() #2 — emergency stop flagged
+2026-05-20 15:46:14 INFO    [scanflow.automation.runner] tile 02: set_offset_nm(0.948, -20.765) [Δ from centre: +0.000, -20.000 nm]
+2026-05-20 15:46:14 INFO    [scanflow.automation.runner] tile 02 after positioning: offset X=9.101 nm  Y=-199.344 nm
+2026-05-20 15:46:14 WARNING [scanflow.automation.runner] tile 02: positioning mismatch — wanted (0.948, -20.765), Createc reports (9.101, -199.344), err (+8.153, -178.579) nm
+2026-05-20 15:46:15 INFO    [scanflow.automation.runner] tile 02 after apply(tile_params): offset X=9.101 nm  Y=-199.344 nm
+2026-05-20 15:46:15 INFO    [scanflow.automation.runner] Mosaic: before return-to-centre: offset X=9.101 nm  Y=-199.344 nm
+2026-05-20 15:46:15 INFO    [scanflow.automation.runner] wide-after: set_offset_nm(0.948, -0.765)
+2026-05-20 15:46:25 INFO    [scanflow.automation.runner] Mosaic: after return-to-centre: offset X=9.101 nm  Y=-7.344 nm

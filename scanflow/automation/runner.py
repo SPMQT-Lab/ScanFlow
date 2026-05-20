@@ -661,6 +661,19 @@ class AutomationRunner(QThread):
         log.info("Mosaic wide centre anchored: X=%.3f nm, Y=%.3f nm",
                  wide_centre[0], wide_centre[1])
 
+        # Derive the piezo V/nm calibration from the current offset.
+        # set_offset_nm() needs this to convert nm → volts for the
+        # underlying setxyoffvolt COM call. Empirically ~0.1 V/nm on this
+        # rig. If both X and Y are near zero we can't derive — abort
+        # rather than position the tip with a bad calibration.
+        if self._stm.scan.calibrate_xy_from_current() is None:
+            self.error.emit(
+                "Mosaic: piezo calibration unknown and wide_centre is too "
+                "close to (0, 0) to derive it. Move STMAFM to a non-zero "
+                "offset (≥ 0.05 nm) before starting the mosaic."
+            )
+            return
+
         # Tile pixel-offsets → nm offsets in the wide frame
         wide_nm_per_px_x = cfg.wide_size_nm[0] / max(cfg.wide_pixels[0], 1)
         wide_nm_per_px_y = cfg.wide_size_nm[1] / max(cfg.wide_pixels[1], 1)

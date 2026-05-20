@@ -87,6 +87,12 @@ class ScanParams:
 class ScanController:
     def __init__(self, client: "STMClient") -> None:
         self._c = client
+        # Piezo XY calibration in V/nm. Derived from the current
+        # SCAN.OFFSET.{X,Y}.NM vs ...VOLT readings via calibrate_xy_from_current().
+        # None means uncalibrated; set_offset_nm() will attempt to derive it
+        # automatically on first use.
+        self._volts_per_nm_x: Optional[float] = None
+        self._volts_per_nm_y: Optional[float] = None
 
     # ------------------------------------------------------------------
     # Parameter getters/setters
@@ -174,13 +180,42 @@ class ScanController:
     def set_offset_nm(self, x_nm: float, y_nm: float) -> None:
         """Set the scan-frame XY offset in nanometres (absolute positioning).
 
-        Uses the legacy ``setxyoffvolt`` COM method which, despite the
-        'volt' in its name, takes input in the same units STMAFM
-        displays for the X/Y offset — confirmed empirically on this rig.
-        This is the canonical positioning call for Mosaic / Survey /
-        anything that needs to move the scan window to a known place.
+        Routes through ``setxyoffvolt`` which truly takes piezo volts:
+        empirically on this rig, ``setxyoffvolt(1, 0)`` produces an
+        offset of ~9.6 nm (see calibrate_xy_from_current). We multiply
+        the requested nm by the cached V/nm ratio.
+
+        If no calibration is available yet, we try to derive one from
+        the current SCAN.OFFSET.{X,Y}.NM/VOLT readings. If even that
+        fails (offset near zero), we WARN loudly and pass through 1:1 —
+        the user will see the resulting WARN line in the log and know to
+        recalibrate.
         """
-        self._c.raw.setxyoffvolt(float(x_nm), float(y_nm))
+        import logging as _logging
+        log = _logging.getLogger(__name__)
+
+        if self._volts_per_nm_x is None or self._volts_per_nm_y is None:
+            self.calibrate_xy_from_current()
+
+        if self._volts_per_nm_x is None or self._volts_per_nm_y is None:
+            log.warning(
+                "set_offset_nm(%.3f, %.3f) without calibration — "
+                "passing nm to setxyoffvolt 1:1, position will likely be wrong. "
+                "Move the scan to a non-zero offset first so calibration can derive.",
+                x_nm, y_nm,
+            )
+            self._c.raw.setxyoffvolt(float(x_nm), float(y_nm))
+            return
+
+        x_volts = float(x_nm) * self._volts_per_nm_x
+        y_volts = float(y_nm) * self._volts_per_nm_y
+        log.debug(
+            "set_offset_nm(%.3f, %.3f) → setxyoffvolt(%.5f, %.5f) "
+            "[cal: %.5f, %.5f V/nm]",
+            x_nm, y_nm, x_volts, y_volts,
+            self._volts_per_nm_x, self._volts_per_nm_y,
+        )
+        self._c.raw.setxyoffvolt(x_volts, y_volts)
 
     def get_offset_nm(self) -> Optional[Tuple[float, float]]:
         """Read the current scan-frame XY offset in nanometres.
@@ -196,6 +231,67 @@ class ScanController:
             return (float(x), float(y))
         except Exception:
             return None
+
+    def calibrate_xy_from_current(self) -> Optional[Tuple[float, float]]:
+        """Derive the piezo XY V/nm ratio from the current offset readings.
+
+        Reads SCAN.OFFSET.{X,Y}.NM and SCAN.OFFSET.{X,Y}.VOLT and computes
+        V/nm per axis. Caches the result on the controller for future
+        set_offset_nm() calls. Returns ``(vx_per_nm, vy_per_nm)`` or
+        ``None`` if the current offset is too close to zero on both axes
+        to derive a stable ratio.
+
+        Safe to call repeatedly — re-runs whenever the user explicitly
+        wants to refresh the calibration after manual position changes.
+        """
+        import logging as _logging
+        log = _logging.getLogger(__name__)
+        try:
+            x_nm_raw = self._c.getp("SCAN.OFFSET.X.NM", None)
+            x_v_raw  = self._c.getp("SCAN.OFFSET.X.VOLT", None)
+            y_nm_raw = self._c.getp("SCAN.OFFSET.Y.NM", None)
+            y_v_raw  = self._c.getp("SCAN.OFFSET.Y.VOLT", None)
+        except Exception as e:
+            log.warning("calibrate_xy_from_current: getp failed: %s", e)
+            return None
+
+        def _to_float(v) -> float:
+            try:
+                if v in (None, ""):
+                    return 0.0
+                return float(v)
+            except Exception:
+                return 0.0
+
+        x_nm, x_v = _to_float(x_nm_raw), _to_float(x_v_raw)
+        y_nm, y_v = _to_float(y_nm_raw), _to_float(y_v_raw)
+
+        # Need at least one axis with non-trivial offset to derive ratio
+        x_cal = (x_v / x_nm) if abs(x_nm) > 0.05 else None
+        y_cal = (y_v / y_nm) if abs(y_nm) > 0.05 else None
+        # If only one axis is available, use it for both (piezo gain is
+        # usually symmetric to within a percent)
+        if x_cal is None and y_cal is not None:
+            x_cal = y_cal
+        if y_cal is None and x_cal is not None:
+            y_cal = x_cal
+        if x_cal is None and y_cal is None:
+            log.warning(
+                "calibrate_xy_from_current: |X.NM|=%.3f, |Y.NM|=%.3f too close to "
+                "zero to derive calibration. Move scan to a non-zero offset first.",
+                abs(x_nm), abs(y_nm),
+            )
+            return None
+
+        self._volts_per_nm_x = float(x_cal)
+        self._volts_per_nm_y = float(y_cal)
+        log.info(
+            "XY calibration: %.5f V/nm (X), %.5f V/nm (Y)   "
+            "[from offset X=%.3f nm / %.4f V, Y=%.3f nm / %.4f V]",
+            self._volts_per_nm_x, self._volts_per_nm_y,
+            x_nm, x_v, y_nm, y_v,
+        )
+        return (self._volts_per_nm_x, self._volts_per_nm_y)
 
     # ------------------------------------------------------------------
     # Recipe application

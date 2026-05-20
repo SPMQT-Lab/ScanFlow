@@ -77,6 +77,11 @@ _DEFAULTS: Dict[str, Any] = {
     "SCAN.NUM.Y": 256,
     "SCAN.OFFSET.X.NM": 0.0,
     "SCAN.OFFSET.Y.NM": 0.0,
+    # Mock piezo calibration: 1 V = 10 nm (close to a typical LT-STM
+    # head). Used by ScanController.calibrate_xy_from_current() in
+    # offline mode so set_offset_nm() can resolve without a real rig.
+    "SCAN.OFFSET.X.VOLT": 0.0,
+    "SCAN.OFFSET.Y.VOLT": 0.0,
     "SCAN.ROTATION.DEG": 0.0,
     "SCAN.CHANNELS": ("TOPOGRAPHY", "CURRENT"),
     "Sec/Image:": 30.0,
@@ -409,10 +414,13 @@ class MockDispatch:
             self._params["SCAN.OFFSET.Y.NM"] = cy + float(y) * 0.1
 
     def setxyoffvolt(self, x: float, y: float) -> None:
-        """Absolute set in nm (despite the legacy 'volt' name)."""
+        """Absolute set in piezo volts. Real Createc takes volts; the mock
+        simulates a 10 nm/V calibration to match a typical LT-STM head."""
         with self._lock:
-            self._params["SCAN.OFFSET.X.NM"] = float(x)
-            self._params["SCAN.OFFSET.Y.NM"] = float(y)
+            self._params["SCAN.OFFSET.X.VOLT"] = float(x)
+            self._params["SCAN.OFFSET.Y.VOLT"] = float(y)
+            self._params["SCAN.OFFSET.X.NM"] = float(x) * 10.0
+            self._params["SCAN.OFFSET.Y.NM"] = float(y) * 10.0
 
     def scandatabitmap(self) -> Optional[bytes]:
         return None
