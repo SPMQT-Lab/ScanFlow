@@ -110,9 +110,15 @@ class AutomationRunner(QThread):
         self._stop_requested = True
         if self._stop_count >= 2:
             self._emergency_stop_requested = True
+            log.warning("AutomationRunner.stop() #%d — emergency stop flagged",
+                        self._stop_count)
+        else:
+            log.info("AutomationRunner.stop() #%d — graceful halt flagged",
+                     self._stop_count)
 
     def force_stop(self) -> None:
         """Hard-terminate the runner thread. Last resort if soft stop hangs."""
+        log.warning("AutomationRunner.force_stop() — terminating runner thread")
         self._stop_requested = True
         self._emergency_stop_requested = True
         if self.isRunning():

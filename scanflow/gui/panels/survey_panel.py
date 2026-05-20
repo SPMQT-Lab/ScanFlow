@@ -352,9 +352,11 @@ class SurveyPanel(QWidget):
         self._stop_btn.setEnabled(True)
 
     def _stop_run(self) -> None:
-        if self._runner:
-            self._runner.stop()
-            self._status.setText("Stopping…")
+        if not self._runner:
+            return
+        self.log_message.emit("Stop requested — will halt after current feature")
+        self._runner.stop()
+        self._status.setText("Stopping…")
 
     def _open_in_probeflow(self) -> None:
         if self._last_manifest_path is None or not self._last_manifest_path.exists():

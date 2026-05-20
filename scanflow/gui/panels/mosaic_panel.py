@@ -347,9 +347,15 @@ class MosaicPanel(QWidget):
         stop_count_before = self._runner._stop_count
         self._runner.stop()
         if stop_count_before == 0:
+            self.log_message.emit(
+                "Stop requested — will finish current tile iteration then halt"
+            )
             self._stop_btn.setText("Emergency Stop")
             self._status.setText("Stopping…")
         else:
+            self.log_message.emit(
+                "EMERGENCY STOP requested — aborting scan, retracting tip"
+            )
             self._status.setText("Emergency stop — retracting tip…")
 
     def _force_quit_run(self) -> None:
@@ -361,6 +367,9 @@ class MosaicPanel(QWidget):
             "mid-scan — only use if Stop is not responding.",
         )
         if ans == QMessageBox.Yes:
+            self.log_message.emit(
+                "FORCE QUIT — hard-terminating runner thread"
+            )
             self._status.setText("Force-terminating…")
             self._runner.force_stop()
 
