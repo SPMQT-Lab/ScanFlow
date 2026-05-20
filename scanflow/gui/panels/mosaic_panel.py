@@ -322,6 +322,23 @@ class MosaicPanel(QWidget):
         if confirm != QMessageBox.Yes:
             return
 
+        # Snapshot the XY position the instant the user commits, so the
+        # Log tab shows where we're starting from before any apply() runs.
+        try:
+            xy0 = self._stm.scan.get_offset_nm()
+        except Exception as e:
+            self.log_message.emit(f"Mosaic START — error reading XY: {e}")
+            xy0 = None
+        if xy0 is not None:
+            self.log_message.emit(
+                f"Mosaic START — current XY = ({xy0[0]:+.3f}, {xy0[1]:+.3f}) nm"
+            )
+        else:
+            self.log_message.emit(
+                "Mosaic START — could not read SCAN.OFFSET.{X,Y}.NM "
+                "(rig may be unable to position; aborting may be safer)"
+            )
+
         self._runner = AutomationRunner(self._stm, recipe)
         self._runner.progress.connect(self._on_progress)
         self._runner.state_changed.connect(self._on_state)

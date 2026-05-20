@@ -624,6 +624,10 @@ class AutomationRunner(QThread):
             output = Path(cfg.output_folder) / f"mosaic_{stamp}"
             output.mkdir(parents=True, exist_ok=True)
 
+        # First thing on the worker thread: record where we're starting
+        # from, before any apply() / scan / positioning call runs.
+        self._log_offset(f"{cfg.name}: at Start click (worker-thread snapshot)")
+
         # ── 1. Wide overview (before) ─────────────────────────────────
         wide_params = ScanParams(
             bias_V=cfg.bias_V,
