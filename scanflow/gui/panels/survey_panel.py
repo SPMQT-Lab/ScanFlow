@@ -342,6 +342,7 @@ class SurveyPanel(QWidget):
         self._runner.survey_finished.connect(self._on_survey_finished)
         self._runner.z_stability.connect(self._on_z_stability)
         self._runner.settling.connect(self._on_settling)
+        self._runner.info_message.connect(self.log_message)
         self._runner.scan_completed.connect(
             lambda p: self.log_message.emit(f"saved: {p}")
         )

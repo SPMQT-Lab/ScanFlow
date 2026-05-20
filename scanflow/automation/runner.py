@@ -76,6 +76,10 @@ class AutomationRunner(QThread):
     mosaic_tile_started = Signal(int, int)                # (tile_idx, total)
     mosaic_tile_done = Signal(int)                        # tile_idx
     mosaic_finished = Signal(str)                         # output folder path
+    # Free-form line for the GUI Log tab — used to surface things the
+    # runner already log.info()s to the file log, but that the user also
+    # wants to see in the GUI without pulling the file.
+    info_message = Signal(str)
 
     def __init__(self, stm: STMClient, recipe: MeasurementRecipe, parent=None) -> None:
         super().__init__(parent)
@@ -664,13 +668,22 @@ class AutomationRunner(QThread):
             return
         log.info("Mosaic wide centre anchored: X=%.3f nm, Y=%.3f nm",
                  wide_centre[0], wide_centre[1])
+        self.info_message.emit(
+            f"wide centre anchored: X={wide_centre[0]:+.3f} nm  "
+            f"Y={wide_centre[1]:+.3f} nm"
+        )
 
         # Derive the piezo V/nm calibration from the current offset.
         # set_offset_nm() needs this to convert nm → volts for the
         # underlying setxyoffvolt COM call. Empirically ~0.1 V/nm on this
         # rig. If both X and Y are near zero we can't derive — abort
         # rather than position the tip with a bad calibration.
-        if self._stm.scan.calibrate_xy_from_current() is None:
+        cal = self._stm.scan.calibrate_xy_from_current()
+        if cal is not None:
+            self.info_message.emit(
+                f"XY calibration: {cal[0]:.5f} V/nm (X), {cal[1]:.5f} V/nm (Y)"
+            )
+        if cal is None:
             self.error.emit(
                 "Mosaic: piezo calibration unknown and wide_centre is too "
                 "close to (0, 0) to derive it. Move STMAFM to a non-zero "
@@ -707,6 +720,11 @@ class AutomationRunner(QThread):
             target_nm = (wide_centre[0] + dx_nm, wide_centre[1] + dy_nm)
 
             try:
+                self.info_message.emit(
+                    f"tile {tile_idx:02d}/{n_tiles}: target "
+                    f"X={target_nm[0]:+.3f} nm  Y={target_nm[1]:+.3f} nm  "
+                    f"(Δ centre: {dx_nm:+.2f}, {dy_nm:+.2f})"
+                )
                 self._stm.scan.set_offset_nm(target_nm[0], target_nm[1])
                 log.info(
                     "tile %02d: set_offset_nm(%.3f, %.3f) "
@@ -717,15 +735,21 @@ class AutomationRunner(QThread):
                 if actual is not None:
                     err_x = actual[0] - target_nm[0]
                     err_y = actual[1] - target_nm[1]
+                    self.info_message.emit(
+                        f"tile {tile_idx:02d}/{n_tiles}: actual "
+                        f"X={actual[0]:+.3f} nm  Y={actual[1]:+.3f} nm  "
+                        f"(err: {err_x:+.3f}, {err_y:+.3f} nm)"
+                    )
                     if abs(err_x) > 0.5 or abs(err_y) > 0.5:
-                        log.warning(
-                            "tile %02d: positioning mismatch — wanted (%.3f, %.3f), "
-                            "Createc reports (%.3f, %.3f), err (%+.3f, %+.3f) nm",
-                            tile_idx, target_nm[0], target_nm[1],
-                            actual[0], actual[1], err_x, err_y,
-                        )
+                        msg = (f"tile {tile_idx:02d}: positioning mismatch — wanted "
+                               f"({target_nm[0]:.3f}, {target_nm[1]:.3f}), "
+                               f"Createc reports ({actual[0]:.3f}, {actual[1]:.3f}), "
+                               f"err ({err_x:+.3f}, {err_y:+.3f}) nm")
+                        log.warning(msg)
+                        self.info_message.emit("⚠ " + msg)
             except Exception as e:
                 log.warning("tile %02d set_offset_nm failed: %s", tile_idx, e)
+                self.info_message.emit(f"⚠ tile {tile_idx:02d} positioning failed: {e}")
 
             # 2c. Apply tile params (offset preserved).
             tile_params = ScanParams(

@@ -408,6 +408,7 @@ class SweepPanel(QWidget):
         self._runner.drift_measured.connect(self._on_drift)
         self._runner.z_stability.connect(self._on_z_stability)
         self._runner.settling.connect(self._on_settling)
+        self._runner.info_message.connect(self.log_message)
         self._runner.start()
 
         self._progress.setMaximum(recipe.total_steps())

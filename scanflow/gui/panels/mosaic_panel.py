@@ -350,6 +350,10 @@ class MosaicPanel(QWidget):
         self._runner.mosaic_tile_done.connect(self._on_tile_done)
         self._runner.mosaic_finished.connect(self._on_mosaic_finished)
         self._runner.settling.connect(self._on_settling)
+        # Free-form runner info → straight into the Log tab so per-tile XY,
+        # calibration, wide-centre, and positioning errors are visible
+        # without pulling the file log.
+        self._runner.info_message.connect(self.log_message)
         self._runner.start()
 
         self._progress.setMaximum(n_tiles + 2)
