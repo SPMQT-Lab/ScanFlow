@@ -1,29 +1,31 @@
 """Positioning diagnostic — characterise CreaTec's XY offset commands.
 
 ScanFlow currently has three plausible APIs for moving the scan offset
-and each one has misbehaved in different ways on the real rig. Rather
-than keep guessing, this tab lets you fire a single offset command,
-read the tip XY position before/after, and accumulate a table of
-(command, sent, before, after, delta) rows that we can use to build
-the real positioning algorithm.
+and each one has misbehaved in different ways on the real rig. This
+tab lets you fire a single offset command and record what happened in
+STMAFM, so we can derive what the commands actually do.
+
+Two reading modes:
+  * **Auto** — tries ``tip_xy_position()`` via getxypos(). Works only
+    if the ``pstmafm.stmafmuser`` COM is accessible.
+  * **Manual** — you read STMAFM's offset display and type the values
+    in. Always works.
 
 Safety:
-  * Every send is a single one-shot operation — no loops.
-  * Default magnitudes are tiny (1 V/V, 10 pixels) and the spinbox
-    ranges are clamped.
-  * Spec X = 0 and Y = 0 gives a no-op — useful for read-only tests.
-  * No scanning is triggered. The tip will move; the feedback loop
-    keeps the current setpoint, so the same precautions as moving the
-    tip manually in STMAFM apply.
+  * Every Send is a single one-shot operation — no loops.
+  * Default values are 0 (no-op) so the first Send is read-only.
+  * Spinbox ranges are clamped to ±100.
+  * No scanning is triggered.
 
 Workflow:
-  1. Click "Read tip position" to confirm getxypos() works.
+  1. Click "Read auto (if available)". If it returns a number, great.
+     If it says "unavailable", just type the offset STMAFM is currently
+     showing into the Before X / Y boxes.
   2. Pick a Command, set small X / Y values, click "Send".
-  3. The panel auto-reads the tip position before and after, logs the
-     delta. Photograph or note STMAFM's offset display for cross-check.
-  4. Repeat for the three commands and a couple of magnitudes.
-  5. "Save CSV" → send the file to the developer; they translate the
-     results into a working positioning algorithm.
+  3. Look at STMAFM. Type the NEW offset it displays into After X / Y.
+  4. Click "Log row" to record this test.
+  5. Repeat for the three commands × a couple of magnitudes.
+  6. "Save CSV" → send to the developer.
 """
 
 from __future__ import annotations
@@ -72,9 +74,14 @@ class PositioningDiagPanel(QWidget):
 
         # Warning banner
         warn = QLabel(
-            "<b>⚠ This panel moves the tip.</b> Each Send fires one offset "
-            "command — the tip will physically translate. Use small values, "
-            "make sure the surface is clear, and watch STMAFM."
+            "<b>⚠ This panel moves the tip.</b> Each <i>Send</i> fires one "
+            "offset command — the tip will physically translate. Use small "
+            "values, make sure the surface is clear, and watch STMAFM."
+            "<br><br>"
+            "<b>Reading positions:</b> the 'Read auto' buttons try "
+            "<code>getxypos()</code> via the secondary COM dispatch. On rigs "
+            "where that's not exposed, just <b>type the offset STMAFM is "
+            "currently showing</b> into the X/Y boxes by hand."
         )
         warn.setTextFormat(Qt.RichText)
         warn.setWordWrap(True)
@@ -84,20 +91,26 @@ class PositioningDiagPanel(QWidget):
         )
         root.addWidget(warn)
 
-        # Read-position section
-        readbox = QGroupBox("Tip position")
-        rg = QGridLayout(readbox)
-        self._pos_label = QLabel("—")
-        self._pos_label.setStyleSheet("font-family: monospace; font-size: 11pt;")
-        rg.addWidget(QLabel("<b>Current XY:</b>"), 0, 0)
-        rg.addWidget(self._pos_label, 0, 1)
-        read_btn = QPushButton("Read tip position")
-        read_btn.clicked.connect(self._read_position)
-        rg.addWidget(read_btn, 0, 2)
-        root.addWidget(readbox)
+        # 1) BEFORE position
+        before_box = QGroupBox("1.  Before position  (what STMAFM shows now)")
+        bg = QGridLayout(before_box)
+        bg.addWidget(QLabel("X:"), 0, 0)
+        self._before_x = QDoubleSpinBox()
+        self._before_x.setRange(-1e6, 1e6)
+        self._before_x.setDecimals(4)
+        bg.addWidget(self._before_x, 0, 1)
+        bg.addWidget(QLabel("Y:"), 0, 2)
+        self._before_y = QDoubleSpinBox()
+        self._before_y.setRange(-1e6, 1e6)
+        self._before_y.setDecimals(4)
+        bg.addWidget(self._before_y, 0, 3)
+        read_before_btn = QPushButton("Read auto (if available)")
+        read_before_btn.clicked.connect(lambda: self._auto_read(self._before_x, self._before_y))
+        bg.addWidget(read_before_btn, 0, 4)
+        root.addWidget(before_box)
 
-        # Command section
-        cmdbox = QGroupBox("Send one offset command")
+        # 2) Command to send
+        cmdbox = QGroupBox("2.  Send one offset command")
         cg = QGridLayout(cmdbox)
         cg.addWidget(QLabel("Command:"), 0, 0)
         self._cmd_combo = QComboBox()
@@ -131,6 +144,29 @@ class PositioningDiagPanel(QWidget):
         cg.addWidget(send_btn, 3, 0, 1, 4)
         root.addWidget(cmdbox)
 
+        # 3) AFTER position
+        after_box = QGroupBox("3.  After position  (what STMAFM shows after Send)")
+        ag = QGridLayout(after_box)
+        ag.addWidget(QLabel("X:"), 0, 0)
+        self._after_x = QDoubleSpinBox()
+        self._after_x.setRange(-1e6, 1e6)
+        self._after_x.setDecimals(4)
+        ag.addWidget(self._after_x, 0, 1)
+        ag.addWidget(QLabel("Y:"), 0, 2)
+        self._after_y = QDoubleSpinBox()
+        self._after_y.setRange(-1e6, 1e6)
+        self._after_y.setDecimals(4)
+        ag.addWidget(self._after_y, 0, 3)
+        read_after_btn = QPushButton("Read auto (if available)")
+        read_after_btn.clicked.connect(lambda: self._auto_read(self._after_x, self._after_y))
+        ag.addWidget(read_after_btn, 0, 4)
+
+        log_row_btn = QPushButton("Log row to table")
+        log_row_btn.setStyleSheet("font-weight: bold;")
+        log_row_btn.clicked.connect(self._log_current_row)
+        ag.addWidget(log_row_btn, 1, 0, 1, 5)
+        root.addWidget(after_box)
+
         # Results table
         table_box = QGroupBox("Results")
         tg = QVBoxLayout(table_box)
@@ -155,31 +191,34 @@ class PositioningDiagPanel(QWidget):
         root.addWidget(table_box, 1)
 
     # ------------------------------------------------------------------
-    # Position read
+    # Auto-read (best-effort; falls back to manual when unavailable)
     # ------------------------------------------------------------------
 
-    def _read_position(self) -> Optional[Tuple[float, float]]:
+    def _auto_read(self, x_spin: QDoubleSpinBox, y_spin: QDoubleSpinBox) -> None:
+        """Try tip_xy_position(); on success fill the spinboxes, on failure
+        log a hint and leave the user to type the values from STMAFM."""
         if not self._stm.connected and not self._stm.is_mock:
-            self._pos_label.setText("(not connected)")
-            return None
+            self.log_message.emit("auto-read: not connected — type values manually")
+            return
         try:
             xy = self._stm.tip_xy_position()
         except Exception as e:
-            log.exception("tip_xy_position failed")
-            self._pos_label.setText(f"<error: {e}>")
-            return None
+            log.exception("tip_xy_position raised")
+            self.log_message.emit(f"auto-read: error ({e}) — type values manually")
+            return
         if xy is None:
-            self._pos_label.setText(
-                "<i>getxypos() returned None — user dispatch unavailable on this rig?</i>"
+            self.log_message.emit(
+                "auto-read: getxypos() unavailable on this rig — "
+                "type the offset STMAFM is showing into the X / Y boxes."
             )
-            return None
+            return
         x, y = xy
-        self._pos_label.setText(f"X = {x:+.6f}    Y = {y:+.6f}")
-        self.log_message.emit(f"tip XY = ({x:+.6f}, {y:+.6f})")
-        return (x, y)
+        x_spin.setValue(float(x))
+        y_spin.setValue(float(y))
+        self.log_message.emit(f"auto-read: X={x:+.6f}  Y={y:+.6f}")
 
     # ------------------------------------------------------------------
-    # Send a one-shot command
+    # Send a one-shot offset command
     # ------------------------------------------------------------------
 
     def _send_command(self) -> None:
@@ -190,11 +229,6 @@ class PositioningDiagPanel(QWidget):
         cmd = self._cmd_combo.currentText()
         x = self._x_spin.value()
         y = self._y_spin.value()
-
-        # Pre-position read
-        before = self._read_position()
-
-        # Fire the command
         try:
             if cmd.startswith("setxyoffvolt"):
                 self._stm.scan.set_offset_volts(x, y)
@@ -209,29 +243,38 @@ class PositioningDiagPanel(QWidget):
             log.exception("offset command failed")
             QMessageBox.critical(self, "Command failed", str(e))
             return
+        self.log_message.emit(
+            f"sent: {sent_repr} — now read STMAFM's offset display and "
+            f"type it into the After X / Y boxes."
+        )
 
-        self.log_message.emit(f"sent: {sent_repr}")
+    # ------------------------------------------------------------------
+    # Log the current Before / Command / After triple as a table row
+    # ------------------------------------------------------------------
 
-        # Brief settle, then post-position read
-        time.sleep(0.2)
-        after = self._read_position()
-
-        # Row to table
-        if before is not None and after is not None:
-            dx = after[0] - before[0]
-            dy = after[1] - before[1]
-            delta_str = f"({dx:+.4f}, {dy:+.4f})"
-        else:
-            delta_str = "n/a"
+    def _log_current_row(self) -> None:
+        bx, by = self._before_x.value(), self._before_y.value()
+        ax, ay = self._after_x.value(), self._after_y.value()
+        cmd = self._cmd_combo.currentText()
+        sx, sy = self._x_spin.value(), self._y_spin.value()
+        before = (bx, by)
+        after = (ax, ay)
+        dx, dy = ax - bx, ay - by
         self._append_row({
             "time": datetime.now().strftime("%H:%M:%S"),
             "command": cmd,
-            "sent_x": x,
-            "sent_y": y,
+            "sent_x": sx,
+            "sent_y": sy,
             "before": _fmt_xy(before),
             "after": _fmt_xy(after),
-            "delta": delta_str,
+            "delta": f"({dx:+.4f}, {dy:+.4f})",
         })
+        # Stage the next test: copy 'after' into 'before' so the table chains
+        # naturally if you keep sending commands.
+        self._before_x.setValue(ax)
+        self._before_y.setValue(ay)
+        self._after_x.setValue(0.0)
+        self._after_y.setValue(0.0)
 
     # ------------------------------------------------------------------
     # Table management
