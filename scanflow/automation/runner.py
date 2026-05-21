@@ -805,7 +805,10 @@ class AutomationRunner(QThread):
                     pass
 
                 # Drift correction: first iteration becomes the reference;
-                # subsequent iterations cross-correlate against it and nudge.
+                # subsequent iterations cross-correlate against it and
+                # absolute-position via set_offset_nm (using the calibration
+                # already derived). Replaces the relative nudge_offset_pixels
+                # which uses setxyoffpixel — unvalidated on this rig.
                 if it == 0:
                     tile_ref = img
                 elif tile_ref is not None:
@@ -816,22 +819,30 @@ class AutomationRunner(QThread):
                         )
                         result = detector.measure(reference=tile_ref, current=img)
                         if (abs(result.dx_pixels) + abs(result.dy_pixels)) > 0.5:
-                            # Pixel shift the cross-correlation found
-                            # → expected nm shift in current (tile) frame
-                            exp_dx_nm = result.dx_pixels * zoom_nm_per_px_x
-                            exp_dy_nm = result.dy_pixels * zoom_nm_per_px_y
+                            # Pixel shift → nm shift in the tile frame
+                            shift_x_nm = result.dx_pixels * zoom_nm_per_px_x
+                            shift_y_nm = result.dy_pixels * zoom_nm_per_px_y
+
                             before = self._log_offset(
-                                f"tile {tile_idx:02d} iter{it + 1} drift nudge "
+                                f"tile {tile_idx:02d} iter{it + 1} drift "
                                 f"({result.dx_pixels:+.2f}, {result.dy_pixels:+.2f}) px "
-                                f"= expected ({exp_dx_nm:+.3f}, {exp_dy_nm:+.3f}) nm"
+                                f"→ ({shift_x_nm:+.3f}, {shift_y_nm:+.3f}) nm"
                             )
-                            self._stm.scan.nudge_offset_pixels(
-                                result.dx_pixels, result.dy_pixels,
-                            )
-                            self._verify_nudge(
-                                f"tile {tile_idx:02d} iter{it + 1} nudge",
-                                before, exp_dx_nm, exp_dy_nm,
-                            )
+                            if before is not None:
+                                new_x = before[0] + shift_x_nm
+                                new_y = before[1] + shift_y_nm
+                                self._stm.scan.set_offset_nm(new_x, new_y)
+                                self._verify_nudge(
+                                    f"tile {tile_idx:02d} iter{it + 1} drift",
+                                    before, shift_x_nm, shift_y_nm,
+                                )
+                                self.info_message.emit(
+                                    f"tile {tile_idx:02d} iter{it + 1}: drift "
+                                    f"corrected by ({shift_x_nm:+.3f}, "
+                                    f"{shift_y_nm:+.3f}) nm "
+                                    f"[from {result.dx_pixels:+.2f}, "
+                                    f"{result.dy_pixels:+.2f} px shift]"
+                                )
                             self.drift_measured.emit(result)
                     except Exception as e:
                         log.debug("tile drift step failed: %s", e)
@@ -873,6 +884,36 @@ class AutomationRunner(QThread):
             if output is not None and wide_after_img is not None:
                 _save_image_preview(wide_after_img, output / "wide_after.png")
             self._log_offset(f"{cfg.name}: wide_after scan complete")
+
+            # Total mosaic drift: cross-correlate wide_before vs wide_after.
+            # Both anchored at wide_centre, so any pixel shift is sample
+            # drift over the whole mosaic duration. Useful diagnostic for
+            # overnight runs and rig stability.
+            if wide_before_img is not None and wide_after_img is not None:
+                try:
+                    detector = DriftDetector(
+                        continuous=False,
+                        method=getattr(self._recipe, "drift_method", "hybrid"),
+                    )
+                    drift = detector.measure(
+                        reference=wide_before_img, current=wide_after_img,
+                    )
+                    drift_x_nm = drift.dx_pixels * wide_nm_per_px_x
+                    drift_y_nm = drift.dy_pixels * wide_nm_per_px_y
+                    drift_total = (drift_x_nm ** 2 + drift_y_nm ** 2) ** 0.5
+                    log.info(
+                        "Mosaic total drift (wide_before → wide_after): "
+                        "Δx=%+.3f nm, Δy=%+.3f nm, |Δ|=%.3f nm  "
+                        "(confidence %.2f, method=%s)",
+                        drift_x_nm, drift_y_nm, drift_total,
+                        drift.confidence, drift.method,
+                    )
+                    self.info_message.emit(
+                        f"Total mosaic drift: Δx={drift_x_nm:+.3f} nm, "
+                        f"Δy={drift_y_nm:+.3f} nm, |Δ|={drift_total:.3f} nm"
+                    )
+                except Exception as e:
+                    log.warning("Mosaic total drift measurement failed: %s", e)
 
         if output is not None:
             self.mosaic_finished.emit(str(output))
