@@ -99,3 +99,22 @@
 2026-05-20 16:08:29 INFO    [scanflow.automation.runner] Mosaic: before return-to-centre: offset X=-28.656 nm  Y=-66.528 nm
 2026-05-20 16:08:29 INFO    [scanflow.automation.runner] wide-after: set_offset_nm(1.344, -66.528)
 2026-05-20 16:08:30 INFO    [scanflow.automation.runner] Mosaic: after return-to-centre: offset X=1.344 nm  Y=-66.528 nm
+2026-05-20 16:17:41 INFO    [scanflow.gui.app] ScanFlow file logging → C:\ScanflowMonitor\logs\scanflow_20260520.log
+2026-05-20 16:19:33 INFO    [scanflow.core.stm_client] Connected to STMAFM (scanstatus=0)
+2026-05-20 16:19:33 INFO    [scanflow.core.stm_client] User dispatch unavailable: (-2147221005, 'Invalid class string', None, None)
+2026-05-20 16:19:33 INFO    [scanflow.core.events] COM event sink attached: pstmafm.stmafmevent
+2026-05-20 16:19:37 INFO    [scanflow.core.stm_client] STM bound on thread Dummy-1
+2026-05-20 16:19:37 INFO    [scanflow.automation.runner] Starting Mosaic
+2026-05-20 16:19:37 INFO    [scanflow.automation.runner] Mosaic: at Start click (worker-thread snapshot): offset X=0.000 nm  Y=0.000 nm
+2026-05-20 16:19:38 INFO    [scanflow.automation.runner] Mosaic: wide_before apply: offset X=0.000 nm  Y=0.000 nm
+2026-05-20 16:19:57 INFO    [scanflow.automation.runner] AutomationRunner.stop() #1 — graceful halt flagged
+2026-05-20 16:19:58 INFO    [scanflow.automation.runner] Mosaic: wide_before scan complete: offset X=0.000 nm  Y=0.000 nm
+2026-05-20 16:19:58 INFO    [scanflow.automation.runner] Mosaic wide centre anchored: X=0.000 nm, Y=0.000 nm
+2026-05-20 16:19:58 WARNING [scanflow.core.scan] calibrate_xy_from_current: |X.NM|=0.000, |Y.NM|=0.000 too close to zero to derive calibration. Move scan to a non-zero offset first.
+2026-05-20 16:20:09 INFO    [scanflow.core.stm_client] STM bound on thread Dummy-2
+2026-05-20 16:20:09 INFO    [scanflow.automation.runner] Starting Mosaic
+2026-05-20 16:20:09 INFO    [scanflow.automation.runner] Mosaic: at Start click (worker-thread snapshot): offset X=0.000 nm  Y=0.000 nm
+2026-05-20 16:20:10 INFO    [scanflow.automation.runner] Mosaic: wide_before apply: offset X=0.000 nm  Y=0.000 nm
+2026-05-20 16:40:48 INFO    [scanflow.automation.runner] Mosaic: wide_before scan complete: offset X=0.000 nm  Y=0.000 nm
+2026-05-20 16:40:48 INFO    [scanflow.automation.runner] Mosaic wide centre anchored: X=0.000 nm, Y=0.000 nm
+2026-05-20 16:40:48 WARNING [scanflow.core.scan] calibrate_xy_from_current: |X.NM|=0.000, |Y.NM|=0.000 too close to zero to derive calibration. Move scan to a non-zero offset first.

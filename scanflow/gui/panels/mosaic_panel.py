@@ -333,11 +333,37 @@ class MosaicPanel(QWidget):
             self.log_message.emit(
                 f"Mosaic START — current XY = ({xy0[0]:+.3f}, {xy0[1]:+.3f}) nm"
             )
+            # Fail-fast on the (0, 0) case — set_offset_nm() needs a V/nm
+            # calibration derived from a non-zero offset, and there's no
+            # point making the user wait through wide_before just to abort.
+            if abs(xy0[0]) < 0.05 and abs(xy0[1]) < 0.05:
+                QMessageBox.warning(
+                    self, "Scan at piezo origin",
+                    "<b>Cannot start mosaic at XY = (0, 0).</b><br><br>"
+                    "ScanFlow derives the piezo V/nm calibration from the "
+                    "current offset, and needs a non-zero starting point "
+                    "(at least ±0.05 nm on either axis).<br><br>"
+                    "In STMAFM, nudge the scan frame slightly off the origin "
+                    "and try again — anywhere within a few nm is fine."
+                )
+                self.log_message.emit(
+                    "Mosaic START aborted — XY = (0, 0); piezo calibration "
+                    "cannot be derived. Move STMAFM to a non-zero offset first."
+                )
+                return
         else:
             self.log_message.emit(
                 "Mosaic START — could not read SCAN.OFFSET.{X,Y}.NM "
                 "(rig may be unable to position; aborting may be safer)"
             )
+            QMessageBox.warning(
+                self, "Cannot read XY offset",
+                "ScanFlow could not read SCAN.OFFSET.{X,Y}.NM. Without a "
+                "current-position reading, the mosaic positioning logic "
+                "cannot derive its calibration. Check that STMAFM is "
+                "connected and showing live offset values."
+            )
+            return
 
         self._runner = AutomationRunner(self._stm, recipe)
         self._runner.progress.connect(self._on_progress)

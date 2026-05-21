@@ -679,17 +679,19 @@ class AutomationRunner(QThread):
         # rig. If both X and Y are near zero we can't derive — abort
         # rather than position the tip with a bad calibration.
         cal = self._stm.scan.calibrate_xy_from_current()
-        if cal is not None:
-            self.info_message.emit(
-                f"XY calibration: {cal[0]:.5f} V/nm (X), {cal[1]:.5f} V/nm (Y)"
-            )
         if cal is None:
-            self.error.emit(
-                "Mosaic: piezo calibration unknown and wide_centre is too "
-                "close to (0, 0) to derive it. Move STMAFM to a non-zero "
-                "offset (≥ 0.05 nm) before starting the mosaic."
+            msg = (
+                "Mosaic ABORTED — piezo calibration could not be derived "
+                "(wide_centre is at or near the piezo origin). "
+                "Move STMAFM to a non-zero offset (≥ 0.05 nm) and re-start."
             )
+            log.error(msg)
+            self.info_message.emit("⚠ " + msg)
+            self.error.emit(msg)
             return
+        self.info_message.emit(
+            f"XY calibration: {cal[0]:.5f} V/nm (X), {cal[1]:.5f} V/nm (Y)"
+        )
 
         # Tile pixel-offsets → nm offsets in the wide frame
         wide_nm_per_px_x = cfg.wide_size_nm[0] / max(cfg.wide_pixels[0], 1)
