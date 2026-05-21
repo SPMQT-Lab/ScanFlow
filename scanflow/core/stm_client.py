@@ -177,6 +177,11 @@ class STMClient:
 
         Counterpart to :meth:`bind_thread`. Safe to call unconditionally —
         no-op in mock mode and tolerant of repeat calls.
+
+        The 250 ms pre-uninit sleep lets any in-flight Createc COM events
+        targeting our proxy drain before we tear the apartment down. Without
+        it, STMAFM occasionally crashes when its post-scan-stop bookkeeping
+        tries to invoke our just-released proxy.
         """
         if self._is_mock:
             return
@@ -184,6 +189,8 @@ class STMClient:
         self._local.user = None
         try:
             import pythoncom
+            import time
+            time.sleep(0.25)
             pythoncom.CoUninitialize()
         except Exception:
             pass

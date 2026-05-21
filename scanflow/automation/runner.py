@@ -121,13 +121,32 @@ class AutomationRunner(QThread):
                      self._stop_count)
 
     def force_stop(self) -> None:
-        """Hard-terminate the runner thread. Last resort if soft stop hangs."""
-        log.warning("AutomationRunner.force_stop() — terminating runner thread")
+        """Try to halt the runner gracefully; terminate only as a last resort.
+
+        QThread.terminate() skips the finally block, which means
+        unbind_thread() never runs and the COM apartment is left in an
+        inconsistent state — that's what crashes STMAFM after a force
+        quit. So we give the graceful path up to 8 seconds to drain
+        first; only if it really hangs do we fall back to terminate().
+        """
+        log.warning("AutomationRunner.force_stop() requested")
         self._stop_requested = True
         self._emergency_stop_requested = True
-        if self.isRunning():
-            self.terminate()
-            self.wait(2000)
+        if not self.isRunning():
+            return
+        # Graceful path: flags are set, the scan loop will see them and
+        # exit cleanly via the finally block (which uninits COM safely).
+        if self.wait(8000):
+            log.info("force_stop: worker exited gracefully — COM clean")
+            return
+        # Worker truly hung. Terminate is the only option, but warn:
+        # STMAFM may crash because COM tear-down is skipped.
+        log.error(
+            "force_stop: worker did not exit after 8 s — terminating. "
+            "STMAFM may crash; if so, restart STMAFM before reconnecting."
+        )
+        self.terminate()
+        self.wait(2000)
 
     def pause(self) -> None:
         self._pause_requested = True
@@ -1018,9 +1037,15 @@ class AutomationRunner(QThread):
             if self._emergency_stop_requested:
                 log.warning("Emergency stop requested — retracting tip")
                 self._safety.emergency_stop(self._stm)
+                # Wait for STMAFM to actually halt before we let the worker
+                # exit and tear down COM. Releasing the proxy while STMAFM
+                # is still mid-stop is the canonical 'STMAFM crashed after
+                # I clicked Stop' pattern.
+                self._wait_for_scan_idle(timeout_s=5.0)
                 return False
             if self._stop_requested:
                 scan.stop()
+                self._wait_for_scan_idle(timeout_s=5.0)
                 return False
             self._wait_if_paused()
             # Safety check — raises SafetyViolation if threshold exceeded
@@ -1035,6 +1060,36 @@ class AutomationRunner(QThread):
             # Either wake on an event or sleep the polling interval
             bridge.consume_flag(timeout=poll_interval_s)
         return True
+
+    def _wait_for_scan_idle(self, timeout_s: float = 5.0,
+                             poll_s: float = 0.1) -> bool:
+        """Block until STMAFM reports the scan as no longer running.
+
+        Used right after we send STMAFM.BTN.STOP — without this delay, we
+        return immediately, the worker thread exits, and the finally
+        block tears down our COM proxy while STMAFM is still in its
+        stop-handling code. That's the standard 'STMAFM crashed after I
+        clicked Stop' recipe.
+
+        Returns True if the scan went idle within ``timeout_s``, False if
+        the timeout fired (we still let the caller proceed in that case
+        — better than hanging the worker forever).
+        """
+        import time as _time
+        scan = self._stm.scan
+        deadline = _time.monotonic() + float(timeout_s)
+        while _time.monotonic() < deadline:
+            try:
+                if not scan.is_running:
+                    log.info("scan idle confirmed after stop")
+                    return True
+            except Exception as e:
+                log.debug("is_running check raised: %s", e)
+                return False
+            _time.sleep(poll_s)
+        log.warning("scan still running %.1fs after stop request — proceeding anyway",
+                    timeout_s)
+        return False
 
     def _check_safety(self) -> None:
         """Raise SafetyViolation if the current threshold is exceeded."""
