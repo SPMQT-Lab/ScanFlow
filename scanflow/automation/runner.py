@@ -678,18 +678,23 @@ class AutomationRunner(QThread):
         # underlying setxyoffvolt COM call. Empirically ~0.1 V/nm on this
         # rig. If both X and Y are near zero we can't derive — abort
         # rather than position the tip with a bad calibration.
-        cal = self._stm.scan.calibrate_xy_from_current()
+        # Calibration policy: prefer the delta-probe method unconditionally.
+        # The "from current" path is unreliable when either axis has a
+        # small starting offset (≲ a few nm) because Createc rounds the
+        # .VOLT readback to two decimal places, contaminating the V/nm
+        # ratio. A known +0.1 V probe move (≈1 nm) gives ~20× the signal
+        # and a calibration accurate to well under 1%.
+        self.info_message.emit(
+            "Calibration: deriving V/nm by delta probe "
+            "(±0.1 V move + restore — tip returns to start)"
+        )
+        cal = self._stm.scan.calibrate_xy_by_delta()
         if cal is None:
-            # Starting position is at (or very near) the piezo origin,
-            # so we can't divide V/NM directly. Fall back to a tiny
-            # known probe move and read the delta — works at any
-            # starting XY, including exactly (0, 0). Returns the tip
-            # to its original position when done.
-            self.info_message.emit(
-                "Calibration: deriving V/nm by delta probe "
-                "(±0.1 V move + restore — tip returns to start)"
-            )
-            cal = self._stm.scan.calibrate_xy_by_delta()
+            # Delta probe didn't move the piezo enough to trust the
+            # reading (rare — typically means the rig is unresponsive).
+            # Fall back to the from-current path; better than nothing.
+            log.warning("delta-probe calibration failed; trying from-current")
+            cal = self._stm.scan.calibrate_xy_from_current()
         if cal is None:
             msg = (
                 "Mosaic ABORTED — piezo calibration could not be derived "
