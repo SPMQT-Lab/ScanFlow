@@ -26,16 +26,18 @@ def test_tile_centers_cover_wide_pixels():
     cfg = MosaicConfig(wide_size_nm=(90.0, 90.0), wide_pixels=(300, 300), grid_n=3)
     centres = list(tile_centers_in_wide_pixels(cfg))
     assert len(centres) == 9
-    # Row-major: tile 1 is top-left
+    # Middle-first row order: tile 1 is middle-LEFT (same Y as wide centre).
     idx1, cx1, cy1 = centres[0]
     assert idx1 == 1
-    assert cx1 == 50.0   # 300/3 = 100 wide → centre 50
-    assert cy1 == 50.0
-    # Tile 5 is centre
-    idx5, cx5, cy5 = centres[4]
-    assert idx5 == 5
-    assert cx5 == 150.0
-    assert cy5 == 150.0
+    assert cx1 == 50.0   # 300/3 = 100 wide → centre 50 (left column)
+    assert cy1 == 150.0  # middle row → centre Y
+    # Tile 2 is middle-centre (the wide centre itself in pixel terms)
+    idx2, cx2, cy2 = centres[1]
+    assert (cx2, cy2) == (150.0, 150.0)
+    # Tile 3 is middle-right
+    assert (centres[2][1], centres[2][2]) == (250.0, 150.0)
+    # Tile 4 is top-left (next row out)
+    assert (centres[3][1], centres[3][2]) == (50.0, 50.0)
     # Tile 9 is bottom-right
     idx9, cx9, cy9 = centres[-1]
     assert idx9 == 9
@@ -46,11 +48,16 @@ def test_tile_centers_cover_wide_pixels():
 def test_tile_pixel_centres_are_evenly_spaced():
     cfg = MosaicConfig(wide_pixels=(300, 300), grid_n=3)
     centres = list(tile_centers_in_wide_pixels(cfg))
-    # The X coords of each row should match
-    row0 = [c[1] for c in centres[0:3]]
-    row1 = [c[1] for c in centres[3:6]]
-    row2 = [c[1] for c in centres[6:9]]
-    assert row0 == row1 == row2 == [50.0, 150.0, 250.0]
+    # Each row's X coords are still [left, centre, right] — only the row
+    # *order* changed (middle first).
+    middle_row = [c[1] for c in centres[0:3]]
+    top_row    = [c[1] for c in centres[3:6]]
+    bottom_row = [c[1] for c in centres[6:9]]
+    assert middle_row == top_row == bottom_row == [50.0, 150.0, 250.0]
+    # Y of middle row is centre, top row is min, bottom row is max
+    assert centres[0][2] == 150.0   # middle
+    assert centres[3][2] == 50.0    # top
+    assert centres[6][2] == 250.0   # bottom
 
 
 def test_estimate_duration_scales_with_tiles_and_iterations():

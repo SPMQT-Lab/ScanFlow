@@ -5,11 +5,16 @@ overview at the end. Each zoom tile is acquired ``iterations_per_tile``
 times with drift correction between iterations, so you keep the best
 (or average) scan after the fact.
 
-Grid layout (row-major, 1-indexed):
+Grid layout (middle row first, then top, then bottom; columns L→R):
 
-    1 2 3      ← top row (negative Y if Y points down)
-    4 5 6
-    7 8 9
+    4 5 6      ← top    row (Y = wide_centre.Y − wide_size_nm/3)
+    1 2 3      ← middle row (Y = wide_centre.Y)            ← tiles 1..3
+    7 8 9      ← bottom row (Y = wide_centre.Y + wide_size_nm/3)
+
+So tile 1 shares Y with the wide image (only X differs), and the
+middle horizontal strip of the wide field is scanned first — useful
+when drift along Y is faster than X and you want the best-aligned
+data acquired before drift accumulates.
 """
 
 from __future__ import annotations
@@ -64,18 +69,31 @@ class MosaicConfig:
 def tile_centers_in_wide_pixels(cfg: MosaicConfig):
     """Yield ``(tile_index_1based, cx_px, cy_px)`` for each tile.
 
-    The pixel coordinates are in the wide-image frame. Row-major order:
-    tile 1 is top-left, tile ``grid_n`` is top-right, tile ``grid_n+1`` is
-    the start of the second row, etc.
+    The pixel coordinates are in the wide-image frame.
+
+    Row order: **middle row first**, then alternating outward — so for a
+    3×3 grid the row sequence is [1, 0, 2] (middle, top, bottom). For 5×5
+    it's [2, 1, 3, 0, 4]. This way tiles 1..n share Y with wide_centre
+    and only X varies. Within each row, columns go left → right.
     """
     n = cfg.grid_n
     if n < 1:
         return
     wpx, wpy = cfg.wide_pixels
-    # Tile centers in pixels: split the wide image into n×n equal cells,
-    # take the centre of each cell.
+
+    # Row order: middle, then alternating one above + one below, outward.
+    mid = n // 2
+    row_order = [mid]
+    for offset in range(1, n):
+        above = mid - offset
+        below = mid + offset
+        if above >= 0:
+            row_order.append(above)
+        if below < n:
+            row_order.append(below)
+
     idx = 1
-    for row in range(n):
+    for row in row_order:
         for col in range(n):
             cx = (col + 0.5) * wpx / n
             cy = (row + 0.5) * wpy / n
