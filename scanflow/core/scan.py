@@ -239,7 +239,8 @@ class ScanController:
         V/nm per axis. Caches the result on the controller for future
         set_offset_nm() calls. Returns ``(vx_per_nm, vy_per_nm)`` or
         ``None`` if the current offset is too close to zero on both axes
-        to derive a stable ratio.
+        to derive a stable ratio — at that point callers should invoke
+        :meth:`calibrate_xy_by_delta` instead.
 
         Safe to call repeatedly — re-runs whenever the user explicitly
         wants to refresh the calibration after manual position changes.
@@ -269,16 +270,14 @@ class ScanController:
         # Need at least one axis with non-trivial offset to derive ratio
         x_cal = (x_v / x_nm) if abs(x_nm) > 0.05 else None
         y_cal = (y_v / y_nm) if abs(y_nm) > 0.05 else None
-        # If only one axis is available, use it for both (piezo gain is
-        # usually symmetric to within a percent)
         if x_cal is None and y_cal is not None:
             x_cal = y_cal
         if y_cal is None and x_cal is not None:
             y_cal = x_cal
         if x_cal is None and y_cal is None:
-            log.warning(
-                "calibrate_xy_from_current: |X.NM|=%.3f, |Y.NM|=%.3f too close to "
-                "zero to derive calibration. Move scan to a non-zero offset first.",
+            log.info(
+                "calibrate_xy_from_current: |X.NM|=%.3f, |Y.NM|=%.3f near "
+                "zero — falling back to delta calibration",
                 abs(x_nm), abs(y_nm),
             )
             return None
@@ -286,10 +285,113 @@ class ScanController:
         self._volts_per_nm_x = float(x_cal)
         self._volts_per_nm_y = float(y_cal)
         log.info(
-            "XY calibration: %.5f V/nm (X), %.5f V/nm (Y)   "
+            "XY calibration (from current): %.5f V/nm (X), %.5f V/nm (Y)   "
             "[from offset X=%.3f nm / %.4f V, Y=%.3f nm / %.4f V]",
             self._volts_per_nm_x, self._volts_per_nm_y,
             x_nm, x_v, y_nm, y_v,
+        )
+        return (self._volts_per_nm_x, self._volts_per_nm_y)
+
+    def calibrate_xy_by_delta(
+        self, probe_volts: float = 0.1, settle_s: float = 0.3,
+    ) -> Optional[Tuple[float, float]]:
+        """Derive V/nm by making a tiny known move and reading the delta.
+
+        Works regardless of starting position — including XY = (0, 0).
+        Uses the *change* in SCAN.OFFSET.X.NM after a ``probe_volts``
+        move on setxyoffvolt, so the absolute origin is irrelevant.
+
+        Safety:
+          * ``probe_volts = 0.1`` corresponds to roughly 1 nm of tip
+            displacement on a typical Createc piezo (0.1 V/nm), well
+            within any sane scan range.
+          * After deriving the ratio, this method *restores the original
+            offset* so the tip is back where it started.
+          * Pure read-write-read-write sequence — no scan, no Z move.
+
+        Returns ``(vx_per_nm, vy_per_nm)`` on success, ``None`` if the
+        piezo didn't respond (delta too small to be trusted).
+        """
+        import logging as _logging
+        import time as _time
+        log = _logging.getLogger(__name__)
+
+        def _read_nm() -> Optional[Tuple[float, float]]:
+            try:
+                x = self._c.getp("SCAN.OFFSET.X.NM", None)
+                y = self._c.getp("SCAN.OFFSET.Y.NM", None)
+                if x in (None, "") or y in (None, ""):
+                    return None
+                return (float(x), float(y))
+            except Exception:
+                return None
+
+        def _read_volt() -> Optional[Tuple[float, float]]:
+            try:
+                x = self._c.getp("SCAN.OFFSET.X.VOLT", None)
+                y = self._c.getp("SCAN.OFFSET.Y.VOLT", None)
+                if x in (None, "") or y in (None, ""):
+                    return None
+                return (float(x), float(y))
+            except Exception:
+                return None
+
+        start_nm = _read_nm()
+        start_v = _read_volt()
+        if start_nm is None or start_v is None:
+            log.warning("calibrate_xy_by_delta: could not read start position")
+            return None
+
+        # Probe move: shift by +probe_volts on each axis
+        target_v = (start_v[0] + probe_volts, start_v[1] + probe_volts)
+        log.info(
+            "calibrate_xy_by_delta: probing with setxyoffvolt(%+.4f, %+.4f) V "
+            "(from start V=%.4f, %.4f)",
+            target_v[0], target_v[1], start_v[0], start_v[1],
+        )
+        try:
+            self._c.raw.setxyoffvolt(target_v[0], target_v[1])
+        except Exception as e:
+            log.warning("calibrate_xy_by_delta: probe setxyoffvolt failed: %s", e)
+            return None
+        _time.sleep(settle_s)
+
+        after_nm = _read_nm()
+        if after_nm is None:
+            log.warning("calibrate_xy_by_delta: could not read after-probe position")
+            # Try to restore anyway
+            try:
+                self._c.raw.setxyoffvolt(start_v[0], start_v[1])
+            except Exception:
+                pass
+            return None
+
+        delta_nm = (after_nm[0] - start_nm[0], after_nm[1] - start_nm[1])
+
+        # Restore original position immediately
+        try:
+            self._c.raw.setxyoffvolt(start_v[0], start_v[1])
+            _time.sleep(settle_s)
+        except Exception as e:
+            log.warning("calibrate_xy_by_delta: restore failed: %s", e)
+
+        # Sanity: piezo should have responded by at least 0.1 nm
+        if abs(delta_nm[0]) < 0.1 or abs(delta_nm[1]) < 0.1:
+            log.warning(
+                "calibrate_xy_by_delta: piezo barely responded — "
+                "delta (%.3f, %.3f) nm too small to trust",
+                delta_nm[0], delta_nm[1],
+            )
+            return None
+
+        # V/nm = probe_volts / observed_nm_delta
+        self._volts_per_nm_x = float(probe_volts / delta_nm[0])
+        self._volts_per_nm_y = float(probe_volts / delta_nm[1])
+        log.info(
+            "XY calibration (by delta): %.5f V/nm (X), %.5f V/nm (Y)   "
+            "[%.4f V move → (%.3f, %.3f) nm]",
+            self._volts_per_nm_x, self._volts_per_nm_y,
+            probe_volts, delta_nm[0], delta_nm[1],
         )
         return (self._volts_per_nm_x, self._volts_per_nm_y)
 

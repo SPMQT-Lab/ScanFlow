@@ -680,10 +680,21 @@ class AutomationRunner(QThread):
         # rather than position the tip with a bad calibration.
         cal = self._stm.scan.calibrate_xy_from_current()
         if cal is None:
+            # Starting position is at (or very near) the piezo origin,
+            # so we can't divide V/NM directly. Fall back to a tiny
+            # known probe move and read the delta — works at any
+            # starting XY, including exactly (0, 0). Returns the tip
+            # to its original position when done.
+            self.info_message.emit(
+                "Calibration: deriving V/nm by delta probe "
+                "(±0.1 V move + restore — tip returns to start)"
+            )
+            cal = self._stm.scan.calibrate_xy_by_delta()
+        if cal is None:
             msg = (
                 "Mosaic ABORTED — piezo calibration could not be derived "
-                "(wide_centre is at or near the piezo origin). "
-                "Move STMAFM to a non-zero offset (≥ 0.05 nm) and re-start."
+                "(both from-current and delta-probe methods failed). "
+                "Check the piezo is responding and SCAN.OFFSET keys are live."
             )
             log.error(msg)
             self.info_message.emit("⚠ " + msg)
