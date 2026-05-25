@@ -4,9 +4,9 @@ Two sweep modes:
   • Bias ramp at constant tunneling current
   • Current ramp at constant bias
 
-Both with optional drift correction and tip-crash safety abort. Live monitoring
-of the actual scan is done in the manufacturer's STMAFM software — this panel
-just orchestrates parameter changes between scans.
+Both with tip-crash safety abort. Live monitoring of the actual scan is done
+in the manufacturer's STMAFM software — this panel just orchestrates
+parameter changes between scans.
 """
 
 from __future__ import annotations
@@ -158,7 +158,7 @@ class SweepPanel(QWidget):
         return box
 
     def _build_safety_group(self) -> QGroupBox:
-        box = QGroupBox("Safety and drift")
+        box = QGroupBox("Safety")
         g = QGridLayout(box)
 
         self._safety_chk = QCheckBox("Tip-crash safety abort")
@@ -172,24 +172,8 @@ class SweepPanel(QWidget):
         self._safety_nA.setValue(1.0)
         g.addWidget(self._safety_nA, 0, 3)
 
-        self._drift_chk = QCheckBox("Drift correction")
-        self._drift_chk.setChecked(True)
-        self._drift_chk.toggled.connect(self._refresh_estimate)
-        g.addWidget(self._drift_chk, 1, 0, 1, 2)
-
-        self._fast_align_chk = QCheckBox("Fast alignment (half-pixel)")
-        self._fast_align_chk.setChecked(False)
-        self._fast_align_chk.setToolTip(
-            "Run the alignment scan at half the data-scan pixel count for "
-            "roughly 2× faster alignment (~33% faster sweep overall). The "
-            "reference is downsampled on the fly to match; correlation "
-            "precision is slightly coarser but still sub-pixel."
-        )
-        self._fast_align_chk.toggled.connect(self._refresh_estimate)
-        g.addWidget(self._fast_align_chk, 1, 2, 1, 2)
-
         self._safety_label = QLabel("Live |I|: —")
-        g.addWidget(self._safety_label, 3, 2, 1, 2)
+        g.addWidget(self._safety_label, 1, 2, 1, 2)
 
         g.addWidget(QLabel("Settle before scan (s)"), 2, 0)
         self._settle_s = QDoubleSpinBox()
@@ -288,11 +272,9 @@ class SweepPanel(QWidget):
         size = (self._size_x.value(), self._size_y.value())
         pixels = (self._pixels.value(), self._pixels.value())
         speed = self._speed.value()
-        drift = self._drift_chk.isChecked()
         n = self._ramp_step_count()
 
         settle = self._settle_s.value()
-        fast_align = self._fast_align_chk.isChecked()
         if self._kind.currentIndex() == 0:
             recipe = MeasurementRecipe.bias_ramp(
                 start_V=self._start.value(),
@@ -300,9 +282,7 @@ class SweepPanel(QWidget):
                 steps=n,
                 setpoint_A=self._fixed_value.value() * 1e-12,
                 size_nm=size, pixels=pixels, speed_nm_s=speed,
-                drift_correction=drift,
                 settling_s=settle,
-                fast_alignment=fast_align,
             )
         else:
             recipe = MeasurementRecipe.current_ramp(
@@ -311,9 +291,7 @@ class SweepPanel(QWidget):
                 steps=n,
                 bias_V=self._fixed_value.value(),
                 size_nm=size, pixels=pixels, speed_nm_s=speed,
-                drift_correction=drift,
                 settling_s=settle,
-                fast_alignment=fast_align,
             )
 
         recipe.save_folder = self._save_folder.text()
@@ -405,7 +383,6 @@ class SweepPanel(QWidget):
         self._runner.error.connect(self._on_error)
         self._runner.safety_violation.connect(self._on_safety_violation)
         self._runner.safety_reading.connect(self._on_safety_reading)
-        self._runner.drift_measured.connect(self._on_drift)
         self._runner.z_stability.connect(self._on_z_stability)
         self._runner.settling.connect(self._on_settling)
         self._runner.info_message.connect(self.log_message)
@@ -509,17 +486,3 @@ class SweepPanel(QWidget):
     def _on_z_stability(self, metrics) -> None:
         from scanflow.automation.scan_metrics import format_z_stability
         self.log_message.emit(format_z_stability(metrics))
-
-    def _on_drift(self, result) -> None:
-        try:
-            x_dir = "→" if result.dx_angstrom >= 0 else "←"
-            y_dir = "↓" if result.dy_angstrom >= 0 else "↑"
-            self.log_message.emit(
-                f"drift correction:  "
-                f"X {x_dir} {abs(result.dx_angstrom):.2f} Å  "
-                f"Y {y_dir} {abs(result.dy_angstrom):.2f} Å  "
-                f"total {result.magnitude_angstrom:.2f} Å  "
-                f"[{result.method}]"
-            )
-        except AttributeError:
-            pass

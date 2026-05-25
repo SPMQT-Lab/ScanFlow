@@ -109,7 +109,6 @@ def test_runner_completes_safely_without_crash(stm):
     )
     r.safety_max_current_A = 1e-9
     r.safety_poll_interval_s = 0.1
-    r.drift_correction = False  # avoid createc.Createc_pyFile dependency
 
     runner = AutomationRunner(stm, r)
 

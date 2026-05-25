@@ -1,8 +1,8 @@
 """ScanFlow main window — focused, two-tab GUI.
 
-Sweep tab orchestrates bias / current ramps with drift correction and
-tip-crash safety. Log tab shows running events. Live monitoring of the
-scan itself happens in the manufacturer's STMAFM window.
+Sweep tab orchestrates bias / current ramps with tip-crash safety. Log
+tab shows running events. Live monitoring of the scan itself happens
+in the manufacturer's STMAFM window.
 """
 
 from __future__ import annotations

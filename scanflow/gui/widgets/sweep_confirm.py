@@ -81,8 +81,6 @@ class SweepConfirmDialog(QDialog):
             f"<b>{self._recipe.name}</b><br>"
             f"Scans: <b>{n_steps}</b>   ·   "
             f"Estimated total: <b>{format_duration(est_s)}</b>   ·   "
-            f"Drift: {'on' if self._recipe.drift_correction else 'off'}"
-            f"{' (fast)' if getattr(self._recipe, 'fast_alignment', False) else ''}   ·   "
             f"Safety threshold: {self._recipe.safety_max_current_A * 1e9:.2f} nA"
         )
         head = QLabel(head_text)

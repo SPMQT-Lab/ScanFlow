@@ -4,11 +4,6 @@ Given a wide STM image and its physical scale, segment bright features,
 optionally merge nearby pieces (so a cluster reads as one feature),
 filter by physical size and edge margin, and return sorted candidates
 with auto-sized zoom frames.
-
-Reuses the same Otsu + level-correct pipeline as :mod:`scanflow.drift.detector`,
-but returns bounding-box information so the runner can scale each zoom to the
-actual feature size — handles 1.2 nm molecules and 10 nm clusters with the
-same code path.
 """
 
 from __future__ import annotations
@@ -18,7 +13,15 @@ from typing import List, Tuple
 
 import numpy as np
 
-from scanflow.drift.detector import _level_correct
+def _level_correct(img: np.ndarray) -> np.ndarray:
+    """Subtract a fitted plane from a 2-D image array (de-tilts the wide scan)."""
+    m, n = img.shape
+    x1, x2 = np.mgrid[:m, :n]
+    X = np.column_stack([np.ones(m * n), x1.ravel(), x2.ravel()])
+    Y = img.ravel()
+    theta, *_ = np.linalg.lstsq(X, Y, rcond=None)
+    plane = (X @ theta).reshape(m, n)
+    return img - plane
 
 
 @dataclass

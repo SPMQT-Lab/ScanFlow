@@ -1,24 +1,25 @@
-"""ScanFlow Mosaic panel — wide image + 3×3 zoom tiles + wide image.
+"""ScanFlow Mosaic panel — wide image + N×N zoom tiles + wide image.
 
 Inputs (wide overview): size X/Y, pixels, speed.
-Inputs (per-tile zoom): size X/Y (default wide/3), pixels (same as wide
-unless overridden), speed, iterations.
-Shared: bias, setpoint, settle. Output folder, campaign name.
+Inputs (per-tile zoom): size X/Y (default wide/N), pixels, speed, grid N.
+Bias modes:
+  • Single bias  — all tile iterations use the same bias_V.
+  • Bias sweep   — each iteration uses a different bias from a comma-
+                   separated list; iteration count is derived from the list.
+Shared: setpoint, settle. Output folder, campaign name.
 
 Workflow when Start is pressed:
   1. Wide overview scan → wide_before.dat / wide_before.png
-  2. Visit each of the 9 tiles row-major; per tile, run N iterations
-     with drift correction between them; save every iteration's .dat
-     and a PNG preview.
+  2. Visit each of the N×N tiles (top row first, then middle, then bottom);
+     per tile, run M iterations — each at the configured bias — save every
+     iteration's .dat and a PNG preview.
   3. Wide overview again → wide_after.dat / wide_after.png
-
-The 9 tile images, stitched 3×3, reconstruct the wide image at higher
-effective resolution.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import List
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
@@ -36,7 +37,7 @@ from scanflow.automation.recipe import format_duration
 
 
 class MosaicPanel(QWidget):
-    """Configure and run a 3×3 mosaic campaign."""
+    """Configure and run an N×N mosaic campaign."""
 
     log_message = Signal(str)
     error_message = Signal(str)
@@ -47,21 +48,18 @@ class MosaicPanel(QWidget):
         self._runner: AutomationRunner | None = None
         self._last_output: Path | None = None
         self._build_ui()
-        # Update tile-size auto-fill whenever wide size changes
-        self._auto_tile_check.toggled.connect(self._refresh_tile_size)
-        for w in (self._wide_x, self._wide_y):
-            w.valueChanged.connect(self._refresh_tile_size)
-        self._refresh_tile_size()
 
+    # ------------------------------------------------------------------
+    # UI construction
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.addWidget(self._build_wide_group())
-        root.addWidget(self._build_tile_group())
+        root.addWidget(self._build_tile_group())   # sets self._tile_group
         root.addWidget(self._build_shared_group())
 
-        # Live count + duration estimate, refreshed on any spinbox change.
+        # Live scan count + duration estimate.
         estimate_row = QHBoxLayout()
         self._count_label = QLabel("Scans: 0")
         self._count_label.setStyleSheet("font-weight: bold;")
@@ -82,14 +80,33 @@ class MosaicPanel(QWidget):
         root.addWidget(self._status)
         root.addStretch(1)
 
-        # Wire every parameter that affects the time estimate.
+        # ── Connect signals ─────────────────────────────────────────────
+
+        # Auto tile-size: recompute whenever wide size or grid N changes.
+        self._auto_tile_check.toggled.connect(self._refresh_tile_size)
+        self._auto_tile_check.toggled.connect(self._refresh_estimate)
+        for w in (self._wide_x, self._wide_y):
+            w.valueChanged.connect(self._refresh_tile_size)
+        self._grid_n.valueChanged.connect(self._refresh_tile_size)
+        self._grid_n.valueChanged.connect(self._refresh_grid_label)
+
+        # Sweep toggle.
+        self._sweep_check.toggled.connect(self._on_sweep_toggled)
+        self._sweep_edit.textChanged.connect(self._refresh_sweep_info)
+        self._sweep_edit.textChanged.connect(self._refresh_estimate)
+
+        # All spinboxes that affect the time estimate.
         for w in (self._wide_x, self._wide_y,
                   self._wide_pixels_x, self._wide_pixels_y, self._wide_speed,
                   self._tile_x, self._tile_y,
                   self._tile_pixels_x, self._tile_pixels_y, self._tile_speed,
-                  self._iters, self._settle):
+                  self._iters, self._settle, self._grid_n):
             w.valueChanged.connect(self._refresh_estimate)
-        self._auto_tile_check.toggled.connect(self._refresh_estimate)
+
+        # Initial state.
+        self._refresh_tile_size()
+        self._refresh_grid_label()
+        self._on_sweep_toggled(False)
         self._refresh_estimate()
 
     def _build_wide_group(self) -> QGroupBox:
@@ -131,15 +148,18 @@ class MosaicPanel(QWidget):
         return box
 
     def _build_tile_group(self) -> QGroupBox:
-        box = QGroupBox("Per-tile zoom (3×3 grid = 9 tiles)")
-        g = QGridLayout(box)
+        # Title is updated dynamically by _refresh_grid_label().
+        self._tile_group = QGroupBox("Per-tile zoom (3×3 grid = 9 tiles)")
+        g = QGridLayout(self._tile_group)
 
+        # Row 0: auto-size checkbox.
         self._auto_tile_check = QCheckBox(
-            "Auto-size tiles (= wide / 3, no gaps or overlap)"
+            "Auto-size tiles (= wide / N, no gaps or overlap)"
         )
         self._auto_tile_check.setChecked(True)
         g.addWidget(self._auto_tile_check, 0, 0, 1, 4)
 
+        # Row 1: tile sizes.
         g.addWidget(QLabel("Tile size X (nm)"), 1, 0)
         self._tile_x = QDoubleSpinBox()
         self._tile_x.setRange(0.1, 5000.0)
@@ -154,6 +174,7 @@ class MosaicPanel(QWidget):
         self._tile_y.setValue(30.0)
         g.addWidget(self._tile_y, 1, 3)
 
+        # Row 2: tile pixels.
         g.addWidget(QLabel("Tile pixels X"), 2, 0)
         self._tile_pixels_x = QSpinBox()
         self._tile_pixels_x.setRange(32, 4096)
@@ -166,6 +187,7 @@ class MosaicPanel(QWidget):
         self._tile_pixels_y.setValue(256)
         g.addWidget(self._tile_pixels_y, 2, 3)
 
+        # Row 3: speed + grid N.
         g.addWidget(QLabel("Speed (nm/s)"), 3, 0)
         self._tile_speed = QDoubleSpinBox()
         self._tile_speed.setRange(0.1, 2000.0)
@@ -173,21 +195,39 @@ class MosaicPanel(QWidget):
         self._tile_speed.setValue(20.0)
         g.addWidget(self._tile_speed, 3, 1)
 
-        g.addWidget(QLabel("Iterations per tile"), 3, 2)
+        g.addWidget(QLabel("Grid N×N"), 3, 2)
+        self._grid_n = QSpinBox()
+        self._grid_n.setRange(1, 10)
+        self._grid_n.setValue(3)
+        self._grid_n.setToolTip(
+            "N×N grid of zoom tiles.\n"
+            "3 → 3×3 = 9 tiles, 4 → 4×4 = 16 tiles, etc.\n"
+            "Auto-size adjusts tile size to wide/N automatically."
+        )
+        g.addWidget(self._grid_n, 3, 3)
+
+        # Row 4: iterations (hidden when bias sweep is active).
+        self._iters_label = QLabel("Iterations per tile")
+        g.addWidget(self._iters_label, 4, 2)
         self._iters = QSpinBox()
-        self._iters.setRange(1, 10)
+        self._iters.setRange(1, 20)
         self._iters.setValue(3)
         self._iters.setToolTip(
-            "Number of scans per tile. Iterations 2..N are drift-corrected "
-            "against iteration 1, so the final iteration is well-centered."
+            "Scans per tile (for repeat / averaging). "
+            "Ignored when Bias sweep is active — iteration count "
+            "comes from the number of sweep values."
         )
-        g.addWidget(self._iters, 3, 3)
-        return box
+        g.addWidget(self._iters, 4, 3)
+
+        return self._tile_group
 
     def _build_shared_group(self) -> QGroupBox:
         box = QGroupBox("Tunneling, settle, output")
         g = QGridLayout(box)
-        g.addWidget(QLabel("Bias (V)"), 0, 0)
+
+        # Row 0: bias + setpoint.
+        self._bias_label = QLabel("Bias (V)")
+        g.addWidget(self._bias_label, 0, 0)
         self._bias = QDoubleSpinBox()
         self._bias.setRange(-10.0, 10.0)
         self._bias.setDecimals(4)
@@ -201,6 +241,7 @@ class MosaicPanel(QWidget):
         self._setpoint.setValue(50.0)
         g.addWidget(self._setpoint, 0, 3)
 
+        # Row 1: settle.
         g.addWidget(QLabel("Settle before scan (s)"), 1, 0)
         self._settle = QDoubleSpinBox()
         self._settle.setRange(0.0, 600.0)
@@ -208,17 +249,43 @@ class MosaicPanel(QWidget):
         self._settle.setValue(5.0)
         g.addWidget(self._settle, 1, 1)
 
-        g.addWidget(QLabel("Campaign name"), 2, 0)
-        self._name = QLineEdit("Mosaic")
-        g.addWidget(self._name, 2, 1, 1, 3)
+        # Row 2: bias sweep toggle.
+        self._sweep_check = QCheckBox("Bias sweep per tile iteration")
+        self._sweep_check.setToolTip(
+            "Each iteration of every tile is acquired at a different bias.\n"
+            "Enter the bias values (V) as a comma-separated list.\n"
+            "The number of values determines iterations per tile.\n"
+            "'Bias (V)' above is used for the wide overview scans."
+        )
+        g.addWidget(self._sweep_check, 2, 0, 1, 4)
 
-        g.addWidget(QLabel("Output folder"), 3, 0)
+        # Row 3: sweep values (shown only when sweep is ON).
+        self._sweep_values_label = QLabel("Sweep values (V):")
+        g.addWidget(self._sweep_values_label, 3, 0)
+        self._sweep_edit = QLineEdit()
+        self._sweep_edit.setPlaceholderText("e.g. -0.5, -0.1, 0.1, 0.5")
+        self._sweep_edit.setToolTip(
+            "Comma-separated bias values in volts, one per tile iteration.\n"
+            "Example: -0.5, -0.1, 0.1, 0.5  →  4 iterations per tile."
+        )
+        g.addWidget(self._sweep_edit, 3, 1, 1, 2)
+        self._sweep_info = QLabel("")
+        self._sweep_info.setStyleSheet("color: gray; font-style: italic;")
+        g.addWidget(self._sweep_info, 3, 3)
+
+        # Row 4: campaign name.
+        g.addWidget(QLabel("Campaign name"), 4, 0)
+        self._name = QLineEdit("Mosaic")
+        g.addWidget(self._name, 4, 1, 1, 3)
+
+        # Row 5: output folder.
+        g.addWidget(QLabel("Output folder"), 5, 0)
         self._output = QLineEdit()
         self._output.setPlaceholderText("(required to save .dat and .png files)")
-        g.addWidget(self._output, 3, 1, 1, 2)
+        g.addWidget(self._output, 5, 1, 1, 2)
         pick = QPushButton("Browse…")
         pick.clicked.connect(self._pick_folder)
-        g.addWidget(pick, 3, 3)
+        g.addWidget(pick, 5, 3)
         return box
 
     def _build_run_group(self) -> QGroupBox:
@@ -244,36 +311,90 @@ class MosaicPanel(QWidget):
         return box
 
     # ------------------------------------------------------------------
+    # Slot helpers
+    # ------------------------------------------------------------------
+
+    def _refresh_grid_label(self) -> None:
+        n = self._grid_n.value()
+        n2 = n * n
+        self._tile_group.setTitle(
+            f"Per-tile zoom ({n}×{n} grid = {n2} tile{'s' if n2 != 1 else ''})"
+        )
 
     def _refresh_tile_size(self) -> None:
         auto = self._auto_tile_check.isChecked()
         if auto:
-            self._tile_x.setValue(self._wide_x.value() / 3.0)
-            self._tile_y.setValue(self._wide_y.value() / 3.0)
+            n = max(self._grid_n.value(), 1)
+            self._tile_x.setValue(self._wide_x.value() / n)
+            self._tile_y.setValue(self._wide_y.value() / n)
         self._tile_x.setEnabled(not auto)
         self._tile_y.setEnabled(not auto)
+
+    def _on_sweep_toggled(self, checked: bool) -> None:
+        """Show/hide sweep widgets; update bias label; hide iterations."""
+        for w in (self._sweep_values_label, self._sweep_edit, self._sweep_info):
+            w.setVisible(checked)
+        # Hide manual iteration count when the sweep drives it.
+        self._iters_label.setVisible(not checked)
+        self._iters.setVisible(not checked)
+        # Clarify that the bias field controls only the wide scans.
+        self._bias_label.setText(
+            "Wide scan bias (V)" if checked else "Bias (V)"
+        )
+        self._refresh_sweep_info()
+        self._refresh_estimate()
+
+    def _refresh_sweep_info(self) -> None:
+        if not self._sweep_check.isChecked():
+            self._sweep_info.setText("")
+            return
+        try:
+            vals = self._parse_sweep_values()
+            n = len(vals)
+            if n == 0:
+                self._sweep_info.setText("(empty)")
+                self._sweep_info.setStyleSheet("color: gray; font-style: italic;")
+            else:
+                self._sweep_info.setText(f"→ {n} iter{'s' if n != 1 else ''}/tile")
+                self._sweep_info.setStyleSheet("color: green; font-weight: bold;")
+        except ValueError:
+            self._sweep_info.setText("⚠ invalid")
+            self._sweep_info.setStyleSheet("color: red; font-weight: bold;")
+
+    def _parse_sweep_values(self) -> List[float]:
+        """Parse the sweep text field.  Raises ValueError on bad input."""
+        text = self._sweep_edit.text().strip()
+        if not text:
+            return []
+        return [float(v.strip()) for v in text.split(",") if v.strip()]
 
     def _refresh_estimate(self) -> None:
         try:
             cfg = self._build_config()
             step = MosaicStep(config=cfg)
             n_tiles = cfg.total_tiles()
-            n_iter = max(1, cfg.iterations_per_tile)
+            n_iters = cfg.effective_iterations()
             total = step.estimate_duration_s()
         except Exception:
             self._count_label.setText("Scans: —")
             self._estimate_label.setText("Estimated total time: —")
             return
-        n_scans = 2 + n_tiles * n_iter   # 2 wide + tiles × iters
+        n_scans = 2 + n_tiles * n_iters
         self._count_label.setText(
             f"Scans: <b>{n_scans}</b>  "
-            f"(2 wide + {n_tiles} tiles × {n_iter} iter)"
+            f"(2 wide + {n_tiles} tiles × {n_iters} iter)"
         )
         self._estimate_label.setText(
             f"Estimated total time: <b>{format_duration(total)}</b>"
         )
 
     def _build_config(self) -> MosaicConfig:
+        bias_sweep: List[float] = []
+        if self._sweep_check.isChecked():
+            try:
+                bias_sweep = self._parse_sweep_values()
+            except ValueError:
+                bias_sweep = []
         return MosaicConfig(
             wide_size_nm=(self._wide_x.value(), self._wide_y.value()),
             wide_pixels=(self._wide_pixels_x.value(), self._wide_pixels_y.value()),
@@ -282,7 +403,9 @@ class MosaicPanel(QWidget):
             tile_pixels=(self._tile_pixels_x.value(), self._tile_pixels_y.value()),
             tile_speed_nm_s=self._tile_speed.value(),
             iterations_per_tile=self._iters.value(),
+            grid_n=self._grid_n.value(),
             bias_V=self._bias.value(),
+            bias_sweep=bias_sweep,
             setpoint_A=self._setpoint.value() * 1e-12,
             settling_s=self._settle.value(),
             output_folder=self._output.text(),
@@ -294,36 +417,53 @@ class MosaicPanel(QWidget):
         if path:
             self._output.setText(path)
 
+    # ------------------------------------------------------------------
+    # Run / stop
+    # ------------------------------------------------------------------
+
     def _start_run(self) -> None:
         if not self._stm.connected and not self._stm.is_mock:
             QMessageBox.warning(self, "STM not connected",
                                 "Connect to the STM (or Mock) first.")
             return
-        cfg = self._build_config()
-        recipe = MeasurementRecipe(name=cfg.name)
-        recipe.add_step(MosaicStep(config=cfg, label=cfg.name))
 
+        cfg = self._build_config()
         n_tiles = cfg.total_tiles()
+        n_iters = cfg.effective_iterations()
         step_for_estimate = MosaicStep(config=cfg)
         total_s = step_for_estimate.estimate_duration_s()
+
+        # Bias description for the confirmation dialog.
+        if cfg.bias_sweep:
+            shown = cfg.bias_sweep[:6]
+            bias_str = "Bias sweep: " + ", ".join(
+                f"{b * 1000:.1f} mV" for b in shown
+            ) + (" …" if len(cfg.bias_sweep) > 6 else "")
+        else:
+            bias_str = f"Bias {cfg.bias_V:.3f} V"
+
         confirm = QMessageBox.question(
             self, "Start mosaic",
             f"<b>{cfg.name}</b><br><br>"
             f"Wide: {cfg.wide_size_nm[0]:.0f} × {cfg.wide_size_nm[1]:.0f} nm "
             f"@ {cfg.wide_speed_nm_s:.0f} nm/s<br>"
-            f"Tiles: {n_tiles} × {cfg.iterations_per_tile} iterations "
-            f"= {n_tiles * cfg.iterations_per_tile} small scans<br>"
+            f"Grid: {cfg.grid_n}×{cfg.grid_n} = {n_tiles} tiles, "
+            f"{n_iters} iterations each "
+            f"= {n_tiles * n_iters} small scans<br>"
             f"Tile size: {cfg.resolved_tile_size_nm()[0]:.2f} × "
             f"{cfg.resolved_tile_size_nm()[1]:.2f} nm<br>"
-            f"Bias {cfg.bias_V:.3f} V, setpoint {cfg.setpoint_A * 1e12:.1f} pA<br>"
+            f"{bias_str}<br>"
+            f"Setpoint {cfg.setpoint_A * 1e12:.1f} pA<br>"
             f"Estimated total time: <b>{format_duration(total_s)}</b><br><br>"
             f"Start?",
         )
         if confirm != QMessageBox.Yes:
             return
 
-        # Snapshot the XY position the instant the user commits, so the
-        # Log tab shows where we're starting from before any apply() runs.
+        recipe = MeasurementRecipe(name=cfg.name)
+        recipe.add_step(MosaicStep(config=cfg, label=cfg.name))
+
+        # Snapshot XY before the runner thread starts.
         try:
             xy0 = self._stm.scan.get_offset_nm()
         except Exception as e:
@@ -358,9 +498,6 @@ class MosaicPanel(QWidget):
         self._runner.mosaic_tile_done.connect(self._on_tile_done)
         self._runner.mosaic_finished.connect(self._on_mosaic_finished)
         self._runner.settling.connect(self._on_settling)
-        # Free-form runner info → straight into the Log tab so per-tile XY,
-        # calibration, wide-centre, and positioning errors are visible
-        # without pulling the file log.
         self._runner.info_message.connect(self.log_message)
         self._runner.start()
 
@@ -372,7 +509,6 @@ class MosaicPanel(QWidget):
     def _stop_run(self) -> None:
         if not self._runner:
             return
-        # First click: graceful. Second click: emergency stop + tip retract.
         stop_count_before = self._runner._stop_count
         self._runner.stop()
         if stop_count_before == 0:

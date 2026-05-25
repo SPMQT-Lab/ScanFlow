@@ -51,8 +51,6 @@ def _print_plan(recipe: MeasurementRecipe, what: str) -> None:
         per_s = s0.estimate_duration_s() if hasattr(s0, "estimate_duration_s") else 0.0
         if per_s:
             print(f"  Per scan  : ≈ {format_duration(per_s)}")
-    print(f"  Drift     : {'on' if recipe.drift_correction else 'off'}"
-          + ("   (adds ~50% alignment time)" if recipe.drift_correction else ""))
     print(f"  Safety    : "
           f"{'on, threshold ' + f'{recipe.safety_max_current_A*1e9:.3f} nA' if recipe.safety_enable else 'off'}")
     if recipe.save_folder:
@@ -109,18 +107,10 @@ def _run_blocking(stm, recipe: MeasurementRecipe) -> int:
         print(f"⚠ SAFETY ABORT: {msg}  (|I|={current_A*1e9:.3f} nA)",
               file=sys.stderr)
 
-    def on_drift(result):
-        try:
-            print(f"        drift: dx={result.dx_angstrom:+.3f} Å  "
-                  f"dy={result.dy_angstrom:+.3f} Å  |d|={result.magnitude_angstrom:.3f} Å")
-        except AttributeError:
-            pass
-
     runner.progress.connect(on_progress)
     runner.scan_completed.connect(on_saved)
     runner.error.connect(on_error)
     runner.safety_violation.connect(on_safety)
-    runner.drift_measured.connect(on_drift)
     runner.finished.connect(app.quit)
     runner.start()
 
@@ -150,7 +140,6 @@ def _build_bias_recipe(a) -> MeasurementRecipe:
         size_nm=(a.size, a.size),
         speed_nm_s=a.speed,
         pixels=(a.pixels, a.pixels),
-        drift_correction=not a.no_drift,
     )
     recipe.save_folder = a.save_folder or ""
     recipe.safety_max_current_A = a.safety_nA * 1e-9
@@ -168,7 +157,6 @@ def _build_current_recipe(a) -> MeasurementRecipe:
         size_nm=(a.size, a.size),
         speed_nm_s=a.speed,
         pixels=(a.pixels, a.pixels),
-        drift_correction=not a.no_drift,
     )
     recipe.save_folder = a.save_folder or ""
     recipe.safety_max_current_A = a.safety_nA * 1e-9
@@ -248,8 +236,6 @@ def _add_common_scan_args(p: argparse.ArgumentParser) -> None:
                    help="Image resolution per side (default 256)")
     p.add_argument("--save-folder", default="",
                    help="Directory for .dat files (default: STMAFM default)")
-    p.add_argument("--no-drift", action="store_true",
-                   help="Disable drift correction")
     p.add_argument("--safety-nA", type=float, default=1.0,
                    help="Tip-crash current threshold in nA (default 1.0)")
     p.add_argument("--no-safety", action="store_true",

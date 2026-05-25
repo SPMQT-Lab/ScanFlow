@@ -14,7 +14,6 @@ class Session:
     last_recipe: str = ""
     theme: str = "dark"
     font_size: int = 11
-    drift_channel: int = 0
     scan_log: list[str] = field(default_factory=list)
 
     _PATH = Path.home() / ".scanflow_session.json"
