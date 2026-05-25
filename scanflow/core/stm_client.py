@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Any, Optional
 
 log = logging.getLogger(__name__)
@@ -20,6 +21,23 @@ log = logging.getLogger(__name__)
 
 class STMNotConnectedError(RuntimeError):
     pass
+
+
+def _is_transient_com_error(exc: Exception) -> bool:
+    """Best-effort classifier for common transient COM failures."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    markers = (
+        "rpc_e_call_rejected",
+        "rpc_e_servercall_retrylater",
+        "call rejected",
+        "retry later",
+        "temporar",
+        "timeout",
+        "busy",
+        "server unavailable",
+        "com_error",
+    )
+    return any(marker in text for marker in markers)
 
 
 class STMClient:
@@ -40,6 +58,25 @@ class STMClient:
     PROG_ID = "pstmafm.stmafmrem"
 
     USER_PROG_ID = "pstmafm.stmafmuser"  # crosscorr, getxypos, mtip_*
+
+    _ACTION_KEYS = {
+        "STMAFM.BTN.START",
+        "STMAFM.BTN.STOP",
+        "STMAFM.BEEP",
+        "STMAFM.CMD.SETXYOFF.VOLT",
+        "STMAFM.CMD.SETXYOFF.IMAGECOORD",
+        "HVAMPCOARSE.APPROACH.START",
+        "HVAMPCOARSE.APPROACH.STOP",
+        "HVAMPCOARSE.CMD.XYZSLIDER",
+        "AFM.BTN.FREQSCAN",
+        "AFM.BTN.FREQSCAN.RESULTS.APPLY",
+        "TIP-FORM.CMD.START",
+        "VERTMAN.CMD.SINGLE_SPECTRUM",
+        "VERTMAN.CMD.GRID",
+        "STMAFM.FILE.SAVE.DAT",
+        "STMAFM.FILE.SAVE.VERT",
+        "STMAFM.FILE.LOAD.DAT",
+    }
 
     def __init__(self) -> None:
         # Real COM proxies live in thread-local storage (apartment-bound).
@@ -230,14 +267,55 @@ class STMClient:
     # ------------------------------------------------------------------
 
     def setp(self, key: str, value: Any) -> None:
-        """Set a CreaTec parameter by structured key (e.g. 'SCAN.BIASVOLTAGE.VOLT')."""
+        """Set a CreaTec parameter by structured key.
+
+        Idempotent parameter writes get one transient-COM retry. Physical
+        action commands (start/stop/move/pulse/save) are single-shot by
+        default so a retry cannot duplicate an instrument action.
+        """
         self._require()
-        self._stm.setp(key, value)
+        attempts = 1 if self._is_physical_action_key(key) else 2
+        self._call_with_retry(lambda: self._stm.setp(key, value), attempts=attempts)
+
+    def setp_idempotent(self, key: str, value: Any) -> None:
+        """Set a parameter with retry even when the key is command-like.
+
+        Use only when the caller has established the operation is idempotent
+        on the current Createc API path.
+        """
+        self._require()
+        self._call_with_retry(lambda: self._stm.setp(key, value), attempts=2)
 
     def getp(self, key: str, default: Any = "") -> Any:
         """Read a CreaTec parameter by structured key."""
         self._require()
-        return self._stm.getp(key, default)
+        return self._call_with_retry(lambda: self._stm.getp(key, default), attempts=2)
+
+    def getp_retry(self, key: str, default: Any = "") -> Any:
+        """Explicit retrying read helper for call sites that want the policy visible."""
+        return self.getp(key, default)
+
+    @classmethod
+    def _is_physical_action_key(cls, key: str) -> bool:
+        if key in cls._ACTION_KEYS:
+            return True
+        return key.startswith(("TIP-FORM.CMD.", "HVAMPCOARSE.CMD.", "VERTMAN.CMD."))
+
+    @staticmethod
+    def _call_with_retry(fn, *, attempts: int, backoff_s: float = 0.05):
+        attempts = max(int(attempts), 1)
+        last = None
+        for i in range(attempts):
+            try:
+                return fn()
+            except Exception as exc:
+                last = exc
+                if i >= attempts - 1 or not _is_transient_com_error(exc):
+                    raise
+                log.debug("Transient COM call failure; retrying (%d/%d): %s",
+                          i + 1, attempts, exc)
+                time.sleep(backoff_s * (i + 1))
+        raise last  # pragma: no cover - loop always returns or raises
 
     # ------------------------------------------------------------------
     # Direct COM passthrough for legacy operations not yet wrapped
