@@ -189,25 +189,32 @@ class TipMotionManager:
         except Exception as exc:
             return MotionResult(False, target, before, before, 0, reason, [*warnings, str(exc)])
 
-        attempts = max(1, int(self.config.max_retries) + 1)
-        last_after = before
+        try:
+            log.info(
+                "motion command: %s -> target=(%.3f, %.3f) nm",
+                reason, target[0], target[1],
+            )
+            self._stm.scan.set_offset_nm(target[0], target[1])
+        except Exception as exc:
+            return MotionResult(False, target, before, before, 1, reason, [*warnings, f"motion command failed: {exc}"])
+
+        if settle > 0:
+            time.sleep(settle)
+
+        if not verify:
+            after_pos = self.read_position_nm()
+            last_after = after_pos.xy if after_pos is not None else None
+            return MotionResult(True, target, before, last_after, 1, reason, warnings)
+
+        readback_attempts = max(1, int(self.config.max_retries) + 1)
+        last_after = None
         last_warnings = list(warnings)
-        for attempt in range(1, attempts + 1):
-            try:
-                log.info(
-                    "motion attempt %d/%d: %s -> target=(%.3f, %.3f) nm",
-                    attempt, attempts, reason, target[0], target[1],
-                )
-                self._stm.scan.set_offset_nm(target[0], target[1])
-                if settle > 0:
-                    time.sleep(settle)
-                after_pos = self.read_position_nm()
-                last_after = after_pos.xy if after_pos is not None else None
-                if not verify:
-                    return MotionResult(True, target, before, last_after, attempt, reason, warnings)
-                if last_after is None:
-                    last_warnings = [*warnings, "position readback unavailable after move"]
-                    continue
+        for attempt in range(1, readback_attempts + 1):
+            after_pos = self.read_position_nm()
+            last_after = after_pos.xy if after_pos is not None else None
+            if last_after is None:
+                last_warnings = [*warnings, "position readback unavailable after move"]
+            else:
                 err = _distance_nm(last_after, target)
                 if err <= self.config.readback_tolerance_nm:
                     return MotionResult(True, target, before, last_after, attempt, reason, warnings)
@@ -216,11 +223,10 @@ class TipMotionManager:
                     f"readback error {err:.3f} nm exceeds tolerance "
                     f"{self.config.readback_tolerance_nm:.3f} nm",
                 ]
-            except Exception as exc:
-                last_warnings = [*warnings, f"motion command failed: {exc}"]
-                log.warning("motion attempt failed: %s", exc)
+            if attempt < readback_attempts:
+                time.sleep(min(0.05 * attempt, 0.2))
 
-        return MotionResult(False, target, before, last_after, attempts, reason, last_warnings)
+        return MotionResult(False, target, before, last_after, readback_attempts, reason, last_warnings)
 
     def move_relative_nm(
         self,

@@ -19,7 +19,7 @@ from PySide6.QtCore import QThread, Signal
 from scanflow.core import (
     STMClient, STMNotConnectedError, ScanParams, IVTable,
     SafetyMonitor, SafetyConfig, SafetyViolation, TipMotionManager,
-    MotionConfig, MotionResult,
+    MotionConfig, MotionResult, TipFormParams,
 )
 from scanflow.automation.recipe import (
     MeasurementRecipe, ScanStep, SpectroscopyStep, ApproachStep, WaitStep,
@@ -116,6 +116,10 @@ class AutomationRunner(QThread):
         self._last_drift_result: Optional[DriftResult] = None
         self._last_z_stability: dict | None = None
         self._max_observed_current_A: Optional[float] = None
+        self._run_generation = 0
+        self._active_run_generation = 0
+        self._tip_form_approval_pending = False
+        self._tip_form_approval_run_generation: int | None = None
 
     # ------------------------------------------------------------------
     # Public controls
@@ -172,6 +176,16 @@ class AutomationRunner(QThread):
     def resume(self) -> None:
         self._pause_requested = False
 
+    def approve_next_tip_form(self) -> None:
+        """Arm one supervised tip-forming pulse for the current or next run."""
+        target_generation = (
+            self._active_run_generation
+            if self._active_run_generation > 0
+            else self._run_generation + 1
+        )
+        self._tip_form_approval_pending = True
+        self._tip_form_approval_run_generation = target_generation
+
     def _set_state(self, state: RunnerState) -> None:
         self._state = state
         self.state_changed.emit(state)
@@ -182,6 +196,8 @@ class AutomationRunner(QThread):
 
     def run(self) -> None:
         self._stop_requested = False
+        self._run_generation += 1
+        self._active_run_generation = self._run_generation
         # COM proxies are apartment-bound — re-dispatch them on this worker
         # thread before any setp/getp, otherwise the first call raises
         # RPC_E_WRONG_THREAD ("interface marshalled for a different thread").
@@ -221,6 +237,7 @@ class AutomationRunner(QThread):
             self._set_state(RunnerState.ERROR)
             return
         finally:
+            self._active_run_generation = 0
             self._stm.unbind_thread()
         self._set_state(RunnerState.FINISHED)
 
@@ -292,6 +309,44 @@ class AutomationRunner(QThread):
         if self._motion is None:
             self._motion = TipMotionManager(self._stm, safety=self._safety)
         return self._motion
+
+    def _capture_tip_form_snapshot(self, phase: str, label: str) -> bool:
+        """Require a live-data snapshot for tip-form quality checks."""
+        try:
+            img = self._stm.scan.live_data()
+        except Exception:
+            img = None
+
+        if img is None:
+            msg = (
+                f"TipFormStep '{label}' requires a {phase} quality snapshot; "
+                "live_data() was unavailable"
+            )
+            self._acq_log.emit(
+                "routine_error",
+                step_kind="tip_form",
+                label=label,
+                reason=msg,
+                phase=phase,
+            )
+            log.warning(msg)
+            self.error.emit(msg)
+            self._stop_requested = True
+            return False
+
+        try:
+            self._last_z_stability = compute_z_stability(img)
+            self._acq_log.emit(
+                "z_stability",
+                metrics=self._last_z_stability,
+                phase=f"{phase}_tip_form",
+            )
+        except Exception as exc:
+            log.warning(
+                "TipFormStep '%s' %s snapshot quality metric failed: %s",
+                label, phase, exc,
+            )
+        return True
 
     def _apply_scan_params(self, params: ScanParams) -> None:
         self._active_scan_params = params
@@ -488,24 +543,100 @@ class AutomationRunner(QThread):
         log.info("Spec step finished: %s", label)
 
     def _do_tip_form_step(self, step: TipFormStep, label: str) -> None:
-        """Refuse unattended tip forming until a GUI confirmation path arms it."""
-        msg = (
-            f"TipFormStep '{label}' requires explicit operator confirmation; "
-            "unattended recipe execution is refused in this version."
-        )
+        """Execute one supervised tip-forming pulse when explicitly armed."""
+        if (
+            not self._tip_form_approval_pending
+            or self._tip_form_approval_run_generation != self._active_run_generation
+        ):
+            if (
+                self._tip_form_approval_pending
+                and self._tip_form_approval_run_generation is not None
+                and self._tip_form_approval_run_generation != self._active_run_generation
+            ):
+                msg = (
+                    f"TipFormStep '{label}' approval was armed for run "
+                    f"{self._tip_form_approval_run_generation}, but this is run "
+                    f"{self._active_run_generation}; call approve_next_tip_form() "
+                    "again before starting this recipe."
+                )
+                self._tip_form_approval_pending = False
+                self._tip_form_approval_run_generation = None
+            else:
+                msg = (
+                    f"TipFormStep '{label}' requires explicit operator confirmation; "
+                    "call approve_next_tip_form() before starting this recipe."
+                )
+            self._acq_log.emit(
+                "routine_error",
+                step_kind="tip_form",
+                label=label,
+                reason=msg,
+                x_px=step.x_px,
+                y_px=step.y_px,
+                voltage_V=step.voltage_V,
+                pulse_length_s=step.pulse_length_s,
+            )
+            log.warning(msg)
+            self.error.emit(msg)
+            self._stop_requested = True
+            return
+
+        self._tip_form_approval_pending = False
+        self._tip_form_approval_run_generation = None
         self._acq_log.emit(
-            "routine_error",
-            step_kind="tip_form",
+            "tip_form_started",
             label=label,
-            reason=msg,
+            x_px=step.x_px,
+            y_px=step.y_px,
+            voltage_V=step.voltage_V,
+            z_approach_nm=step.z_approach_nm,
+            pulse_length_s=step.pulse_length_s,
+            z_offset_nm=step.z_offset_nm,
+            lateral_speed_nm_s=step.lateral_speed_nm_s,
+        )
+        try:
+            self._motion_manager().assert_safe_to_move()
+            if self._motion_manager().calibration is None:
+                self._motion_manager().calibrate_xy("current_then_delta")
+        except Exception as exc:
+            msg = f"TipFormStep '{label}' aborted before pulse: {exc}"
+            self._acq_log.emit("routine_error", step_kind="tip_form", label=label, reason=msg)
+            log.warning(msg)
+            self.error.emit(msg)
+            self._stop_requested = True
+            return
+
+        if not self._capture_tip_form_snapshot("pre", label):
+            return
+
+        params = TipFormParams(
+            voltage_V=step.voltage_V,
+            z_approach_nm=step.z_approach_nm,
+            pulse_length_s=step.pulse_length_s,
+            z_offset_nm=step.z_offset_nm,
+            lateral_speed_nm_s=step.lateral_speed_nm_s,
+        )
+        try:
+            self._stm.tipform.form_at(step.x_px, step.y_px, params)
+        except Exception as exc:
+            msg = f"TipFormStep '{label}' failed: {exc}"
+            self._acq_log.emit("routine_error", step_kind="tip_form", label=label, reason=msg)
+            log.warning(msg)
+            self.error.emit(msg)
+            self._stop_requested = True
+            return
+
+        if not self._capture_tip_form_snapshot("post", label):
+            return
+
+        self._acq_log.emit(
+            "tip_form_completed",
+            label=label,
             x_px=step.x_px,
             y_px=step.y_px,
             voltage_V=step.voltage_V,
             pulse_length_s=step.pulse_length_s,
         )
-        log.warning(msg)
-        self.error.emit(msg)
-        self._stop_requested = True
 
     def _do_survey_step(self, step: SurveyStep, label: str) -> None:
         """Wide scan → feature discovery → per-feature zoom campaign.
