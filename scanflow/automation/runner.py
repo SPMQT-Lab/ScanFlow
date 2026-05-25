@@ -1,7 +1,7 @@
 """Automation runner: executes a MeasurementRecipe against a live STM.
 
 Runs in a QThread so the GUI stays responsive. Emits Qt signals for progress,
-drift results, new scan files, and errors.
+new scan files, and errors.
 """
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ from scanflow.automation.survey import SurveyConfig, FeatureRecord, SurveyManife
 from scanflow.automation.mosaic import MosaicConfig, tile_centers_in_wide_pixels
 from scanflow.automation.feature_discovery import discover_features, FeatureCandidate
 from scanflow.automation.scan_metrics import compute_z_stability, format_z_stability
-from scanflow.drift import DriftDetector, DriftResult
 
 log = logging.getLogger(__name__)
 
@@ -43,22 +42,18 @@ class RunnerState(Enum):
 
 
 class AutomationRunner(QThread):
-    """Executes a recipe step-by-step with optional drift correction.
+    """Executes a recipe step-by-step.
 
     Signals
     -------
     progress(current_step, total_steps, label)
     scan_completed(dat_file_path)
-    drift_measured(DriftResult)
-    drift_corrected(dx_pixels, dy_pixels)
     state_changed(RunnerState)
     error(message)
     """
 
     progress = Signal(int, int, str)
     scan_completed = Signal(str)
-    drift_measured = Signal(object)
-    drift_corrected = Signal(float, float)
     state_changed = Signal(object)
     error = Signal(str)
     live_frame = Signal(object)         # numpy 2-D array, emitted ~2 Hz during scan
@@ -90,9 +85,6 @@ class AutomationRunner(QThread):
         self._stop_count = 0
         self._emergency_stop_requested = False
         self._pause_requested = False
-        self._detector: Optional[DriftDetector] = None
-        self._reference_array: Optional[np.ndarray] = None
-        self._reference_timestamp: Optional[float] = None
         self._safety = SafetyMonitor(SafetyConfig(
             max_current_A=recipe.safety_max_current_A,
             enable_current_check=recipe.safety_enable,
@@ -205,18 +197,6 @@ class AutomationRunner(QThread):
             except Exception:
                 pass
 
-        if recipe.drift_correction:
-            self._detector = DriftDetector(
-                continuous=True,
-                method=getattr(recipe, "drift_method", "hybrid"),
-            )
-
-        if recipe.drift_correction and recipe.drift_template:
-            self._reference_array = self._load_channel(
-                Path(recipe.drift_template), recipe.drift_channel
-            )
-            self._reference_timestamp = time.time()
-
         for _rep in range(recipe.repetitions):
             for step in recipe.steps:
                 if self._stop_requested:
@@ -279,29 +259,11 @@ class AutomationRunner(QThread):
             if self._stop_requested:
                 return
 
-        if recipe.drift_correction and self._reference_array is not None:
-            self._do_alignment_scan(recipe, data_params=params)
-            if self._stop_requested:
-                return
-
         dat_path = self._scan_and_save(recipe)
         if dat_path:
             log.info("Saved: %s", dat_path)
             self.scan_completed.emit(str(dat_path))
-            # Z-stability snapshot: emit before reference handling so the GUI
-            # sees one line per data scan regardless of drift state.
             self._emit_z_stability()
-            if self._reference_array is None and recipe.drift_correction:
-                # live_data() is always available immediately after a scan —
-                # no createc file library dependency. Fall back to disk only
-                # if the DSP buffer is empty for some reason.
-                self._reference_array = self._stm.scan.live_data()
-                if self._reference_array is None:
-                    self._reference_array = self._load_channel(
-                        dat_path, recipe.drift_channel)
-                self._reference_timestamp = time.time()
-                if self._reference_array is not None:
-                    log.info("Drift reference captured — correction active from next scan")
 
     def _do_spec_step(self, step: SpectroscopyStep, label: str) -> None:
         table = IVTable(
@@ -594,26 +556,6 @@ class AutomationRunner(QThread):
         log.info("%s: offset X=%.3f nm  Y=%.3f nm", label, xy[0], xy[1])
         return xy
 
-    def _verify_nudge(self, label: str, before: Optional[Tuple[float, float]],
-                      expected_dx_nm: float, expected_dy_nm: float,
-                      tol_nm: float = 0.5) -> None:
-        """Log a WARNING if the actual change in offset disagrees with the
-        commanded shift by more than ``tol_nm``."""
-        if before is None:
-            return
-        after = self._log_offset(f"{label} (after)")
-        if after is None:
-            return
-        actual_dx = after[0] - before[0]
-        actual_dy = after[1] - before[1]
-        if (abs(actual_dx - expected_dx_nm) > tol_nm
-                or abs(actual_dy - expected_dy_nm) > tol_nm):
-            log.warning(
-                "%s: shift verification FAILED — expected (%+.3f, %+.3f) nm, "
-                "got (%+.3f, %+.3f) nm",
-                label, expected_dx_nm, expected_dy_nm, actual_dx, actual_dy,
-            )
-
     def _emit_z_stability(self) -> None:
         """Pull the just-completed scan's topography and emit a stability metric."""
         try:
@@ -639,7 +581,7 @@ class AutomationRunner(QThread):
         cfg = step.config
         tile_size_nm = cfg.resolved_tile_size_nm()
         n_tiles = cfg.total_tiles()
-        n_iter = max(1, cfg.iterations_per_tile)
+        n_iter = cfg.effective_iterations()
 
         output: Optional[Path] = None
         if cfg.output_folder:
@@ -748,8 +690,13 @@ class AutomationRunner(QThread):
                                f"{cfg.name}: tile {tile_idx}/{n_tiles}")
 
             # Pixel-from-wide-centre → nm-from-wide-centre → absolute nm.
+            # X: SCAN.OFFSET.X.NM = centre of scan frame → standard centre formula.
             dx_nm = (target_x_px - cfg.wide_pixels[0] / 2.0) * wide_nm_per_px_x
-            dy_nm = (target_y_px - cfg.wide_pixels[1] / 2.0) * wide_nm_per_px_y
+            # Y: SCAN.OFFSET.Y.NM = top edge (first scanline) of scan frame, NOT centre.
+            # target_y_px = (row + 0.5)*wpy/n; subtracting half a tile (wpy/(2*n))
+            # gives row*wpy/n → the top-edge pixel of that row, yielding
+            # dy = row * tile_size_nm (0 for row 0, tile_size for row 1, …).
+            dy_nm = (target_y_px - cfg.wide_pixels[1] / (2.0 * cfg.grid_n)) * wide_nm_per_px_y
             # Safety clamp: never request a tile centre more than half a
             # wide-field away — anything outside is a math typo.
             dx_nm = max(-max_excursion_x, min(max_excursion_x, dx_nm))
@@ -788,44 +735,59 @@ class AutomationRunner(QThread):
                 log.warning("tile %02d set_offset_nm failed: %s", tile_idx, e)
                 self.info_message.emit(f"⚠ tile {tile_idx:02d} positioning failed: {e}")
 
-            # 2c. Apply tile params (offset preserved).
-            tile_params = ScanParams(
-                bias_V=cfg.bias_V,
-                setpoint_A=cfg.setpoint_A,
-                size_nm=tile_size_nm,
-                pixels=cfg.tile_pixels,
-                speed_nm_s=cfg.tile_speed_nm_s,
-                memo=f"{cfg.name} tile {tile_idx:02d}",
-            )
-            self._stm.scan.apply(tile_params)
-            self._log_offset(f"tile {tile_idx:02d} after apply(tile_params)")
+            # 2c–d. Per-iteration loop.  Each iteration applies its own bias
+            # so a bias sweep is supported (each iter at a different voltage).
+            # apply() preserves the XY offset set by set_offset_nm() above.
+            bias_seq = cfg.effective_bias_sequence()
 
-            # 2d. Iterations with drift correction against iter 1.
-            tile_ref: Optional[np.ndarray] = None
-            zoom_nm_per_px_x = tile_size_nm[0] / max(cfg.tile_pixels[0], 1)
-            zoom_nm_per_px_y = tile_size_nm[1] / max(cfg.tile_pixels[1], 1)
-            for it in range(n_iter):
+            for it, iter_bias_V in enumerate(bias_seq):
                 if self._stop_requested:
                     break
+
+                # Safety guard: never scan constant-current at ~0 V.
+                if abs(iter_bias_V) < MIN_CONST_CURRENT_BIAS_V:
+                    msg = (f"tile {tile_idx:02d} iter{it + 1}: "
+                           f"|bias|={abs(iter_bias_V) * 1000:.2f} mV "
+                           f"< {MIN_CONST_CURRENT_BIAS_V * 1000:.2f} mV — "
+                           "skipping (constant-current scan at 0 V would crash the tip)")
+                    log.warning(msg)
+                    self.info_message.emit("⚠ " + msg)
+                    continue
+
+                # Apply scan params for this iteration (bias may differ).
+                iter_params = ScanParams(
+                    bias_V=iter_bias_V,
+                    setpoint_A=cfg.setpoint_A,
+                    size_nm=tile_size_nm,
+                    pixels=cfg.tile_pixels,
+                    speed_nm_s=cfg.tile_speed_nm_s,
+                    memo=(f"{cfg.name} tile {tile_idx:02d} iter{it + 1} "
+                          f"{iter_bias_V * 1000:.1f} mV"),
+                )
+                self._stm.scan.apply(iter_params)
+                self._log_offset(f"tile {tile_idx:02d} iter{it + 1} after apply")
+
                 if cfg.settling_s > 0:
                     self._sleep_with_progress(
                         cfg.settling_s,
-                        f"tile {tile_idx:02d} iter{it + 1} settle",
+                        f"tile {tile_idx:02d} iter{it + 1} "
+                        f"{iter_bias_V * 1000:.1f} mV settle",
                     )
                     if self._stop_requested:
                         break
 
-                self._log_offset(
-                    f"tile {tile_idx:02d} iter{it + 1} before scan"
-                )
-                dat_name = f"tile_{tile_idx:02d}_iter{it + 1}.dat"
-                png_name = f"tile_{tile_idx:02d}_iter{it + 1}.png"
+                # Filenames: include the bias tag when a sweep is active so
+                # each image is self-documenting (e.g. tile_02_iter3_+100mV.dat).
+                bias_tag = (f"_{iter_bias_V * 1000:+.0f}mV"
+                            if cfg.bias_sweep else "")
+                dat_name = f"tile_{tile_idx:02d}_iter{it + 1}{bias_tag}.dat"
+                png_name = f"tile_{tile_idx:02d}_iter{it + 1}{bias_tag}.png"
+
+                self._log_offset(f"tile {tile_idx:02d} iter{it + 1} before scan")
                 path = self._scan_and_save_to(output, dat_name)
                 if path is not None:
                     self.scan_completed.emit(str(path))
-                self._log_offset(
-                    f"tile {tile_idx:02d} iter{it + 1} after scan"
-                )
+                self._log_offset(f"tile {tile_idx:02d} iter{it + 1} after scan")
 
                 img = self._stm.scan.live_data()
                 if img is None:
@@ -838,49 +800,6 @@ class AutomationRunner(QThread):
                     self.z_stability.emit(compute_z_stability(img))
                 except Exception:
                     pass
-
-                # Drift correction: first iteration becomes the reference;
-                # subsequent iterations cross-correlate against it and
-                # absolute-position via set_offset_nm (using the calibration
-                # already derived). Replaces the relative nudge_offset_pixels
-                # which uses setxyoffpixel — unvalidated on this rig.
-                if it == 0:
-                    tile_ref = img
-                elif tile_ref is not None:
-                    try:
-                        detector = DriftDetector(
-                            continuous=False,
-                            method=getattr(self._recipe, "drift_method", "hybrid"),
-                        )
-                        result = detector.measure(reference=tile_ref, current=img)
-                        if (abs(result.dx_pixels) + abs(result.dy_pixels)) > 0.5:
-                            # Pixel shift → nm shift in the tile frame
-                            shift_x_nm = result.dx_pixels * zoom_nm_per_px_x
-                            shift_y_nm = result.dy_pixels * zoom_nm_per_px_y
-
-                            before = self._log_offset(
-                                f"tile {tile_idx:02d} iter{it + 1} drift "
-                                f"({result.dx_pixels:+.2f}, {result.dy_pixels:+.2f}) px "
-                                f"→ ({shift_x_nm:+.3f}, {shift_y_nm:+.3f}) nm"
-                            )
-                            if before is not None:
-                                new_x = before[0] + shift_x_nm
-                                new_y = before[1] + shift_y_nm
-                                self._stm.scan.set_offset_nm(new_x, new_y)
-                                self._verify_nudge(
-                                    f"tile {tile_idx:02d} iter{it + 1} drift",
-                                    before, shift_x_nm, shift_y_nm,
-                                )
-                                self.info_message.emit(
-                                    f"tile {tile_idx:02d} iter{it + 1}: drift "
-                                    f"corrected by ({shift_x_nm:+.3f}, "
-                                    f"{shift_y_nm:+.3f}) nm "
-                                    f"[from {result.dx_pixels:+.2f}, "
-                                    f"{result.dy_pixels:+.2f} px shift]"
-                                )
-                            self.drift_measured.emit(result)
-                    except Exception as e:
-                        log.debug("tile drift step failed: %s", e)
 
             self.mosaic_tile_done.emit(tile_idx)
 
@@ -919,36 +838,6 @@ class AutomationRunner(QThread):
             if output is not None and wide_after_img is not None:
                 _save_image_preview(wide_after_img, output / "wide_after.png")
             self._log_offset(f"{cfg.name}: wide_after scan complete")
-
-            # Total mosaic drift: cross-correlate wide_before vs wide_after.
-            # Both anchored at wide_centre, so any pixel shift is sample
-            # drift over the whole mosaic duration. Useful diagnostic for
-            # overnight runs and rig stability.
-            if wide_before_img is not None and wide_after_img is not None:
-                try:
-                    detector = DriftDetector(
-                        continuous=False,
-                        method=getattr(self._recipe, "drift_method", "hybrid"),
-                    )
-                    drift = detector.measure(
-                        reference=wide_before_img, current=wide_after_img,
-                    )
-                    drift_x_nm = drift.dx_pixels * wide_nm_per_px_x
-                    drift_y_nm = drift.dy_pixels * wide_nm_per_px_y
-                    drift_total = (drift_x_nm ** 2 + drift_y_nm ** 2) ** 0.5
-                    log.info(
-                        "Mosaic total drift (wide_before → wide_after): "
-                        "Δx=%+.3f nm, Δy=%+.3f nm, |Δ|=%.3f nm  "
-                        "(confidence %.2f, method=%s)",
-                        drift_x_nm, drift_y_nm, drift_total,
-                        drift.confidence, drift.method,
-                    )
-                    self.info_message.emit(
-                        f"Total mosaic drift: Δx={drift_x_nm:+.3f} nm, "
-                        f"Δy={drift_y_nm:+.3f} nm, |Δ|={drift_total:.3f} nm"
-                    )
-                except Exception as e:
-                    log.warning("Mosaic total drift measurement failed: %s", e)
 
         if output is not None:
             self.mosaic_finished.emit(str(output))
@@ -1100,96 +989,6 @@ class AutomationRunner(QThread):
             raise SafetyViolation(status.reason,
                                   current_A=status.measured_current_A)
 
-    def _do_alignment_scan(
-        self,
-        recipe: MeasurementRecipe,
-        data_params: Optional["ScanParams"] = None,
-    ) -> None:
-        """Run a tracking scan and nudge the offset to keep features centred.
-
-        If ``recipe.fast_alignment`` is True and ``data_params`` is given,
-        the alignment scan runs at half the data-scan pixel count (same
-        physical area). The reference is downsampled to match for the
-        correlation, and the data-scan pixels are restored before the
-        caller's data scan starts. Halves the alignment scan's wall-clock
-        time at the cost of slightly coarser cross-correlation precision.
-
-        The alignment frame is captured via ``live_data()`` and *not* saved
-        to disk.
-        """
-        from dataclasses import replace as _dc_replace
-        scan = self._stm.scan
-
-        fast = bool(getattr(recipe, "fast_alignment", False)) and data_params is not None
-        if fast:
-            align_params = _dc_replace(
-                data_params,
-                pixels=(max(64, int(data_params.pixels[0]) // 2),
-                        max(64, int(data_params.pixels[1]) // 2)),
-                memo=f"{data_params.memo} (fast align)" if data_params.memo else "fast align",
-            )
-            scan.apply(align_params)
-
-        scan.start()
-        if not self._wait_for_scan_with_live_emit():
-            if fast and data_params is not None:
-                scan.apply(data_params)
-            return
-        current_array = scan.live_data()
-        if current_array is None or self._reference_array is None:
-            if fast and data_params is not None:
-                scan.apply(data_params)
-            return
-
-        # Cross-correlation needs matching shapes; downsample the full-res
-        # reference onto the alignment frame's grid if they differ.
-        ref_for_corr = self._reference_array
-        if fast and ref_for_corr.shape != current_array.shape:
-            try:
-                from skimage.transform import resize
-                ref_for_corr = resize(
-                    self._reference_array,
-                    current_array.shape,
-                    mode="reflect",
-                    anti_aliasing=True,
-                    preserve_range=True,
-                )
-            except Exception as e:
-                log.warning("Reference resize failed (%s); skipping alignment", e)
-                if data_params is not None:
-                    scan.apply(data_params)
-                return
-
-        cur_ts = time.time()
-        result = self._detector.measure(
-            reference=ref_for_corr,
-            current=current_array,
-            ref_timestamp=self._reference_timestamp,
-            cur_timestamp=cur_ts,
-            extra_seconds=recipe.drift_reposition_delay_s,
-        )
-        self.drift_measured.emit(result)
-        log.info(
-            "Drift%s: dx=%.2f Å, dy=%.2f Å, magnitude=%.2f Å, confidence=%.2f",
-            " (fast)" if fast else "",
-            result.dx_angstrom, result.dy_angstrom,
-            result.magnitude_angstrom, result.confidence,
-        )
-
-        # Nudge *while* the alignment frame is still active so the pixel
-        # delta is interpreted in alignment-frame pixels (correct physical
-        # shift either way: dx_align_px × align_nm_per_px = dx_data_px ×
-        # data_nm_per_px, since size_nm is unchanged between modes).
-        self._stm.scan.nudge_offset_pixels(result.dx_pixels, result.dy_pixels)
-
-        # Restore data-scan pixels before the caller's data scan starts.
-        if fast and data_params is not None:
-            scan.apply(data_params)
-
-        self._sleep_with_progress(recipe.drift_reposition_delay_s,
-                                  "Drift reposition")
-        self.drift_corrected.emit(result.dx_pixels, result.dy_pixels)
-
     def _wait_if_paused(self) -> None:
         if self._pause_requested:
             self._set_state(RunnerState.PAUSED)
@@ -1198,16 +997,6 @@ class AutomationRunner(QThread):
             if not self._stop_requested:
                 self._set_state(RunnerState.RUNNING)
 
-    @staticmethod
-    def _load_channel(path: Path, channel: int) -> Optional[np.ndarray]:
-        try:
-            from createc.Createc_pyFile import DAT_IMG
-            img = DAT_IMG(str(path))
-            return np.array(img.img_array_list[channel], dtype=float)
-        except Exception as e:
-            log.warning("Could not load channel %d from %s: %s", channel, path, e)
-            return None
-
 
 def _save_image_preview(arr: np.ndarray, path: Path) -> Optional[Path]:
     """Render a 2-D scan array as a greyscale PNG using matplotlib."""
@@ -1215,7 +1004,7 @@ def _save_image_preview(arr: np.ndarray, path: Path) -> Optional[Path]:
         import matplotlib
         matplotlib.use("Agg")  # headless backend
         import matplotlib.pyplot as plt
-        from scanflow.drift.detector import _level_correct
+        from scanflow.automation.feature_discovery import _level_correct
 
         levelled = _level_correct(arr.astype(float))
         fig, ax = plt.subplots(figsize=(4, 4), dpi=150)
@@ -1242,7 +1031,7 @@ def _save_overview_preview(
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         from matplotlib.patches import Rectangle
-        from scanflow.drift.detector import _level_correct
+        from scanflow.automation.feature_discovery import _level_correct
 
         levelled = _level_correct(arr.astype(float))
         fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
