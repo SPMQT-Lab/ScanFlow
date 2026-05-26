@@ -32,6 +32,7 @@ class SweepPanel(QWidget):
 
     log_message = Signal(str)
     error_message = Signal(str)
+    scan_completed = Signal(str)
 
     def __init__(self, stm: STMClient, parent=None) -> None:
         super().__init__(parent)
@@ -402,6 +403,7 @@ class SweepPanel(QWidget):
         self._runner.scan_completed.connect(
             lambda p: self.log_message.emit(f"saved: {p}")
         )
+        self._runner.scan_completed.connect(self._on_scan_completed)
         self._runner.error.connect(self._on_error)
         self._runner.safety_violation.connect(self._on_safety_violation)
         self._runner.safety_reading.connect(self._on_safety_reading)
@@ -444,6 +446,9 @@ class SweepPanel(QWidget):
                 "EMERGENCY STOP requested — aborting scan, retracting tip"
             )
             self._status.setText("Emergency stop — retracting tip…")
+
+    def _on_scan_completed(self, path: str) -> None:
+        self.scan_completed.emit(path)
 
     def _force_quit_run(self) -> None:
         if not self._runner:
