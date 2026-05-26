@@ -46,6 +46,8 @@ class SessionManifestWriter:
         self.session_id = session_id or new_session_id()
         self.recipe_name = recipe_name
         self.routine = routine
+        self.created_at = _utc_now()
+        self.updated_at = self.created_at
         self.scans: list[dict[str, Any]] = []
         self.path = session_manifest_path(self.folder) if self.folder else None
 
@@ -68,13 +70,15 @@ class SessionManifestWriter:
         self.write()
 
     def write(self) -> Path | None:
+        self.updated_at = _utc_now()
         if self.path is None:
             return None
         payload = {
             "schema": SESSION_SCHEMA,
             "record_type": "scanflow_session",
             "session_id": self.session_id,
-            "created_at": _utc_now(),
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
             "instrument": {
                 "vendor": "Createc",
                 "client": "STMAFM COM",

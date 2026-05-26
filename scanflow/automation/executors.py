@@ -63,17 +63,57 @@ class ScanExecutor:
     ) -> Path | None:
         scan = self.context.stm.scan
         self.context.event("scan_started", role=role, scan_parameters=self.active_params)
-        scan.start()
+        try:
+            scan.start()
+        except Exception as exc:
+            self.context.event("scan_error", role=role, reason=str(exc))
+            return None
+
+        if not self._wait_for_scan_start(scan, poll_interval_s=poll_interval_s):
+            try:
+                scan.stop()
+            except Exception:
+                pass
+            self.context.event("scan_error", role=role, reason="scan did not start")
+            return None
+
         while scan.is_running:
             if self.context.stop_requested():
                 scan.stop()
                 return None
             time.sleep(max(0.01, float(poll_interval_s)))
+        saved_path: Path | None
         if save_path is None:
-            scan.save_dat(str(self.context.stm.raw.savedatfilename))
+            target = str(self.context.stm.raw.savedatfilename)
         else:
-            scan.save_dat(str(save_path))
-        return scan.last_saved_path()
+            target = str(save_path)
+        try:
+            scan.save_dat(target)
+        except Exception as exc:
+            self.context.event("scan_error", role=role, reason=f"save failed: {exc}")
+            return None
+        saved_path = scan.last_saved_path()
+        if saved_path is None:
+            saved_path = Path(target)
+        self.context.event("scan_completed", role=role, dat_path=str(saved_path))
+        return saved_path
+
+    def _wait_for_scan_start(
+        self,
+        scan,
+        *,
+        poll_interval_s: float,
+    ) -> bool:
+        """Wait for the scan to flip into the running state before saving."""
+        timeout_s = max(1.0, 3.0 * max(0.01, float(poll_interval_s)))
+        deadline = time.monotonic() + timeout_s
+        while not scan.is_running:
+            if self.context.stop_requested():
+                return False
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(max(0.01, float(poll_interval_s)))
+        return True
 
 
 class DriftExecutor:
