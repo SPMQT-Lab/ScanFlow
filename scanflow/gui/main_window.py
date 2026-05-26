@@ -21,7 +21,7 @@ from scanflow.io import Session
 from scanflow.gui.panels.sweep_panel import SweepPanel
 from scanflow.gui.panels.survey_panel import SurveyPanel
 from scanflow.gui.panels.mosaic_panel import MosaicPanel
-from scanflow.gui.panels.preview_panel import PreviewPanel
+from scanflow.gui.panels.preview_panel import PreviewWindow
 from scanflow.gui.panels.z_stability_panel import ZStabilityPanel
 from scanflow.gui.panels.positioning_diag_panel import PositioningDiagPanel
 from scanflow.gui.panels.log_panel import LogPanel
@@ -76,6 +76,10 @@ class MainWindow(QMainWindow):
         self._theme_action.triggered.connect(self._toggle_theme)
         toolbar.addAction(self._theme_action)
 
+        self._preview_action = QAction("Preview", self)
+        self._preview_action.triggered.connect(self._show_preview_window)
+        toolbar.addAction(self._preview_action)
+
         # -- Tabs --
         self._tabs = QTabWidget()
         self.setCentralWidget(self._tabs)
@@ -83,7 +87,7 @@ class MainWindow(QMainWindow):
         self._sweep = SweepPanel(self._stm)
         self._survey = SurveyPanel(self._stm)
         self._mosaic = MosaicPanel(self._stm)
-        self._preview = PreviewPanel(self._stm)
+        self._preview_window = PreviewWindow(self._stm, self)
         self._positioning_diag = PositioningDiagPanel(self._stm)
         # Z-stability monitor runs continuously; it auto-skips polls while
         # disconnected, so it's safe to construct + start before Connect.
@@ -95,7 +99,6 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._sweep, "Sweep")
         self._tabs.addTab(self._survey, "Survey")
         self._tabs.addTab(self._mosaic, "Mosaic")
-        self._tabs.addTab(self._preview, "Preview")
         self._tabs.addTab(self._positioning_diag, "Positioning Test")
         self._tabs.addTab(self._z_stability, "Z Stability")
         self._tabs.addTab(self._log, "Log")
@@ -106,15 +109,15 @@ class MainWindow(QMainWindow):
         self._survey.error_message.connect(self._log.append_error)
         self._mosaic.log_message.connect(self._log.append)
         self._mosaic.error_message.connect(self._log.append_error)
-        self._preview.log_message.connect(self._log.append)
-        self._preview.error_message.connect(self._log.append_error)
+        self._preview_window.log_message.connect(self._log.append)
+        self._preview_window.error_message.connect(self._log.append_error)
         self._positioning_diag.log_message.connect(self._log.append)
         self._z_stability.log_message.connect(self._log.append)
 
-        self._sweep.scan_completed.connect(self._preview.handle_scan_completed)
-        self._survey.scan_completed.connect(self._preview.handle_scan_completed)
-        self._mosaic.scan_completed.connect(self._preview.handle_scan_completed)
-        self._preview.scan_completed.connect(self._log.append)
+        self._sweep.scan_completed.connect(self._preview_window.handle_scan_completed)
+        self._survey.scan_completed.connect(self._preview_window.handle_scan_completed)
+        self._mosaic.scan_completed.connect(self._preview_window.handle_scan_completed)
+        self._preview_window.scan_completed.connect(self._log.append)
 
         # -- Status bar --
         self._status_bar = QStatusBar()
@@ -175,6 +178,9 @@ class MainWindow(QMainWindow):
         else:
             app.setStyleSheet(_theme.LIGHT_STYLESHEET)
             self._theme_action.setText("Night Mode")
+
+    def _show_preview_window(self) -> None:
+        self._preview_window.show_window()
 
     def closeEvent(self, event) -> None:
         self._session.save()

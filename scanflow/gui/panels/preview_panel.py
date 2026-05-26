@@ -32,9 +32,12 @@ from PySide6.QtWidgets import (
     QSlider,
     QSplitter,
     QScrollArea,
+    QListWidget,
+    QListWidgetItem,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
+    QMainWindow,
     QWidget,
     QCheckBox,
 )
@@ -497,6 +500,8 @@ class PreviewPanel(QWidget):
         self._zero_plane_mode = False
         self._preview_selected_indices: set[int] = set()
         self._flatten_collapsed = False
+        self._recent_sources: list[Path] = []
+        self._recent_limit = 12
         self._analysis_timer = QTimer(self)
         self._analysis_timer.setSingleShot(True)
         self._analysis_timer.setInterval(40)
@@ -628,6 +633,12 @@ class PreviewPanel(QWidget):
         self._style_control(self._source_path_edit)
         source_form.addRow("Loaded file", self._source_path_edit)
 
+        self._recent_list = QListWidget()
+        self._recent_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._recent_list.setMinimumHeight(104)
+        self._recent_list.itemDoubleClicked.connect(self._open_recent_item)
+        source_form.addRow("Recent scans", self._recent_list)
+
         for button in (
             self._refresh_btn,
             self._load_raw_btn,
@@ -642,10 +653,15 @@ class PreviewPanel(QWidget):
         self._style_control(self._folder_edit)
         source_form.addRow("Scan folder", self._folder_edit)
 
-        browse_btn = QPushButton("Browse...")
+        browse_btn = QPushButton("Browse folder...")
         browse_btn.clicked.connect(self._pick_folder)
         self._style_button(browse_btn)
         source_form.addRow("", browse_btn)
+
+        open_btn = QPushButton("Open scan...")
+        open_btn.clicked.connect(self._pick_scan_file)
+        self._style_button(open_btn)
+        source_form.addRow("", open_btn)
 
         controls.addWidget(self._section_label("View"))
         view_form = QFormLayout()
@@ -900,12 +916,14 @@ class PreviewPanel(QWidget):
         if latest is None:
             self._show_status(f"No .dat files found in {folder}")
             return
-        self._current_source = latest
-        self._load_scan(latest)
+        self.open_scan(latest)
 
     def handle_scan_completed(self, dat_path: str) -> None:
         """Refresh the preview after any external scan completes."""
-        path = Path(dat_path)
+        self.open_scan(Path(dat_path))
+
+    def open_scan(self, source: str | Path) -> None:
+        path = Path(source)
         self._current_source = path
         self._folder_edit.setText(str(path.parent))
         self._load_scan(path)
@@ -927,6 +945,7 @@ class PreviewPanel(QWidget):
     def _on_scan_loaded(self, source: Path, scan: Any) -> None:
         self._current_scan = scan
         self._current_source = source
+        self._remember_recent_source(source)
         self._folder_edit.setText(str(source.parent))
         self._source_path_edit.setText(str(source))
         self._zero_plane_points = []
@@ -1839,6 +1858,47 @@ class PreviewPanel(QWidget):
             self._folder_edit.setText(path)
             self.refresh_latest()
 
+    def _pick_scan_file(self) -> None:
+        folder = self._folder()
+        start_dir = str(folder) if folder is not None else str(Path.cwd())
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open .dat scan",
+            start_dir,
+            "Createc scans (*.dat);;All files (*)",
+        )
+        if path:
+            self.open_scan(path)
+
+    def _open_recent_item(self, item: QListWidgetItem) -> None:
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(path, str) and path:
+            self.open_scan(path)
+
+    def _remember_recent_source(self, source: Path) -> None:
+        resolved = source.resolve()
+        self._recent_sources = [p for p in self._recent_sources if p.resolve() != resolved]
+        self._recent_sources.insert(0, resolved)
+        del self._recent_sources[self._recent_limit :]
+        self._refresh_recent_list()
+
+    def _refresh_recent_list(self) -> None:
+        if not hasattr(self, "_recent_list"):
+            return
+        self._recent_list.blockSignals(True)
+        try:
+            self._recent_list.clear()
+            for path in self._recent_sources:
+                label = path.name
+                if path.parent.name:
+                    label = f"{path.name}  [{path.parent.name}]"
+                item = QListWidgetItem(label)
+                item.setToolTip(str(path))
+                item.setData(Qt.ItemDataRole.UserRole, str(path))
+                self._recent_list.addItem(item)
+        finally:
+            self._recent_list.blockSignals(False)
+
     def _section_label(self, text: str) -> QLabel:
         label = QLabel(text)
         label.setStyleSheet("color: #111; font-weight: 700; margin-top: 4px;")
@@ -1972,6 +2032,56 @@ def _latest_dat_in_folder(folder: Path) -> Path | None:
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+class PreviewWindow(QMainWindow):
+    """Floating preview window that hosts the reusable PreviewPanel."""
+
+    log_message = Signal(str)
+    error_message = Signal(str)
+    scan_completed = Signal(str)
+
+    def __init__(self, stm: STMClient, parent=None) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.setWindowFlag(Qt.WindowType.Window, True)
+        self.setWindowTitle("ScanFlow Preview")
+        self.resize(1380, 960)
+
+        self._panel = PreviewPanel(stm, parent=self)
+        self.setCentralWidget(self._panel)
+
+        self._panel.log_message.connect(self.log_message.emit)
+        self._panel.error_message.connect(self.error_message.emit)
+        self._panel.scan_completed.connect(self.scan_completed.emit)
+
+    def show_window(self) -> None:
+        if self._panel._current_source is None:
+            self._panel.refresh_latest()
+        self.show()
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def refresh_latest(self) -> None:
+        self._panel.refresh_latest()
+        self.show_window()
+
+    def open_scan(self, source: str | Path) -> None:
+        self._panel.open_scan(source)
+        self.show_window()
+
+    def handle_scan_completed(self, dat_path: str) -> None:
+        self._panel.handle_scan_completed(dat_path)
+        self.show_window()
+
+    @property
+    def panel(self) -> PreviewPanel:
+        return self._panel
+
+    def closeEvent(self, event) -> None:
+        event.ignore()
+        self.hide()
 
 
 def _unique_dat_path(folder: Path, stem: str) -> Path:

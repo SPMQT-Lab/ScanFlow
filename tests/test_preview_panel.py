@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QApplication
 from scanflow.core import STMClient
 from scanflow.gui.panels.preview_panel import (
     PreviewPanel,
+    PreviewWindow,
     _FeatureScanWorker,
     _latest_dat_in_folder,
 )
@@ -62,6 +63,30 @@ def test_preview_panel_loads_raw_scan_without_auto_analysis(tmp_path) -> None:
     assert panel._viewer._image.image is not None
     assert panel._current_state.corrected_plane is None
     assert panel._current_state.feature_rows == ()
+
+
+def test_preview_window_opens_on_scan_completed_and_tracks_recent(tmp_path) -> None:
+    app = QApplication.instance() or QApplication([])
+    first = tmp_path / f"first_{FIXTURE.name}"
+    second = tmp_path / f"second_{FIXTURE.name}"
+    shutil.copy2(FIXTURE, first)
+    shutil.copy2(FIXTURE, second)
+
+    window = PreviewWindow(STMClient())
+    window.handle_scan_completed(str(first))
+    _wait_until(app, lambda: window.isVisible() and window.panel._current_scan is not None)
+
+    assert window.isVisible()
+    assert window.panel._current_state is not None
+    assert window.panel._current_state.source_path == first
+
+    window.handle_scan_completed(str(second))
+    _wait_until(app, lambda: window.panel._current_state is not None and window.panel._current_state.source_path == second)
+
+    assert window.panel._current_state is not None
+    assert window.panel._current_state.source_path == second
+    assert window.panel._recent_list.count() == 2
+    assert window.panel._recent_list.item(0).data(Qt.ItemDataRole.UserRole) == str(second.resolve())
 
 
 def test_preview_panel_background_and_detection_are_user_driven(tmp_path) -> None:
