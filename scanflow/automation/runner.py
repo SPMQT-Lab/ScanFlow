@@ -10,7 +10,7 @@ import logging
 import time
 from enum import Enum, auto
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 import numpy as np
 
@@ -18,17 +18,23 @@ from PySide6.QtCore import QThread, Signal
 
 from scanflow.core import (
     STMClient, STMNotConnectedError, ScanParams, IVTable,
-    SafetyMonitor, SafetyConfig, SafetyViolation,
+    SafetyMonitor, SafetyConfig, SafetyViolation, TipMotionManager,
+    MotionConfig, MotionResult, TipFormParams,
 )
 from scanflow.automation.recipe import (
     MeasurementRecipe, ScanStep, SpectroscopyStep, ApproachStep, WaitStep,
-    SurveyStep, MosaicStep, MIN_CONST_CURRENT_BIAS_V,
+    TipFormStep, SurveyStep, MosaicStep, MIN_CONST_CURRENT_BIAS_V,
 )
 from scanflow.automation.survey import SurveyConfig, FeatureRecord, SurveyManifest
 from scanflow.automation.mosaic import MosaicConfig, tile_centers_in_wide_pixels
 from scanflow.automation.feature_discovery import discover_features, FeatureCandidate
 from scanflow.automation.scan_metrics import compute_z_stability, format_z_stability
 from scanflow.drift import DriftDetector, DriftResult
+from scanflow.io.acquisition_log import AcquisitionLog, default_acquisition_log_path
+from scanflow.io.sidecar import (
+    SessionManifestWriter, new_session_id, scanflow_sidecar_path,
+    write_scan_sidecar,
+)
 
 log = logging.getLogger(__name__)
 
@@ -98,6 +104,22 @@ class AutomationRunner(QThread):
             enable_current_check=recipe.safety_enable,
             retract_on_violation_nm=recipe.safety_retract_nm,
         ))
+        self._motion: TipMotionManager | None = None
+        self._session_id = new_session_id()
+        self._session_writers: dict[Path, SessionManifestWriter] = {}
+        self._acq_log = AcquisitionLog(default_acquisition_log_path(recipe.save_folder))
+        self._active_scan_params: Optional[ScanParams] = None
+        self._current_step_index: Optional[int] = None
+        self._current_step_kind: str = ""
+        self._current_label: str = ""
+        self._last_motion_result: Optional[MotionResult] = None
+        self._last_drift_result: Optional[DriftResult] = None
+        self._last_z_stability: dict | None = None
+        self._max_observed_current_A: Optional[float] = None
+        self._run_generation = 0
+        self._active_run_generation = 0
+        self._tip_form_approval_pending = False
+        self._tip_form_approval_run_generation: int | None = None
 
     # ------------------------------------------------------------------
     # Public controls
@@ -154,6 +176,16 @@ class AutomationRunner(QThread):
     def resume(self) -> None:
         self._pause_requested = False
 
+    def approve_next_tip_form(self) -> None:
+        """Arm one supervised tip-forming pulse for the current or next run."""
+        target_generation = (
+            self._active_run_generation
+            if self._active_run_generation > 0
+            else self._run_generation + 1
+        )
+        self._tip_form_approval_pending = True
+        self._tip_form_approval_run_generation = target_generation
+
     def _set_state(self, state: RunnerState) -> None:
         self._state = state
         self.state_changed.emit(state)
@@ -164,15 +196,28 @@ class AutomationRunner(QThread):
 
     def run(self) -> None:
         self._stop_requested = False
+        self._run_generation += 1
+        self._active_run_generation = self._run_generation
         # COM proxies are apartment-bound — re-dispatch them on this worker
         # thread before any setp/getp, otherwise the first call raises
         # RPC_E_WRONG_THREAD ("interface marshalled for a different thread").
         self._stm.bind_thread()
+        self._motion = TipMotionManager(
+            self._stm,
+            safety=self._safety,
+            config=MotionConfig(
+                max_single_move_nm=500.0,
+                readback_tolerance_nm=2.0,
+                default_settle_s=max(0.0, float(self._recipe.drift_reposition_delay_s)),
+                max_retries=1,
+            ),
+        )
         self._set_state(RunnerState.RUNNING)
         try:
             self._execute()
         except SafetyViolation as e:
             log.error("SAFETY: %s", e)
+            self._acq_log.emit("safety_abort", reason=str(e), current_A=e.current_A)
             self._safety.emergency_stop(self._stm)
             current = e.current_A if e.current_A is not None else 0.0
             self.safety_violation.emit(str(e), current)
@@ -181,15 +226,18 @@ class AutomationRunner(QThread):
             return
         except STMNotConnectedError as e:
             log.error("STM disconnected: %s", e)
+            self._acq_log.emit("routine_error", reason=str(e), kind="stm_disconnected")
             self.error.emit(f"STM disconnected: {e}")
             self._set_state(RunnerState.ERROR)
             return
         except Exception as e:
             log.exception("Unexpected runner error")
+            self._acq_log.emit("routine_error", reason=str(e), kind="unexpected")
             self.error.emit(str(e))
             self._set_state(RunnerState.ERROR)
             return
         finally:
+            self._active_run_generation = 0
             self._stm.unbind_thread()
         self._set_state(RunnerState.FINISHED)
 
@@ -224,10 +272,16 @@ class AutomationRunner(QThread):
                 self._wait_if_paused()
                 step_idx += 1
                 label = step.label or f"step {step_idx}/{total}"
+                self._current_step_index = step_idx
+                self._current_step_kind = getattr(step, "kind", "scan")
+                self._current_label = label
+                self._last_motion_result = None
+                self._last_drift_result = None
+                self._last_z_stability = None
                 self.progress.emit(step_idx, total, label)
                 log.info("Starting %s", label)
 
-                kind = getattr(step, "kind", "scan")
+                kind = self._current_step_kind
                 if kind == "scan":
                     self._do_scan_step(step, recipe, label)
                 elif kind == "spectroscopy":
@@ -237,6 +291,8 @@ class AutomationRunner(QThread):
                 elif kind == "wait":
                     self._sleep_with_progress(
                         step.seconds, label or "Wait")
+                elif kind == "tip_form":
+                    self._do_tip_form_step(step, label)
                 elif kind == "survey":
                     self._do_survey_step(step, label)
                 elif kind == "mosaic":
@@ -248,6 +304,161 @@ class AutomationRunner(QThread):
                     self._sleep_with_progress(
                         recipe.inter_step_delay_s, "Inter-step pause"
                     )
+
+    def _motion_manager(self) -> TipMotionManager:
+        if self._motion is None:
+            self._motion = TipMotionManager(self._stm, safety=self._safety)
+        return self._motion
+
+    def _capture_tip_form_snapshot(self, phase: str, label: str) -> bool:
+        """Require a live-data snapshot for tip-form quality checks."""
+        try:
+            img = self._stm.scan.live_data()
+        except Exception:
+            img = None
+
+        if img is None:
+            msg = (
+                f"TipFormStep '{label}' requires a {phase} quality snapshot; "
+                "live_data() was unavailable"
+            )
+            self._acq_log.emit(
+                "routine_error",
+                step_kind="tip_form",
+                label=label,
+                reason=msg,
+                phase=phase,
+            )
+            log.warning(msg)
+            self.error.emit(msg)
+            self._stop_requested = True
+            return False
+
+        try:
+            self._last_z_stability = compute_z_stability(img)
+            self._acq_log.emit(
+                "z_stability",
+                metrics=self._last_z_stability,
+                phase=f"{phase}_tip_form",
+            )
+        except Exception as exc:
+            log.warning(
+                "TipFormStep '%s' %s snapshot quality metric failed: %s",
+                label, phase, exc,
+            )
+        return True
+
+    def _apply_scan_params(self, params: ScanParams) -> None:
+        self._active_scan_params = params
+        self._stm.scan.apply(params)
+
+    def _routine_name(self) -> str:
+        kinds = {getattr(step, "kind", "scan") for step in self._recipe.steps}
+        if kinds == {"survey"}:
+            return "survey"
+        if kinds == {"mosaic"}:
+            return "mosaic"
+        name = self._recipe.name.lower()
+        if "bias" in name:
+            return "bias_ramp"
+        if "current" in name:
+            return "current_ramp"
+        if "overnight" in name:
+            return "overnight"
+        return "recipe"
+
+    def _record_motion_result(self, result: MotionResult) -> None:
+        self._last_motion_result = result
+        self._acq_log.emit(
+            "motion_attempt",
+            requested_nm=result.requested_nm,
+            before_nm=result.before_nm,
+            reason=result.reason,
+            attempts=result.attempts,
+        )
+        self._acq_log.emit("motion_result", result=result)
+        msg = (
+            f"motion: {'ok' if result.ok else 'FAILED'} "
+            f"{result.reason} target=({result.requested_nm[0]:+.3f}, "
+            f"{result.requested_nm[1]:+.3f}) nm"
+        )
+        if result.after_nm is not None:
+            msg += f" actual=({result.after_nm[0]:+.3f}, {result.after_nm[1]:+.3f}) nm"
+        if result.warnings:
+            msg += " [" + "; ".join(result.warnings) + "]"
+        log.info(msg)
+        self.info_message.emit(msg)
+
+    def _record_scan_artifacts(
+        self,
+        dat_path: Path,
+        *,
+        role: str,
+        scan_params: Optional[ScanParams] = None,
+        motion: Optional[MotionResult] = None,
+        drift: Optional[DriftResult] = None,
+        quality: Optional[dict] = None,
+    ) -> None:
+        params = scan_params or self._active_scan_params
+        position = None
+        try:
+            pos = self._motion_manager().read_position_nm()
+            position = pos.xy if pos is not None else None
+        except Exception:
+            position = None
+
+        safety = {
+            "enabled": self._recipe.safety_enable,
+            "max_current_A": self._recipe.safety_max_current_A,
+            "max_observed_current_A": self._max_observed_current_A,
+            "aborted": False,
+        }
+        sidecar = write_scan_sidecar(
+            dat_path,
+            session_id=self._session_id,
+            routine=self._routine_name(),
+            step_index=self._current_step_index,
+            step_kind=self._current_step_kind or "scan",
+            step_label=self._current_label,
+            scan_parameters=params,
+            position_nm=position,
+            motion=motion or self._last_motion_result,
+            drift=drift or self._last_drift_result,
+            quality=quality or ({"z_stability": self._last_z_stability}
+                                if self._last_z_stability is not None else {}),
+            safety=safety,
+        )
+        folder = Path(dat_path).resolve().parent
+        self._ensure_acq_log_for_folder(folder)
+        writer = self._session_writers.get(folder)
+        if writer is None:
+            writer = SessionManifestWriter(
+                folder,
+                session_id=self._session_id,
+                recipe_name=self._recipe.name,
+                routine=self._routine_name(),
+            )
+            self._session_writers[folder] = writer
+        writer.add_scan(
+            dat_path=dat_path,
+            sidecar_path=sidecar,
+            role=role,
+            step_index=self._current_step_index,
+            label=self._current_label,
+        )
+        self._acq_log.emit(
+            "scan_completed",
+            dat_path=dat_path,
+            sidecar_path=sidecar,
+            role=role,
+            step_index=self._current_step_index,
+            label=self._current_label,
+        )
+
+    def _ensure_acq_log_for_folder(self, folder: Path | str | None) -> None:
+        if self._acq_log.path is not None or folder is None:
+            return
+        self._acq_log = AcquisitionLog(default_acquisition_log_path(folder))
 
     def _do_scan_step(self, step: ScanStep,
                       recipe: MeasurementRecipe, label: str) -> None:
@@ -272,7 +483,7 @@ class AutomationRunner(QThread):
             preamp_exponent=step.preamp_exponent,
             memo=step.memo or label,
         )
-        self._stm.scan.apply(params)
+        self._apply_scan_params(params)
 
         if step.settling_s > 0:
             self._sleep_with_progress(step.settling_s, f"Settling: {label}")
@@ -291,6 +502,7 @@ class AutomationRunner(QThread):
             # Z-stability snapshot: emit before reference handling so the GUI
             # sees one line per data scan regardless of drift state.
             self._emit_z_stability()
+            self._record_scan_artifacts(dat_path, role="data", scan_params=params)
             if self._reference_array is None and recipe.drift_correction:
                 # live_data() is always available immediately after a scan —
                 # no createc file library dependency. Fall back to disk only
@@ -330,6 +542,102 @@ class AutomationRunner(QThread):
             self._stm.spec.multi_at_pixels(list(step.positions))
         log.info("Spec step finished: %s", label)
 
+    def _do_tip_form_step(self, step: TipFormStep, label: str) -> None:
+        """Execute one supervised tip-forming pulse when explicitly armed."""
+        if (
+            not self._tip_form_approval_pending
+            or self._tip_form_approval_run_generation != self._active_run_generation
+        ):
+            if (
+                self._tip_form_approval_pending
+                and self._tip_form_approval_run_generation is not None
+                and self._tip_form_approval_run_generation != self._active_run_generation
+            ):
+                msg = (
+                    f"TipFormStep '{label}' approval was armed for run "
+                    f"{self._tip_form_approval_run_generation}, but this is run "
+                    f"{self._active_run_generation}; call approve_next_tip_form() "
+                    "again before starting this recipe."
+                )
+                self._tip_form_approval_pending = False
+                self._tip_form_approval_run_generation = None
+            else:
+                msg = (
+                    f"TipFormStep '{label}' requires explicit operator confirmation; "
+                    "call approve_next_tip_form() before starting this recipe."
+                )
+            self._acq_log.emit(
+                "routine_error",
+                step_kind="tip_form",
+                label=label,
+                reason=msg,
+                x_px=step.x_px,
+                y_px=step.y_px,
+                voltage_V=step.voltage_V,
+                pulse_length_s=step.pulse_length_s,
+            )
+            log.warning(msg)
+            self.error.emit(msg)
+            self._stop_requested = True
+            return
+
+        self._tip_form_approval_pending = False
+        self._tip_form_approval_run_generation = None
+        self._acq_log.emit(
+            "tip_form_started",
+            label=label,
+            x_px=step.x_px,
+            y_px=step.y_px,
+            voltage_V=step.voltage_V,
+            z_approach_nm=step.z_approach_nm,
+            pulse_length_s=step.pulse_length_s,
+            z_offset_nm=step.z_offset_nm,
+            lateral_speed_nm_s=step.lateral_speed_nm_s,
+        )
+        try:
+            self._motion_manager().assert_safe_to_move()
+            if self._motion_manager().calibration is None:
+                self._motion_manager().calibrate_xy("current_then_delta")
+        except Exception as exc:
+            msg = f"TipFormStep '{label}' aborted before pulse: {exc}"
+            self._acq_log.emit("routine_error", step_kind="tip_form", label=label, reason=msg)
+            log.warning(msg)
+            self.error.emit(msg)
+            self._stop_requested = True
+            return
+
+        if not self._capture_tip_form_snapshot("pre", label):
+            return
+
+        params = TipFormParams(
+            voltage_V=step.voltage_V,
+            z_approach_nm=step.z_approach_nm,
+            pulse_length_s=step.pulse_length_s,
+            z_offset_nm=step.z_offset_nm,
+            lateral_speed_nm_s=step.lateral_speed_nm_s,
+        )
+        try:
+            self._stm.tipform.form_at(step.x_px, step.y_px, params)
+        except Exception as exc:
+            msg = f"TipFormStep '{label}' failed: {exc}"
+            self._acq_log.emit("routine_error", step_kind="tip_form", label=label, reason=msg)
+            log.warning(msg)
+            self.error.emit(msg)
+            self._stop_requested = True
+            return
+
+        if not self._capture_tip_form_snapshot("post", label):
+            return
+
+        self._acq_log.emit(
+            "tip_form_completed",
+            label=label,
+            x_px=step.x_px,
+            y_px=step.y_px,
+            voltage_V=step.voltage_V,
+            pulse_length_s=step.pulse_length_s,
+        )
+
     def _do_survey_step(self, step: SurveyStep, label: str) -> None:
         """Wide scan → feature discovery → per-feature zoom campaign.
 
@@ -362,7 +670,7 @@ class AutomationRunner(QThread):
             speed_nm_s=cfg.wide_speed_nm_s,
             memo=f"{cfg.name} overview",
         )
-        self._stm.scan.apply(wide_params)
+        self._apply_scan_params(wide_params)
         if cfg.settling_s > 0:
             self._sleep_with_progress(cfg.settling_s, f"{cfg.name}: wide settle")
             if self._stop_requested:
@@ -403,10 +711,10 @@ class AutomationRunner(QThread):
             _save_overview_preview(wide_image, candidates, output / "wide_annotated.png")
 
         # --- 3. Per-feature zoom loop ------------------------------------
-        # Track the cumulative wide-pixel target so we can nudge by the
+        # Track the cumulative wide-pixel target so we can move by the
         # *delta* between consecutive features. We always restore the wide
-        # frame params before nudging, so the nm-per-pixel scale used by
-        # nudge_offset_pixels is the wide image's scale.
+        # frame params before moving, so the nm-per-pixel scale is the wide
+        # image's scale.
         self._last_wide_px = (cfg.wide_pixels[0] / 2.0, cfg.wide_pixels[1] / 2.0)
 
         for idx, cand in enumerate(candidates, start=1):
@@ -442,11 +750,10 @@ class AutomationRunner(QThread):
         """Center the scan window on ``cand``, run ``zoom_iterations`` scans,
         and report residual centering between iterations.
 
-        Positioning: nudges the XY offset by the wide-frame pixel delta from the
+        Positioning: moves the XY offset by the wide-frame pixel delta from the
         previous feature's wide-pixel position. The wide frame params are
-        re-applied first so ``nudge_offset_pixels`` uses the wide nm-per-pixel
-        scale — not the previous feature's zoom scale, which would land the
-        next scan in the wrong place entirely.
+        re-applied first so the motion layer uses the wide nm-per-pixel
+        scale, not the previous feature's zoom scale.
         """
         wide_cx = cfg.wide_pixels[0] / 2.0
         wide_cy = cfg.wide_pixels[1] / 2.0
@@ -458,25 +765,37 @@ class AutomationRunner(QThread):
         )
 
         # 1. Restore wide-frame params (preserves XY offset, sets nm-per-pixel
-        # scale so the next nudge is interpreted in wide-image pixels).
+        # scale so the next move is interpreted in wide-image pixels).
         try:
-            self._stm.scan.apply(wide_params)
+            self._apply_scan_params(wide_params)
         except Exception as e:
-            log.warning("could not re-apply wide params before nudge: %s", e)
+            log.warning("could not re-apply wide params before move: %s", e)
 
         # 2. Shift the offset by (target - previous) in wide-pixel units.
         prev_x, prev_y = getattr(self, "_last_wide_px",
                                  (wide_cx, wide_cy))
         dx_px = float(cand.cx_px - prev_x)
         dy_px = float(cand.cy_px - prev_y)
-        try:
-            self._stm.scan.nudge_offset_pixels(dx_px, dy_px)
+        motion = self._motion_manager().move_relative_pixels(
+            dx_px,
+            dy_px,
+            frame_size_nm=cfg.wide_size_nm,
+            frame_pixels=cfg.wide_pixels,
+            reason=f"survey feature {idx:02d} centre",
+            settle_s=cfg.settling_s,
+        )
+        self._record_motion_result(motion)
+        if motion.ok:
             self._last_wide_px = (float(cand.cx_px), float(cand.cy_px))
-            log.info("Feature %d nudge: Δpx=(%+0.2f, %+0.2f) → Δnm=(%+0.2f, %+0.2f)",
+            log.info("Feature %d move: Δpx=(%+0.2f, %+0.2f) → Δnm=(%+0.2f, %+0.2f)",
                      idx, dx_px, dy_px,
                      dx_px * wide_nm_per_px, dy_px * wide_nm_per_px)
-        except Exception as e:
-            log.warning("nudge_offset_pixels failed: %s", e)
+        else:
+            msg = f"Survey feature {idx:02d} positioning failed: {'; '.join(motion.warnings)}"
+            log.warning(msg)
+            self.error.emit(msg)
+            self._stop_requested = True
+            return None
 
         # 3. Apply zoom params (the XY offset stays where we just placed it).
         zoom_params = ScanParams(
@@ -487,12 +806,12 @@ class AutomationRunner(QThread):
             speed_nm_s=cfg.zoom_speed_nm_s,
             memo=f"{cfg.name} f{idx:02d}",
         )
-        self._stm.scan.apply(zoom_params)
+        self._apply_scan_params(zoom_params)
 
         record = FeatureRecord(
             index=idx,
             centroid_pixels=(cand.cx_px, cand.cy_px),
-            centroid_nm_offset=(dx_nm, dy_nm),
+            centroid_nm_offset=(dx_nm_log, dy_nm_log),
             char_dim_nm=cand.char_dim_nm,
             zoom_size_nm=cand.zoom_nm,
             bias_V=cfg.bias_V,
@@ -511,7 +830,7 @@ class AutomationRunner(QThread):
 
             # Pre-scan settle — lets the piezo / feedback / tip stabilise so
             # the first scanline doesn't carry residual drift from the
-            # apply()/nudge() commands above.
+            # apply()/move commands above.
             if cfg.settling_s > 0:
                 self._sleep_with_progress(
                     cfg.settling_s,
@@ -532,6 +851,8 @@ class AutomationRunner(QThread):
 
             # Z-stability for this iteration's data scan
             stability = compute_z_stability(img)
+            self._last_z_stability = stability
+            self._acq_log.emit("z_stability", metrics=stability)
             self.z_stability.emit(stability)
             record.z_stability_per_iter.append(stability)
 
@@ -568,14 +889,28 @@ class AutomationRunner(QThread):
 
             # Re-centre for the next iteration (skip on the last one)
             if it < cfg.zoom_iterations - 1 and (abs(dx_px) + abs(dy_px) > 0.5):
-                try:
-                    self._stm.scan.nudge_offset_pixels(-float(dx_px), -float(dy_px))
-                except Exception as e:
-                    log.warning("nudge_offset_pixels failed: %s", e)
+                motion = self._motion_manager().move_relative_pixels(
+                    -float(dx_px),
+                    -float(dy_px),
+                    frame_size_nm=cand.zoom_nm,
+                    frame_pixels=cfg.zoom_pixels,
+                    reason=f"survey feature {idx:02d} iter {it + 1} recenter",
+                    settle_s=cfg.settling_s,
+                )
+                self._record_motion_result(motion)
+                if not motion.ok:
+                    msg = (
+                        f"Survey feature {idx:02d} recenter failed: "
+                        f"{'; '.join(motion.warnings)}"
+                    )
+                    log.warning(msg)
+                    self.error.emit(msg)
+                    self._stop_requested = True
+                    break
 
         return record
 
-    def _log_offset(self, label: str) -> Optional[Tuple[float, float]]:
+    def _log_offset(self, label: str) -> Optional[tuple[float, float]]:
         """Read SCAN.OFFSET.{X,Y}.NM, log it at INFO, return the (x,y) tuple.
 
         Returns None if the read fails. Used to trace where the scan
@@ -584,7 +919,8 @@ class AutomationRunner(QThread):
         a different XY than expected.
         """
         try:
-            xy = self._stm.scan.get_offset_nm()
+            pos = self._motion_manager().read_position_nm()
+            xy = pos.xy if pos is not None else None
         except Exception as e:
             log.warning("offset read failed at %s: %s", label, e)
             return None
@@ -594,9 +930,9 @@ class AutomationRunner(QThread):
         log.info("%s: offset X=%.3f nm  Y=%.3f nm", label, xy[0], xy[1])
         return xy
 
-    def _verify_nudge(self, label: str, before: Optional[Tuple[float, float]],
-                      expected_dx_nm: float, expected_dy_nm: float,
-                      tol_nm: float = 0.5) -> None:
+    def _verify_move(self, label: str, before: Optional[tuple[float, float]],
+                     expected_dx_nm: float, expected_dy_nm: float,
+                     tol_nm: float = 0.5) -> None:
         """Log a WARNING if the actual change in offset disagrees with the
         commanded shift by more than ``tol_nm``."""
         if before is None:
@@ -624,6 +960,8 @@ class AutomationRunner(QThread):
             return
         try:
             metrics = compute_z_stability(img)
+            self._last_z_stability = metrics
+            self._acq_log.emit("z_stability", metrics=metrics)
             self.z_stability.emit(metrics)
         except Exception:
             log.debug("compute_z_stability failed", exc_info=True)
@@ -660,7 +998,7 @@ class AutomationRunner(QThread):
             speed_nm_s=cfg.wide_speed_nm_s,
             memo=f"{cfg.name} wide before",
         )
-        self._stm.scan.apply(wide_params)
+        self._apply_scan_params(wide_params)
         self._log_offset(f"{cfg.name}: wide_before apply")
         if cfg.settling_s > 0:
             self._sleep_with_progress(cfg.settling_s, f"{cfg.name}: wide settle")
@@ -678,7 +1016,8 @@ class AutomationRunner(QThread):
         # Anchor: read the wide-frame's XY centre via SCAN.OFFSET.{X,Y}.NM.
         # Every tile target is wide_centre + tile-offset; the wide_after
         # scan at the end restores this exact XY.
-        wide_centre = self._stm.scan.get_offset_nm()
+        wide_pos = self._motion_manager().read_position_nm()
+        wide_centre = wide_pos.xy if wide_pos is not None else None
         if wide_centre is None:
             self.error.emit(
                 "Mosaic: couldn't read SCAN.OFFSET.{X,Y}.NM — aborting "
@@ -693,8 +1032,8 @@ class AutomationRunner(QThread):
         )
 
         # Derive the piezo V/nm calibration from the current offset.
-        # set_offset_nm() needs this to convert nm → volts for the
-        # underlying setxyoffvolt COM call. Empirically ~0.1 V/nm on this
+        # The motion layer needs this to convert nm → volts for the
+        # underlying Createc offset call. Empirically ~0.1 V/nm on this
         # rig. If both X and Y are near zero we can't derive — abort
         # rather than position the tip with a bad calibration.
         # Calibration policy: prefer the delta-probe method unconditionally.
@@ -707,25 +1046,22 @@ class AutomationRunner(QThread):
             "Calibration: deriving V/nm by delta probe "
             "(±0.1 V move + restore — tip returns to start)"
         )
-        cal = self._stm.scan.calibrate_xy_by_delta()
-        if cal is None:
-            # Delta probe didn't move the piezo enough to trust the
-            # reading (rare — typically means the rig is unresponsive).
-            # Fall back to the from-current path; better than nothing.
-            log.warning("delta-probe calibration failed; trying from-current")
-            cal = self._stm.scan.calibrate_xy_from_current()
-        if cal is None:
+        try:
+            cal = self._motion_manager().calibrate_xy("current_then_delta")
+        except Exception as e:
             msg = (
                 "Mosaic ABORTED — piezo calibration could not be derived "
                 "(both from-current and delta-probe methods failed). "
-                "Check the piezo is responding and SCAN.OFFSET keys are live."
+                "Check the piezo is responding and SCAN.OFFSET keys are live. "
+                f"{e}"
             )
             log.error(msg)
             self.info_message.emit("⚠ " + msg)
             self.error.emit(msg)
             return
         self.info_message.emit(
-            f"XY calibration: {cal[0]:.5f} V/nm (X), {cal[1]:.5f} V/nm (Y)"
+            f"XY calibration: {cal.volts_per_nm_x:.5f} V/nm (X), "
+            f"{cal.volts_per_nm_y:.5f} V/nm (Y)"
         )
 
         # Tile pixel-offsets → nm offsets in the wide frame
@@ -736,9 +1072,8 @@ class AutomationRunner(QThread):
 
         # ── 2. Tile loop ─────────────────────────────────────────────
         # Absolute positioning: for each tile, compute the target XY in
-        # nm and call set_offset_nm() (which on this rig invokes
-        # setxyoffvolt(x_nm, y_nm) — verified working from the lab
-        # 2026-05-20 probe logs). No accumulation, no scale ambiguity.
+        # nm and move through TipMotionManager. No accumulation, no scale
+        # ambiguity.
         for tile_idx, target_x_px, target_y_px in tile_centers_in_wide_pixels(cfg):
             if self._stop_requested:
                 break
@@ -762,9 +1097,24 @@ class AutomationRunner(QThread):
                     f"X={target_nm[0]:+.3f} nm  Y={target_nm[1]:+.3f} nm  "
                     f"(Δ centre: {dx_nm:+.2f}, {dy_nm:+.2f})"
                 )
-                self._stm.scan.set_offset_nm(target_nm[0], target_nm[1])
+                motion = self._motion_manager().move_absolute_nm(
+                    target_nm[0],
+                    target_nm[1],
+                    reason=f"mosaic tile {tile_idx:02d} target",
+                    settle_s=cfg.settling_s,
+                )
+                self._record_motion_result(motion)
+                if not motion.ok:
+                    msg = (
+                        f"tile {tile_idx:02d}: positioning failed — "
+                        f"{'; '.join(motion.warnings)}"
+                    )
+                    log.warning(msg)
+                    self.info_message.emit("⚠ " + msg)
+                    self.error.emit(msg)
+                    return
                 log.info(
-                    "tile %02d: set_offset_nm(%.3f, %.3f) "
+                    "tile %02d: move_absolute_nm(%.3f, %.3f) "
                     "[Δ from centre: %+.3f, %+.3f nm]",
                     tile_idx, target_nm[0], target_nm[1], dx_nm, dy_nm,
                 )
@@ -785,7 +1135,7 @@ class AutomationRunner(QThread):
                         log.warning(msg)
                         self.info_message.emit("⚠ " + msg)
             except Exception as e:
-                log.warning("tile %02d set_offset_nm failed: %s", tile_idx, e)
+                log.warning("tile %02d positioning failed: %s", tile_idx, e)
                 self.info_message.emit(f"⚠ tile {tile_idx:02d} positioning failed: {e}")
 
             # 2c. Apply tile params (offset preserved).
@@ -797,7 +1147,7 @@ class AutomationRunner(QThread):
                 speed_nm_s=cfg.tile_speed_nm_s,
                 memo=f"{cfg.name} tile {tile_idx:02d}",
             )
-            self._stm.scan.apply(tile_params)
+            self._apply_scan_params(tile_params)
             self._log_offset(f"tile {tile_idx:02d} after apply(tile_params)")
 
             # 2d. Iterations with drift correction against iter 1.
@@ -835,15 +1185,17 @@ class AutomationRunner(QThread):
 
                 # Z stability per scan
                 try:
-                    self.z_stability.emit(compute_z_stability(img))
+                    stability = compute_z_stability(img)
+                    self._last_z_stability = stability
+                    self._acq_log.emit("z_stability", metrics=stability)
+                    self.z_stability.emit(stability)
                 except Exception:
                     pass
 
                 # Drift correction: first iteration becomes the reference;
                 # subsequent iterations cross-correlate against it and
-                # absolute-position via set_offset_nm (using the calibration
-                # already derived). Replaces the relative nudge_offset_pixels
-                # which uses setxyoffpixel — unvalidated on this rig.
+                # move through TipMotionManager using the calibration already
+                # derived for this mosaic.
                 if it == 0:
                     tile_ref = img
                 elif tile_ref is not None:
@@ -853,6 +1205,8 @@ class AutomationRunner(QThread):
                             method=getattr(self._recipe, "drift_method", "hybrid"),
                         )
                         result = detector.measure(reference=tile_ref, current=img)
+                        self._last_drift_result = result
+                        self._acq_log.emit("drift_result", result=result)
                         if (abs(result.dx_pixels) + abs(result.dy_pixels)) > 0.5:
                             # Pixel shift → nm shift in the tile frame
                             shift_x_nm = result.dx_pixels * zoom_nm_per_px_x
@@ -864,20 +1218,34 @@ class AutomationRunner(QThread):
                                 f"→ ({shift_x_nm:+.3f}, {shift_y_nm:+.3f}) nm"
                             )
                             if before is not None:
-                                new_x = before[0] + shift_x_nm
-                                new_y = before[1] + shift_y_nm
-                                self._stm.scan.set_offset_nm(new_x, new_y)
-                                self._verify_nudge(
-                                    f"tile {tile_idx:02d} iter{it + 1} drift",
-                                    before, shift_x_nm, shift_y_nm,
+                                motion = self._motion_manager().move_relative_nm(
+                                    shift_x_nm,
+                                    shift_y_nm,
+                                    reason=(
+                                        f"mosaic tile {tile_idx:02d} "
+                                        f"iter {it + 1} drift"
+                                    ),
+                                    settle_s=cfg.settling_s,
                                 )
-                                self.info_message.emit(
-                                    f"tile {tile_idx:02d} iter{it + 1}: drift "
-                                    f"corrected by ({shift_x_nm:+.3f}, "
-                                    f"{shift_y_nm:+.3f}) nm "
-                                    f"[from {result.dx_pixels:+.2f}, "
-                                    f"{result.dy_pixels:+.2f} px shift]"
-                                )
+                                self._record_motion_result(motion)
+                                if motion.ok:
+                                    self.info_message.emit(
+                                        f"tile {tile_idx:02d} iter{it + 1}: drift "
+                                        f"corrected by ({shift_x_nm:+.3f}, "
+                                        f"{shift_y_nm:+.3f}) nm "
+                                        f"[from {result.dx_pixels:+.2f}, "
+                                        f"{result.dy_pixels:+.2f} px shift]"
+                                    )
+                                else:
+                                    msg = (
+                                        f"tile {tile_idx:02d} iter{it + 1}: "
+                                        f"drift correction failed — "
+                                        f"{'; '.join(motion.warnings)}"
+                                    )
+                                    log.warning(msg)
+                                    self.error.emit(msg)
+                                    self._stop_requested = True
+                                    break
                             self.drift_measured.emit(result)
                     except Exception as e:
                         log.debug("tile drift step failed: %s", e)
@@ -895,18 +1263,29 @@ class AutomationRunner(QThread):
             speed_nm_s=cfg.wide_speed_nm_s,
             memo=f"{cfg.name} wide after",
         )
-        # Return to the wide centre via absolute set_offset_nm(), so
+        # Return to the wide centre via absolute motion, so
         # wide_after is anchored at the same XY as wide_before.
         self._log_offset(f"{cfg.name}: before return-to-centre")
         try:
-            log.info("wide-after: set_offset_nm(%.3f, %.3f)",
+            log.info("wide-after: move_absolute_nm(%.3f, %.3f)",
                      wide_centre[0], wide_centre[1])
-            self._stm.scan.set_offset_nm(wide_centre[0], wide_centre[1])
+            motion = self._motion_manager().move_absolute_nm(
+                wide_centre[0],
+                wide_centre[1],
+                reason=f"{cfg.name}: return to wide centre",
+                settle_s=cfg.settling_s,
+            )
+            self._record_motion_result(motion)
+            if not motion.ok:
+                msg = f"return-to-centre failed: {'; '.join(motion.warnings)}"
+                log.warning(msg)
+                self.error.emit(msg)
+                self._stop_requested = True
         except Exception as e:
             log.warning("return-to-centre failed: %s", e)
         self._log_offset(f"{cfg.name}: after return-to-centre")
 
-        self._stm.scan.apply(wide_after_params)
+        self._apply_scan_params(wide_after_params)
         if cfg.settling_s > 0:
             self._sleep_with_progress(cfg.settling_s, f"{cfg.name}: wide-after settle")
         if not self._stop_requested:
@@ -933,6 +1312,8 @@ class AutomationRunner(QThread):
                     drift = detector.measure(
                         reference=wide_before_img, current=wide_after_img,
                     )
+                    self._last_drift_result = drift
+                    self._acq_log.emit("drift_result", result=drift, role="mosaic_total")
                     drift_x_nm = drift.dx_pixels * wide_nm_per_px_x
                     drift_y_nm = drift.dy_pixels * wide_nm_per_px_y
                     drift_total = (drift_x_nm ** 2 + drift_y_nm ** 2) ** 0.5
@@ -957,6 +1338,21 @@ class AutomationRunner(QThread):
     def _scan_and_save_to(self, output: Optional[Path], filename: str) -> Optional[Path]:
         """Run one scan, save under ``output/filename`` if given, return path."""
         scan = self._stm.scan
+        role = Path(filename).stem
+        if output is not None:
+            self._ensure_acq_log_for_folder(output)
+        else:
+            try:
+                self._ensure_acq_log_for_folder(Path(self._stm.raw.savedatfilename).parent)
+            except Exception:
+                pass
+        self._acq_log.emit(
+            "scan_started",
+            role=role,
+            step_index=self._current_step_index,
+            label=self._current_label,
+            scan_parameters=self._active_scan_params,
+        )
         scan.start()
         if not self._wait_for_scan_with_live_emit():
             return None
@@ -965,13 +1361,25 @@ class AutomationRunner(QThread):
                 scan.save_dat(str(self._stm.raw.savedatfilename))
             except Exception:
                 pass
-            return scan.last_saved_path()
+            path = scan.last_saved_path()
+            if path is not None:
+                self._record_scan_artifacts(Path(path), role=role)
+            return path
         target = output / filename
         try:
             scan.save_dat(str(target))
         except Exception as e:
             log.warning("save_dat failed for %s: %s", target, e)
             return None
+        quality = None
+        try:
+            img = scan.live_data()
+            if img is not None:
+                self._last_z_stability = compute_z_stability(img)
+                quality = {"z_stability": self._last_z_stability}
+        except Exception:
+            quality = None
+        self._record_scan_artifacts(target, role=role, quality=quality)
         return target
 
     def _do_approach_step(self, step: ApproachStep, label: str) -> None:
@@ -1001,6 +1409,20 @@ class AutomationRunner(QThread):
 
     def _scan_and_save(self, recipe: MeasurementRecipe) -> Optional[Path]:
         scan = self._stm.scan
+        if recipe.save_folder:
+            self._ensure_acq_log_for_folder(Path(recipe.save_folder))
+        else:
+            try:
+                self._ensure_acq_log_for_folder(Path(self._stm.raw.savedatfilename).parent)
+            except Exception:
+                pass
+        self._acq_log.emit(
+            "scan_started",
+            role="data",
+            step_index=self._current_step_index,
+            label=self._current_label,
+            scan_parameters=self._active_scan_params,
+        )
         scan.start()
         if not self._wait_for_scan_with_live_emit():
             return None
@@ -1095,8 +1517,19 @@ class AutomationRunner(QThread):
         """Raise SafetyViolation if the current threshold is exceeded."""
         status = self._safety.check(self._stm)
         if status.measured_current_A is not None:
-            self.safety_reading.emit(abs(status.measured_current_A))
+            current = abs(status.measured_current_A)
+            if self._max_observed_current_A is None:
+                self._max_observed_current_A = current
+            else:
+                self._max_observed_current_A = max(self._max_observed_current_A, current)
+            self._acq_log.emit("safety_reading", current_A=current, ok=status.ok)
+            self.safety_reading.emit(current)
         if not status.ok:
+            self._acq_log.emit(
+                "safety_abort",
+                reason=status.reason,
+                current_A=status.measured_current_A,
+            )
             raise SafetyViolation(status.reason,
                                   current_A=status.measured_current_A)
 
@@ -1105,7 +1538,7 @@ class AutomationRunner(QThread):
         recipe: MeasurementRecipe,
         data_params: Optional["ScanParams"] = None,
     ) -> None:
-        """Run a tracking scan and nudge the offset to keep features centred.
+        """Run a tracking scan and move the offset to keep features centred.
 
         If ``recipe.fast_alignment`` is True and ``data_params`` is given,
         the alignment scan runs at half the data-scan pixel count (same
@@ -1128,17 +1561,29 @@ class AutomationRunner(QThread):
                         max(64, int(data_params.pixels[1]) // 2)),
                 memo=f"{data_params.memo} (fast align)" if data_params.memo else "fast align",
             )
-            scan.apply(align_params)
+            self._apply_scan_params(align_params)
 
+        if self._acq_log.path is None:
+            try:
+                self._ensure_acq_log_for_folder(Path(self._stm.raw.savedatfilename).parent)
+            except Exception:
+                pass
+        self._acq_log.emit(
+            "scan_started",
+            role="alignment",
+            step_index=self._current_step_index,
+            label=self._current_label,
+            scan_parameters=self._active_scan_params,
+        )
         scan.start()
         if not self._wait_for_scan_with_live_emit():
             if fast and data_params is not None:
-                scan.apply(data_params)
+                self._apply_scan_params(data_params)
             return
         current_array = scan.live_data()
         if current_array is None or self._reference_array is None:
             if fast and data_params is not None:
-                scan.apply(data_params)
+                self._apply_scan_params(data_params)
             return
 
         # Cross-correlation needs matching shapes; downsample the full-res
@@ -1157,7 +1602,7 @@ class AutomationRunner(QThread):
             except Exception as e:
                 log.warning("Reference resize failed (%s); skipping alignment", e)
                 if data_params is not None:
-                    scan.apply(data_params)
+                    self._apply_scan_params(data_params)
                 return
 
         cur_ts = time.time()
@@ -1168,6 +1613,8 @@ class AutomationRunner(QThread):
             cur_timestamp=cur_ts,
             extra_seconds=recipe.drift_reposition_delay_s,
         )
+        self._last_drift_result = result
+        self._acq_log.emit("drift_result", result=result)
         self.drift_measured.emit(result)
         log.info(
             "Drift%s: dx=%.2f Å, dy=%.2f Å, magnitude=%.2f Å, confidence=%.2f",
@@ -1176,15 +1623,36 @@ class AutomationRunner(QThread):
             result.magnitude_angstrom, result.confidence,
         )
 
-        # Nudge *while* the alignment frame is still active so the pixel
+        # Move while the alignment frame is still active so the pixel
         # delta is interpreted in alignment-frame pixels (correct physical
         # shift either way: dx_align_px × align_nm_per_px = dx_data_px ×
         # data_nm_per_px, since size_nm is unchanged between modes).
-        self._stm.scan.nudge_offset_pixels(result.dx_pixels, result.dy_pixels)
+        frame_size_nm = data_params.size_nm if data_params is not None else scan.size_nm
+        frame_pixels = (
+            int(current_array.shape[1]),
+            int(current_array.shape[0]),
+        )
+        motion = self._motion_manager().move_relative_pixels(
+            result.dx_pixels,
+            result.dy_pixels,
+            frame_size_nm=frame_size_nm,
+            frame_pixels=frame_pixels,
+            reason="drift alignment",
+            settle_s=0.0,
+        )
+        self._record_motion_result(motion)
+        if not motion.ok:
+            msg = f"Drift correction motion failed: {'; '.join(motion.warnings)}"
+            log.warning(msg)
+            self.error.emit(msg)
+            self._stop_requested = True
+            if fast and data_params is not None:
+                self._apply_scan_params(data_params)
+            return
 
         # Restore data-scan pixels before the caller's data scan starts.
         if fast and data_params is not None:
-            scan.apply(data_params)
+            self._apply_scan_params(data_params)
 
         self._sleep_with_progress(recipe.drift_reposition_delay_s,
                                   "Drift reposition")
