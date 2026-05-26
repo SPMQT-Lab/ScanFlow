@@ -8,6 +8,8 @@ __pycache__/
 dist/
 build/
 .eggs/
+.sixth/
+context.md
 
 # Virtual environments
 .venv/
