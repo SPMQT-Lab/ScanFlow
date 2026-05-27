@@ -68,9 +68,10 @@ if %errorlevel%==0 (
 )
 
 :run
-echo Installing ProbeFlow in editable mode...
+echo Installing ProbeFlow in editable mode (offline / no-deps)...
+echo All dependencies are already satisfied by the ScanFlow install.
 echo.
-"%PIP%" install -e "%PROBEFLOW_DIR%"
+"%PIP%" install -e "%PROBEFLOW_DIR%" --no-deps
 
 if %errorlevel% neq 0 (
     echo.
