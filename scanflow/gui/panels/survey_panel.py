@@ -31,6 +31,7 @@ class SurveyPanel(QWidget):
 
     log_message = Signal(str)
     error_message = Signal(str)
+    scan_completed = Signal(str)
 
     def __init__(self, stm: STMClient, parent=None) -> None:
         super().__init__(parent)
@@ -346,6 +347,7 @@ class SurveyPanel(QWidget):
         self._runner.scan_completed.connect(
             lambda p: self.log_message.emit(f"saved: {p}")
         )
+        self._runner.scan_completed.connect(self._on_scan_completed)
         self._runner.start()
 
         self._progress.setMaximum(0)  # busy/indeterminate during survey
@@ -358,6 +360,9 @@ class SurveyPanel(QWidget):
         self.log_message.emit("Stop requested — will halt after current feature")
         self._runner.stop()
         self._status.setText("Stopping…")
+
+    def _on_scan_completed(self, path: str) -> None:
+        self.scan_completed.emit(path)
 
     def _open_in_probeflow(self) -> None:
         if self._last_manifest_path is None or not self._last_manifest_path.exists():

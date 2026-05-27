@@ -41,6 +41,7 @@ class MosaicPanel(QWidget):
 
     log_message = Signal(str)
     error_message = Signal(str)
+    scan_completed = Signal(str)
 
     def __init__(self, stm: STMClient, parent=None) -> None:
         super().__init__(parent)
@@ -494,6 +495,7 @@ class MosaicPanel(QWidget):
         self._runner.scan_completed.connect(
             lambda p: self.log_message.emit(f"saved: {p}")
         )
+        self._runner.scan_completed.connect(self._on_scan_completed)
         self._runner.mosaic_tile_started.connect(self._on_tile_started)
         self._runner.mosaic_tile_done.connect(self._on_tile_done)
         self._runner.mosaic_finished.connect(self._on_mosaic_finished)
@@ -505,6 +507,9 @@ class MosaicPanel(QWidget):
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._force_quit_btn.setEnabled(True)
+
+    def _on_scan_completed(self, path: str) -> None:
+        self.scan_completed.emit(path)
 
     def _stop_run(self) -> None:
         if not self._runner:

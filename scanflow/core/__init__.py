@@ -9,6 +9,9 @@ from .tipform import TipFormController, TipFormParams
 from .temperature import TemperatureMonitor
 from .lateral import LateralController, LateralParams
 from .safety import SafetyMonitor, SafetyConfig, SafetyStatus, SafetyViolation
+from .motion import (
+    TipMotionManager, MotionConfig, MotionResult, XYCalibration, XYPosition,
+)
 
 __all__ = [
     "STMClient", "STMNotConnectedError",
@@ -22,4 +25,5 @@ __all__ = [
     "TemperatureMonitor",
     "LateralController", "LateralParams",
     "SafetyMonitor", "SafetyConfig", "SafetyStatus", "SafetyViolation",
+    "TipMotionManager", "MotionConfig", "MotionResult", "XYCalibration", "XYPosition",
 ]

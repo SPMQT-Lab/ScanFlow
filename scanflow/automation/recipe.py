@@ -11,6 +11,7 @@ ScanStep        run a single image
 SpectroscopyStep  run one or more I/V spectra (single, multi-point, line, grid)
 ApproachStep    re-approach the tip
 WaitStep        sleep for N seconds (useful for thermal settling)
+TipFormStep     supervised, one-confirmation tip-forming pulse
 
 Recipes built only from ScanSteps remain backwards-compatible with the
 v1 YAML format that earlier sessions produced.
@@ -118,6 +119,44 @@ class WaitStep:
 
 
 @dataclass
+class TipFormStep:
+    """Supervised tip-forming pulse placeholder.
+
+    The runner refuses this step unless a GUI confirmation path has explicitly
+    armed it. This gives recipes a serialisable representation without enabling
+    unattended closed-loop tip forming.
+    """
+
+    x_px: int = 128
+    y_px: int = 128
+    voltage_V: float = 0.1
+    z_approach_nm: float = 1.2
+    pulse_length_s: float = 0.4
+    z_offset_nm: float = 0.0
+    lateral_speed_nm_s: float = 10.0
+    require_confirmation: bool = True
+    label: str = ""
+    kind: str = "tip_form"
+
+    def __post_init__(self) -> None:
+        if int(self.x_px) < 0 or int(self.y_px) < 0:
+            raise ValueError("tip-form pixel coordinates must be non-negative")
+        if abs(float(self.voltage_V)) > 10.0:
+            raise ValueError("tip-form voltage must be bounded to +/-10 V")
+        if not (0.0 < float(self.pulse_length_s) <= 10.0):
+            raise ValueError("tip-form pulse length must be in (0, 10] seconds")
+        if not (0.0 <= float(self.z_approach_nm) <= 5.0):
+            raise ValueError("tip-form Z approach must be in [0, 5] nm")
+        if abs(float(self.z_offset_nm)) > 5.0:
+            raise ValueError("tip-form Z offset must be bounded to +/-5 nm")
+        if not (0.0 < float(self.lateral_speed_nm_s) <= 1000.0):
+            raise ValueError("tip-form lateral speed must be in (0, 1000] nm/s")
+
+    def estimate_duration_s(self) -> float:
+        return float(self.pulse_length_s) + 10.0
+
+
+@dataclass
 class SurveyStep:
     """Wide scan + auto feature discovery + per-feature zoom campaign."""
     config: "SurveyConfig" = field(default_factory=lambda: SurveyConfig())
@@ -160,13 +199,17 @@ class MosaicStep:
         return 2 * wide_t + n_tiles * n_iters * tile_t + settle_t
 
 
-RecipeStep = Union[ScanStep, SpectroscopyStep, ApproachStep, WaitStep, SurveyStep, MosaicStep]
+RecipeStep = Union[
+    ScanStep, SpectroscopyStep, ApproachStep, WaitStep,
+    TipFormStep, SurveyStep, MosaicStep,
+]
 
 _STEP_CLASSES = {
     "scan": ScanStep,
     "spectroscopy": SpectroscopyStep,
     "approach": ApproachStep,
     "wait": WaitStep,
+    "tip_form": TipFormStep,
     "survey": SurveyStep,
     "mosaic": MosaicStep,
 }
@@ -196,6 +239,18 @@ def _step_from_dict(d: dict) -> RecipeStep:
     elif cls is WaitStep:
         if "seconds" in d:
             d["seconds"] = float(d["seconds"])
+    elif cls is TipFormStep:
+        for k in ("x_px", "y_px"):
+            if k in d:
+                d[k] = int(d[k])
+        for k in (
+            "voltage_V", "z_approach_nm", "pulse_length_s",
+            "z_offset_nm", "lateral_speed_nm_s",
+        ):
+            if k in d:
+                d[k] = float(d[k])
+        if "require_confirmation" in d:
+            d["require_confirmation"] = bool(d["require_confirmation"])
     return cls(**d)
 
 
