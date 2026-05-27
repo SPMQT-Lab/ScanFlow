@@ -14,6 +14,8 @@ from PySide6.QtCore import QThread, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
@@ -54,6 +56,7 @@ from probeflow.core.scan_loader import load_scan
 from probeflow.processing.geometry import set_zero_plane
 
 from scanflow.core import STMClient, SafetyConfig, SafetyMonitor, TipMotionManager, ScanParams
+from scanflow.automation.group_survey import FeatureGroup, group_features
 
 log = logging.getLogger(__name__)
 
@@ -262,6 +265,360 @@ class _FeatureScanWorker(QThread):
                 self._stm.unbind_thread()
             except Exception:
                 pass
+
+
+class _FeatureGroupScanWorker(QThread):
+    """Scan a list of FeatureGroups one-by-one.
+
+    For each group the worker:
+    1. Moves the scan-frame offset to the group's centre (using
+       ``move_absolute_nm`` so that groups are always positioned relative to
+       the wide-scan home, not accumulated from the previous group).
+    2. Applies a group-sized ``ScanParams``.
+    3. Runs ``group_iterations`` acquisition passes with a short settle
+       between each.  Cross-correlation drift correction is applied between
+       iterations when the DriftDetector is available.
+
+    Signals
+    -------
+    group_started(group_idx, total, label)
+        Emitted before positioning for each group.
+    group_scan_saved(group_idx, dat_path)
+        Emitted after each successful iteration save.
+    failed(message)
+        Emitted on any unrecoverable error (worker then exits).
+    finished_all(output_folder)
+        Emitted when all groups have been scanned without error.
+    """
+
+    group_started = Signal(int, int, str)    # (group_idx, total, label)
+    group_scan_saved = Signal(int, str)      # (group_idx, dat_path)
+    failed = Signal(str)
+    finished_all = Signal(str)               # output_folder path
+
+    def __init__(
+        self,
+        stm: STMClient,
+        source_path: Path,
+        groups: list[FeatureGroup],
+        *,
+        group_pixels: tuple[int, int] = (256, 256),
+        group_speed_nm_s: float = 20.0,
+        group_iterations: int = 3,
+        settling_s: float = 3.0,
+        output_folder: str = "",
+        bias_V: float | None = None,       # None → keep current STM bias
+        setpoint_A: float | None = None,   # None → keep current STM setpoint
+    ) -> None:
+        super().__init__()
+        self._stm = stm
+        self._source_path = Path(source_path)
+        self._groups = list(groups)
+        self._group_pixels = tuple(int(v) for v in group_pixels)
+        self._group_speed_nm_s = float(group_speed_nm_s)
+        self._group_iterations = int(group_iterations)
+        self._settling_s = float(settling_s)
+        self._output_folder = str(output_folder)
+        self._bias_V = float(bias_V) if bias_V is not None else None
+        self._setpoint_A = float(setpoint_A) if setpoint_A is not None else None
+        self._stop_requested = False
+
+    def stop(self) -> None:
+        self._stop_requested = True
+
+    def run(self) -> None:  # pragma: no cover — exercised via panel tests
+        import time
+
+        try:
+            if not self._stm.bind_thread():
+                raise RuntimeError("could not bind STM to group-scan worker thread")
+
+            motion = TipMotionManager(
+                self._stm,
+                safety=SafetyMonitor(
+                    SafetyConfig(
+                        max_current_A=1e-9,
+                        enable_current_check=True,
+                        retract_on_violation_nm=10.0,
+                    )
+                ),
+            )
+
+            current = self._stm.scan.read()
+            bias_V = self._bias_V if self._bias_V is not None else current.bias_V
+            setpoint_A = self._setpoint_A if self._setpoint_A is not None else current.setpoint_A
+
+            # Record the scan-frame offset at the moment the worker starts.
+            # All group centres are offsets from the wide-scan centre, which
+            # corresponds to this home position.
+            home_pos = motion.read_position_nm()
+            if home_pos is None:
+                raise RuntimeError(
+                    "cannot read current scan offset — is the STM connected?"
+                )
+            home_x, home_y = home_pos.x_nm, home_pos.y_nm
+            log.info(
+                "Group scan worker: home offset X=%.3f nm  Y=%.3f nm",
+                home_x, home_y,
+            )
+
+            # Output folder
+            output: Path
+            if self._output_folder:
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                output = Path(self._output_folder) / f"group_scan_{stamp}"
+                output.mkdir(parents=True, exist_ok=True)
+            else:
+                output = self._source_path.parent
+            base_stem = self._source_path.stem
+
+            total = len(self._groups)
+
+            for g_idx, group in enumerate(self._groups, start=1):
+                if self._stop_requested:
+                    break
+
+                label = (
+                    f"Group {g_idx}/{total} "
+                    f"({len(group.members)} feature{'s' if len(group.members) != 1 else ''},"
+                    f" frame {group.frame_nm[0]:.1f}×{group.frame_nm[1]:.1f} nm)"
+                )
+                self.group_started.emit(g_idx, total, label)
+                log.info(
+                    "Group %d/%d: centre offset (%.2f, %.2f) nm  frame %.1f×%.1f nm",
+                    g_idx, total,
+                    group.center_dx_nm, group.center_dy_nm,
+                    group.frame_nm[0], group.frame_nm[1],
+                )
+
+                # 1. Safety check
+                motion.assert_safe_to_move()
+
+                # 2. Move to group centre using ABSOLUTE positioning so that
+                #    groups are never offset relative to the previous group.
+                target_x = home_x + group.center_dx_nm
+                target_y = home_y + group.center_dy_nm
+                move = motion.move_absolute_nm(
+                    target_x,
+                    target_y,
+                    reason=f"group {g_idx:02d} centre",
+                    settle_s=self._settling_s,
+                )
+                if not move.ok:
+                    raise RuntimeError(
+                        f"group {g_idx} positioning failed: "
+                        + ("; ".join(move.warnings) if move.warnings else move.reason or "")
+                    )
+
+                # 3. Apply group scan params (size changes per group)
+                params = ScanParams(
+                    bias_V=bias_V,
+                    setpoint_A=setpoint_A,
+                    size_nm=group.frame_nm,
+                    pixels=self._group_pixels,
+                    speed_nm_s=self._group_speed_nm_s,
+                    memo=f"group {g_idx:02d}",
+                )
+                self._stm.scan.apply(params)
+
+                # 4. Multi-iteration scan with optional drift correction
+                ref_img: np.ndarray | None = None
+
+                for it in range(self._group_iterations):
+                    if self._stop_requested:
+                        break
+
+                    if self._settling_s > 0:
+                        time.sleep(self._settling_s)
+
+                    target_path = _unique_dat_path(
+                        output,
+                        f"{base_stem}_group{g_idx:02d}_iter{it + 1}",
+                    )
+                    timeout_s = _estimate_scan_timeout(params)
+                    saved = self._stm.scan.scan_and_save(
+                        str(target_path), timeout_s=timeout_s
+                    )
+                    if saved is None:
+                        raise RuntimeError(
+                            f"scan timed out for group {g_idx}, iteration {it + 1}"
+                        )
+                    self.group_scan_saved.emit(g_idx, str(saved))
+
+                    # Drift correction between iterations via cross-correlation
+                    img = self._stm.scan.live_data()
+                    if img is not None:
+                        if ref_img is None:
+                            ref_img = img
+                        elif it > 0:
+                            try:
+                                from scanflow.drift import DriftDetector
+                                result = DriftDetector().measure(ref_img, img)
+                                if result is not None and (
+                                    abs(result.dx_px) + abs(result.dy_px)
+                                ) > 0.5:
+                                    nm_per_px = (
+                                        group.frame_nm[0]
+                                        / max(self._group_pixels[0], 1)
+                                    )
+                                    dx_corr = -result.dx_px * nm_per_px
+                                    dy_corr = -result.dy_px * nm_per_px
+                                    cur_pos = motion.read_position_nm()
+                                    if cur_pos is not None:
+                                        motion.move_absolute_nm(
+                                            cur_pos.x_nm + dx_corr,
+                                            cur_pos.y_nm + dy_corr,
+                                            reason=(
+                                                f"group {g_idx:02d} "
+                                                f"iter {it + 1} drift corr"
+                                            ),
+                                            settle_s=1.0,
+                                        )
+                                        log.info(
+                                            "Group %d iter %d drift corr: "
+                                            "(%.2f, %.2f) nm",
+                                            g_idx, it + 1,
+                                            dx_corr, dy_corr,
+                                        )
+                            except Exception as exc:
+                                log.debug(
+                                    "Group %d iter %d: drift correction skipped: %s",
+                                    g_idx, it + 1, exc,
+                                )
+
+            self.finished_all.emit(str(output))
+
+        except Exception as exc:  # pragma: no cover — exercised via panel tests
+            log.exception("Group scan failed")
+            self.failed.emit(str(exc))
+        finally:
+            try:
+                self._stm.unbind_thread()
+            except Exception:
+                pass
+
+
+class _GroupScanDialog(QDialog):
+    """Parameter dialog shown before launching a grouped follow-up scan.
+
+    Collects grouping knobs (max_per_group, max_group_nm, feature_padding_nm)
+    and scan acquisition settings (pixels, speed, iterations, settling).
+    """
+
+    def __init__(self, parent=None, *, defaults: dict | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Scan as Groups — parameters")
+        self.setModal(True)
+        d = defaults or {}
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(10)
+
+        # ── Grouping ──────────────────────────────────────────────────────
+        self._max_per_group = QSpinBox()
+        self._max_per_group.setRange(2, 8)
+        self._max_per_group.setValue(int(d.get("max_per_group", 4)))
+        self._max_per_group.setToolTip("Maximum number of features captured in one scan frame.")
+        form.addRow("Max features / group", self._max_per_group)
+
+        self._max_group_nm = QDoubleSpinBox()
+        self._max_group_nm.setRange(5.0, 200.0)
+        self._max_group_nm.setSingleStep(5.0)
+        self._max_group_nm.setDecimals(1)
+        self._max_group_nm.setSuffix(" nm")
+        self._max_group_nm.setValue(float(d.get("max_group_nm", 30.0)))
+        self._max_group_nm.setToolTip("Maximum side length of any group's scan frame.")
+        form.addRow("Max frame size", self._max_group_nm)
+
+        self._padding_nm = QDoubleSpinBox()
+        self._padding_nm.setRange(0.5, 20.0)
+        self._padding_nm.setSingleStep(0.5)
+        self._padding_nm.setDecimals(1)
+        self._padding_nm.setSuffix(" nm")
+        self._padding_nm.setValue(float(d.get("feature_padding_nm", 3.0)))
+        self._padding_nm.setToolTip("Margin added on each side of the feature bounding boxes.")
+        form.addRow("Feature padding", self._padding_nm)
+
+        # ── Scan acquisition ──────────────────────────────────────────────
+        self._pixels = QComboBox()
+        for label, val in [("128 × 128", 128), ("256 × 256", 256), ("512 × 512", 512)]:
+            self._pixels.addItem(label, val)
+        default_px = int(d.get("group_pixels", 256))
+        for i in range(self._pixels.count()):
+            if self._pixels.itemData(i) == default_px:
+                self._pixels.setCurrentIndex(i)
+                break
+        form.addRow("Resolution", self._pixels)
+
+        self._speed = QDoubleSpinBox()
+        self._speed.setRange(1.0, 1000.0)
+        self._speed.setSingleStep(5.0)
+        self._speed.setDecimals(1)
+        self._speed.setSuffix(" nm/s")
+        self._speed.setValue(float(d.get("group_speed_nm_s", 20.0)))
+        form.addRow("Scan speed", self._speed)
+
+        self._iterations = QSpinBox()
+        self._iterations.setRange(1, 10)
+        self._iterations.setValue(int(d.get("group_iterations", 3)))
+        self._iterations.setToolTip("Number of repeat acquisitions per group (drift corrected).")
+        form.addRow("Iterations / group", self._iterations)
+
+        self._settling = QDoubleSpinBox()
+        self._settling.setRange(0.0, 60.0)
+        self._settling.setSingleStep(0.5)
+        self._settling.setDecimals(1)
+        self._settling.setSuffix(" s")
+        self._settling.setValue(float(d.get("settling_s", 3.0)))
+        self._settling.setToolTip("Settling pause after positioning and before each acquisition.")
+        form.addRow("Settling time", self._settling)
+
+        # ── Output folder (optional) ──────────────────────────────────────
+        folder_row = QWidget()
+        folder_layout = QHBoxLayout(folder_row)
+        folder_layout.setContentsMargins(0, 0, 0, 0)
+        self._folder_edit = QLineEdit()
+        self._folder_edit.setPlaceholderText("(optional — defaults to source scan folder)")
+        self._folder_edit.setText(str(d.get("output_folder", "")))
+        folder_browse = QPushButton("Browse…")
+        folder_browse.setFixedWidth(80)
+        folder_browse.clicked.connect(self._pick_folder)
+        folder_layout.addWidget(self._folder_edit, 1)
+        folder_layout.addWidget(folder_browse)
+        form.addRow("Output folder", folder_row)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+        self.adjustSize()
+
+    # ------------------------------------------------------------------
+    def _pick_folder(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Output folder for group scans")
+        if path:
+            self._folder_edit.setText(path)
+
+    def values(self) -> dict:
+        px = int(self._pixels.currentData() or 256)
+        return {
+            "max_per_group": int(self._max_per_group.value()),
+            "max_group_nm": float(self._max_group_nm.value()),
+            "feature_padding_nm": float(self._padding_nm.value()),
+            "group_pixels": px,
+            "group_speed_nm_s": float(self._speed.value()),
+            "group_iterations": int(self._iterations.value()),
+            "settling_s": float(self._settling.value()),
+            "output_folder": self._folder_edit.text().strip(),
+        }
 
 
 class _PreviewImageView(QWidget):
@@ -494,6 +851,8 @@ class PreviewPanel(QWidget):
         self._segmentation_worker: _SegmentationWorker | None = None
         self._classification_worker: _ClassificationWorker | None = None
         self._scan_worker: _FeatureScanWorker | None = None
+        self._group_scan_worker: _FeatureGroupScanWorker | None = None
+        self._group_scan_defaults: dict = {}
         self._building_table = False
         self._stage = "raw"
         self._zero_plane_points: list[tuple[int, int]] = []
@@ -603,6 +962,11 @@ class PreviewPanel(QWidget):
         self._scan_selected_btn = QPushButton("Queue selected")
         self._scan_selected_btn.clicked.connect(self._scan_selected_features)
         self._scan_selected_btn.setToolTip("Queue the checked molecules for follow-up scans.")
+        self._scan_groups_btn = QPushButton("Scan as Groups")
+        self._scan_groups_btn.clicked.connect(self._scan_selected_as_groups)
+        self._scan_groups_btn.setToolTip(
+            "Group checked features spatially and scan each group in one frame."
+        )
         self._select_class_btn = QPushButton("Select class")
         self._select_class_btn.clicked.connect(self._select_class_rows_from_combo)
         self._select_class_btn.setToolTip("Select every structure that belongs to the chosen class.")
@@ -615,6 +979,7 @@ class PreviewPanel(QWidget):
         self._label_btn.setEnabled(False)
         self._classify_btn.setEnabled(False)
         self._scan_selected_btn.setEnabled(False)
+        self._scan_groups_btn.setEnabled(False)
         self._select_class_btn.setEnabled(False)
         self._queue_class_btn.setEnabled(False)
         self._reset_btn.setEnabled(False)
@@ -829,6 +1194,7 @@ class PreviewPanel(QWidget):
         class_container.addWidget(self._label_btn)
         class_container.addWidget(self._classify_btn)
         class_container.addWidget(self._scan_selected_btn)
+        class_container.addWidget(self._scan_groups_btn)
         controls.addWidget(self._classification_section)
 
         self._feature_mode.currentIndexChanged.connect(lambda *_: self._schedule_live_segmentation())
@@ -1849,6 +2215,125 @@ class PreviewPanel(QWidget):
         self._show_status(f"Follow-up scan failed: {message}")
 
     # ------------------------------------------------------------------
+    # Group scan
+    # ------------------------------------------------------------------
+
+    def _scan_selected_as_groups(self) -> None:
+        """Cluster the checked features spatially and scan each group."""
+        if self._current_state is None:
+            QMessageBox.information(self, "No preview", "Load a scan before scanning groups.")
+            return
+        selected = self._selected_feature_rows()
+        if not selected:
+            QMessageBox.information(self, "No selection",
+                                    "Select at least one feature before scanning groups.")
+            return
+        if (self._group_scan_worker is not None
+                and self._group_scan_worker.isRunning()):
+            QMessageBox.information(self, "Busy", "A group scan is already running.")
+            return
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            QMessageBox.information(self, "Busy",
+                                    "A follow-up scan is already running. "
+                                    "Wait for it to finish before launching a group scan.")
+            return
+
+        # Show parameter dialog (pre-populated with last-used values)
+        dlg = _GroupScanDialog(self, defaults=self._group_scan_defaults)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        params = dlg.values()
+        self._group_scan_defaults = dict(params)  # remember for next time
+
+        # Compute groups
+        scan_range_m = getattr(self._current_scan, "scan_range_m", None)
+        scan_shape = self._current_state.raw_plane.shape  # (ny, nx)
+        groups = group_features(
+            selected,
+            scan_range_m,
+            scan_shape,
+            max_per_group=params["max_per_group"],
+            max_group_nm=params["max_group_nm"],
+            feature_padding_nm=params["feature_padding_nm"],
+        )
+        if not groups:
+            QMessageBox.information(self, "No groups",
+                                    "Feature grouping produced no groups — "
+                                    "check that at least one feature is selected.")
+            return
+
+        n_feat = len(selected)
+        n_groups = len(groups)
+        member_summary = ", ".join(
+            str(len(g.members)) for g in groups
+        )
+        msg = (
+            f"{n_feat} feature(s) grouped into {n_groups} group(s) "
+            f"[{member_summary} feature(s) each].\n\n"
+            f"Proceed to scan all {n_groups} group(s)?"
+        )
+        if QMessageBox.question(
+            self, "Confirm group scan", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        px = params["group_pixels"]
+        self._scan_groups_btn.setEnabled(False)
+        self._scan_selected_btn.setEnabled(False)
+        self._group_scan_worker = _FeatureGroupScanWorker(
+            self._stm,
+            self._current_state.source_path,
+            groups,
+            group_pixels=(px, px),
+            group_speed_nm_s=params["group_speed_nm_s"],
+            group_iterations=params["group_iterations"],
+            settling_s=params["settling_s"],
+            output_folder=params["output_folder"],
+        )
+        self._group_scan_worker.group_started.connect(self._on_group_started)
+        self._group_scan_worker.group_scan_saved.connect(self._on_group_scan_saved)
+        self._group_scan_worker.failed.connect(self._on_group_scan_failed)
+        self._group_scan_worker.finished_all.connect(self._on_group_scan_finished_all)
+        self._group_scan_worker.finished.connect(self._on_group_scan_thread_done)
+        self._group_scan_worker.start()
+        self.log_message.emit(
+            f"Group scan started: {n_feat} feature(s) → {n_groups} group(s)"
+        )
+        self._show_status(
+            f"Scanning {n_groups} group(s) ({n_feat} feature(s) total)…"
+        )
+
+    def _on_group_started(self, group_idx: int, total: int, label: str) -> None:
+        self._show_status(f"Group scan {group_idx}/{total}: {label}")
+        self.log_message.emit(f"Group scan {group_idx}/{total}: {label}")
+
+    def _on_group_scan_saved(self, group_idx: int, path: str) -> None:
+        self.scan_completed.emit(path)
+        self.handle_scan_completed(path)
+        self.log_message.emit(f"Group {group_idx} scan saved: {path}")
+
+    def _on_group_scan_failed(self, message: str) -> None:
+        self.error_message.emit(message)
+        self._show_status(f"Group scan failed: {message}")
+
+    def _on_group_scan_finished_all(self, folder: str) -> None:
+        self.log_message.emit(f"Group scan complete. Output: {folder}")
+        self._show_status(f"Group scan complete → {folder}")
+
+    def _on_group_scan_thread_done(self) -> None:
+        self._scan_groups_btn.setEnabled(
+            self._stage == "classification"
+            and self._current_state is not None
+            and bool(self._current_state.feature_rows)
+        )
+        self._scan_selected_btn.setEnabled(
+            self._stage == "classification"
+            and self._current_state is not None
+            and bool(self._current_state.feature_rows)
+        )
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
@@ -1962,11 +2447,13 @@ class PreviewPanel(QWidget):
         self._label_btn.setVisible(stage == "classification")
         self._classify_btn.setVisible(stage == "classification")
         self._scan_selected_btn.setVisible(stage == "classification")
+        self._scan_groups_btn.setVisible(stage == "classification")
         self._select_class_btn.setVisible(stage == "classification")
         self._queue_class_btn.setVisible(stage == "classification")
         self._label_btn.setEnabled(stage == "classification" and self._current_state is not None and bool(self._current_state.feature_rows))
         self._classify_btn.setEnabled(stage == "classification" and self._current_state is not None and bool(self._current_state.feature_rows))
         self._scan_selected_btn.setEnabled(stage == "classification" and self._current_state is not None and bool(self._current_state.feature_rows))
+        self._scan_groups_btn.setEnabled(stage == "classification" and self._current_state is not None and bool(self._current_state.feature_rows))
         class_enabled = stage == "classification" and self._current_state is not None and bool(self._current_state.feature_rows)
         self._select_class_btn.setEnabled(class_enabled and self._class_pick_combo.count() > 0)
         self._queue_class_btn.setEnabled(class_enabled and self._class_pick_combo.count() > 0)
