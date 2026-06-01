@@ -29,7 +29,6 @@ from scanflow.automation.survey import SurveyConfig, FeatureRecord, SurveyManife
 from scanflow.automation.mosaic import MosaicConfig, tile_centers_in_wide_pixels
 from scanflow.automation.feature_discovery import discover_features, FeatureCandidate
 from scanflow.automation.scan_metrics import compute_z_stability, format_z_stability
-from scanflow.drift import DriftDetector, DriftResult
 from scanflow.io.acquisition_log import AcquisitionLog, default_acquisition_log_path
 from scanflow.io.sidecar import (
     SessionManifestWriter, new_session_id, scanflow_sidecar_path,
@@ -106,7 +105,6 @@ class AutomationRunner(QThread):
         self._current_step_kind: str = ""
         self._current_label: str = ""
         self._last_motion_result: Optional[MotionResult] = None
-        self._last_drift_result: Optional[DriftResult] = None
         self._last_z_stability: dict | None = None
         self._max_observed_current_A: Optional[float] = None
         self._run_generation = 0
@@ -201,7 +199,7 @@ class AutomationRunner(QThread):
             config=MotionConfig(
                 max_single_move_nm=500.0,
                 readback_tolerance_nm=2.0,
-                default_settle_s=max(0.0, float(self._recipe.drift_reposition_delay_s)),
+                default_settle_s=0.0,
                 max_retries=1,
             ),
         )
@@ -257,7 +255,6 @@ class AutomationRunner(QThread):
                 self._current_step_kind = getattr(step, "kind", "scan")
                 self._current_label = label
                 self._last_motion_result = None
-                self._last_drift_result = None
                 self._last_z_stability = None
                 self.progress.emit(step_idx, total, label)
                 log.info("Starting %s", label)
@@ -377,7 +374,6 @@ class AutomationRunner(QThread):
         role: str,
         scan_params: Optional[ScanParams] = None,
         motion: Optional[MotionResult] = None,
-        drift: Optional[DriftResult] = None,
         quality: Optional[dict] = None,
     ) -> None:
         params = scan_params or self._active_scan_params
@@ -404,7 +400,6 @@ class AutomationRunner(QThread):
             scan_parameters=params,
             position_nm=position,
             motion=motion or self._last_motion_result,
-            drift=drift or self._last_drift_result,
             quality=quality or ({"z_stability": self._last_z_stability}
                                 if self._last_z_stability is not None else {}),
             safety=safety,
@@ -477,17 +472,6 @@ class AutomationRunner(QThread):
             self.scan_completed.emit(str(dat_path))
             self._emit_z_stability()
             self._record_scan_artifacts(dat_path, role="data", scan_params=params)
-            if self._reference_array is None and recipe.drift_correction:
-                # live_data() is always available immediately after a scan —
-                # no createc file library dependency. Fall back to disk only
-                # if the DSP buffer is empty for some reason.
-                self._reference_array = self._stm.scan.live_data()
-                if self._reference_array is None:
-                    self._reference_array = self._load_channel(
-                        dat_path, recipe.drift_channel)
-                self._reference_timestamp = time.time()
-                if self._reference_array is not None:
-                    log.info("Drift reference captured — correction active from next scan")
 
     def _do_spec_step(self, step: SpectroscopyStep, label: str) -> None:
         table = IVTable(
@@ -1122,7 +1106,6 @@ class AutomationRunner(QThread):
             # so a bias sweep is supported (each iter at a different voltage).
             # apply() preserves the XY offset set by set_offset_nm() above.
             bias_seq = cfg.effective_bias_sequence()
-            tile_ref: Optional[np.ndarray] = None
             zoom_nm_per_px_x = tile_size_nm[0] / max(cfg.tile_pixels[0], 1)
             zoom_nm_per_px_y = tile_size_nm[1] / max(cfg.tile_pixels[1], 1)
 
@@ -1190,63 +1173,6 @@ class AutomationRunner(QThread):
                 except Exception:
                     pass
 
-                # Drift correction: first iteration becomes the reference;
-                # subsequent iterations cross-correlate against it and
-                # move through TipMotionManager using the calibration already
-                # derived for this mosaic.
-                if it == 0:
-                    tile_ref = img
-                elif tile_ref is not None:
-                    try:
-                        detector = DriftDetector(
-                            continuous=False,
-                            method=getattr(self._recipe, "drift_method", "hybrid"),
-                        )
-                        result = detector.measure(reference=tile_ref, current=img)
-                        self._last_drift_result = result
-                        self._acq_log.emit("drift_result", result=result)
-                        if (abs(result.dx_pixels) + abs(result.dy_pixels)) > 0.5:
-                            # Pixel shift → nm shift in the tile frame
-                            shift_x_nm = result.dx_pixels * zoom_nm_per_px_x
-                            shift_y_nm = result.dy_pixels * zoom_nm_per_px_y
-
-                            before = self._log_offset(
-                                f"tile {tile_idx:02d} iter{it + 1} drift "
-                                f"({result.dx_pixels:+.2f}, {result.dy_pixels:+.2f}) px "
-                                f"→ ({shift_x_nm:+.3f}, {shift_y_nm:+.3f}) nm"
-                            )
-                            if before is not None:
-                                motion = self._motion_manager().move_relative_nm(
-                                    shift_x_nm,
-                                    shift_y_nm,
-                                    reason=(
-                                        f"mosaic tile {tile_idx:02d} "
-                                        f"iter {it + 1} drift"
-                                    ),
-                                    settle_s=cfg.settling_s,
-                                )
-                                self._record_motion_result(motion)
-                                if motion.ok:
-                                    self.info_message.emit(
-                                        f"tile {tile_idx:02d} iter{it + 1}: drift "
-                                        f"corrected by ({shift_x_nm:+.3f}, "
-                                        f"{shift_y_nm:+.3f}) nm "
-                                        f"[from {result.dx_pixels:+.2f}, "
-                                        f"{result.dy_pixels:+.2f} px shift]"
-                                    )
-                                else:
-                                    msg = (
-                                        f"tile {tile_idx:02d} iter{it + 1}: "
-                                        f"drift correction failed — "
-                                        f"{'; '.join(motion.warnings)}"
-                                    )
-                                    log.warning(msg)
-                                    self.error.emit(msg)
-                                    self._stop_requested = True
-                                    break
-                            self.drift_measured.emit(result)
-                    except Exception as e:
-                        log.debug("tile drift step failed: %s", e)
 
 
             self.mosaic_tile_done.emit(tile_idx)
@@ -1298,37 +1224,6 @@ class AutomationRunner(QThread):
                 _save_image_preview(wide_after_img, output / "wide_after.png")
             self._log_offset(f"{cfg.name}: wide_after scan complete")
 
-            # Total mosaic drift: cross-correlate wide_before vs wide_after.
-            # Both anchored at wide_centre, so any pixel shift is sample
-            # drift over the whole mosaic duration. Useful diagnostic for
-            # overnight runs and rig stability.
-            if wide_before_img is not None and wide_after_img is not None:
-                try:
-                    detector = DriftDetector(
-                        continuous=False,
-                        method=getattr(self._recipe, "drift_method", "hybrid"),
-                    )
-                    drift = detector.measure(
-                        reference=wide_before_img, current=wide_after_img,
-                    )
-                    self._last_drift_result = drift
-                    self._acq_log.emit("drift_result", result=drift, role="mosaic_total")
-                    drift_x_nm = drift.dx_pixels * wide_nm_per_px_x
-                    drift_y_nm = drift.dy_pixels * wide_nm_per_px_y
-                    drift_total = (drift_x_nm ** 2 + drift_y_nm ** 2) ** 0.5
-                    log.info(
-                        "Mosaic total drift (wide_before → wide_after): "
-                        "Δx=%+.3f nm, Δy=%+.3f nm, |Δ|=%.3f nm  "
-                        "(confidence %.2f, method=%s)",
-                        drift_x_nm, drift_y_nm, drift_total,
-                        drift.confidence, drift.method,
-                    )
-                    self.info_message.emit(
-                        f"Total mosaic drift: Δx={drift_x_nm:+.3f} nm, "
-                        f"Δy={drift_y_nm:+.3f} nm, |Δ|={drift_total:.3f} nm"
-                    )
-                except Exception as e:
-                    log.warning("Mosaic total drift measurement failed: %s", e)
 
 
         if output is not None:
@@ -1532,132 +1427,6 @@ class AutomationRunner(QThread):
             )
             raise SafetyViolation(status.reason,
                                   current_A=status.measured_current_A)
-
-    def _do_alignment_scan(
-        self,
-        recipe: MeasurementRecipe,
-        data_params: Optional["ScanParams"] = None,
-    ) -> None:
-        """Run a tracking scan and move the offset to keep features centred.
-
-        If ``recipe.fast_alignment`` is True and ``data_params`` is given,
-        the alignment scan runs at half the data-scan pixel count (same
-        physical area). The reference is downsampled to match for the
-        correlation, and the data-scan pixels are restored before the
-        caller's data scan starts. Halves the alignment scan's wall-clock
-        time at the cost of slightly coarser cross-correlation precision.
-
-        The alignment frame is captured via ``live_data()`` and *not* saved
-        to disk.
-        """
-        from dataclasses import replace as _dc_replace
-        scan = self._stm.scan
-
-        fast = bool(getattr(recipe, "fast_alignment", False)) and data_params is not None
-        if fast:
-            align_params = _dc_replace(
-                data_params,
-                pixels=(max(64, int(data_params.pixels[0]) // 2),
-                        max(64, int(data_params.pixels[1]) // 2)),
-                memo=f"{data_params.memo} (fast align)" if data_params.memo else "fast align",
-            )
-            self._apply_scan_params(align_params)
-
-        if self._acq_log.path is None:
-            try:
-                self._ensure_acq_log_for_folder(Path(self._stm.raw.savedatfilename).parent)
-            except Exception:
-                pass
-        self._acq_log.emit(
-            "scan_started",
-            role="alignment",
-            step_index=self._current_step_index,
-            label=self._current_label,
-            scan_parameters=self._active_scan_params,
-        )
-        scan.start()
-        if not self._wait_for_scan_with_live_emit():
-            if fast and data_params is not None:
-                self._apply_scan_params(data_params)
-            return
-        current_array = scan.live_data()
-        if current_array is None or self._reference_array is None:
-            if fast and data_params is not None:
-                self._apply_scan_params(data_params)
-            return
-
-        # Cross-correlation needs matching shapes; downsample the full-res
-        # reference onto the alignment frame's grid if they differ.
-        ref_for_corr = self._reference_array
-        if fast and ref_for_corr.shape != current_array.shape:
-            try:
-                from skimage.transform import resize
-                ref_for_corr = resize(
-                    self._reference_array,
-                    current_array.shape,
-                    mode="reflect",
-                    anti_aliasing=True,
-                    preserve_range=True,
-                )
-            except Exception as e:
-                log.warning("Reference resize failed (%s); skipping alignment", e)
-                if data_params is not None:
-                    self._apply_scan_params(data_params)
-                return
-
-        cur_ts = time.time()
-        result = self._detector.measure(
-            reference=ref_for_corr,
-            current=current_array,
-            ref_timestamp=self._reference_timestamp,
-            cur_timestamp=cur_ts,
-            extra_seconds=recipe.drift_reposition_delay_s,
-        )
-        self._last_drift_result = result
-        self._acq_log.emit("drift_result", result=result)
-        self.drift_measured.emit(result)
-        log.info(
-            "Drift%s: dx=%.2f Å, dy=%.2f Å, magnitude=%.2f Å, confidence=%.2f",
-            " (fast)" if fast else "",
-            result.dx_angstrom, result.dy_angstrom,
-            result.magnitude_angstrom, result.confidence,
-        )
-
-        # Move while the alignment frame is still active so the pixel
-        # delta is interpreted in alignment-frame pixels (correct physical
-        # shift either way: dx_align_px × align_nm_per_px = dx_data_px ×
-        # data_nm_per_px, since size_nm is unchanged between modes).
-        frame_size_nm = data_params.size_nm if data_params is not None else scan.size_nm
-        frame_pixels = (
-            int(current_array.shape[1]),
-            int(current_array.shape[0]),
-        )
-        motion = self._motion_manager().move_relative_pixels(
-            result.dx_pixels,
-            result.dy_pixels,
-            frame_size_nm=frame_size_nm,
-            frame_pixels=frame_pixels,
-            reason="drift alignment",
-            settle_s=0.0,
-        )
-        self._record_motion_result(motion)
-        if not motion.ok:
-            msg = f"Drift correction motion failed: {'; '.join(motion.warnings)}"
-            log.warning(msg)
-            self.error.emit(msg)
-            self._stop_requested = True
-            if fast and data_params is not None:
-                self._apply_scan_params(data_params)
-            return
-
-        # Restore data-scan pixels before the caller's data scan starts.
-        if fast and data_params is not None:
-            self._apply_scan_params(data_params)
-
-        self._sleep_with_progress(recipe.drift_reposition_delay_s,
-                                  "Drift reposition")
-        self.drift_corrected.emit(result.dx_pixels, result.dy_pixels)
-
 
     def _wait_if_paused(self) -> None:
         if self._pause_requested:

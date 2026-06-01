@@ -30,7 +30,6 @@ def test_write_scan_sidecar(tmp_path):
         ),
         position_nm=(1.0, 2.0),
         motion={"ok": True, "reason": "test"},
-        drift={"method": "hybrid", "dx_pixels": 0.0, "dy_pixels": 0.0, "confidence": 1.0},
         quality={"z_stability": {"rms_pm": 1.0}},
         safety={"enabled": True, "max_current_A": 1e-9, "aborted": False},
     )

@@ -15,7 +15,6 @@ from typing import Callable, Optional
 import numpy as np
 
 from scanflow.core import STMClient, ScanParams, TipMotionManager, MotionResult
-from scanflow.drift import DriftDetector, DriftResult
 from scanflow.io.acquisition_log import AcquisitionLog
 
 
@@ -114,38 +113,6 @@ class ScanExecutor:
                 return False
             time.sleep(max(0.01, float(poll_interval_s)))
         return True
-
-
-class DriftExecutor:
-    """Qt-free drift measurement and motion correction helper."""
-
-    def __init__(self, context: ExecutorContext, *, method: str = "hybrid") -> None:
-        self.context = context
-        self.detector = DriftDetector(continuous=True, method=method)
-
-    def measure(self, reference: np.ndarray, current: np.ndarray) -> DriftResult:
-        result = self.detector.measure(reference=reference, current=current)
-        self.context.event("drift_result", result=result)
-        return result
-
-    def correct_pixels(
-        self,
-        result: DriftResult,
-        *,
-        frame_size_nm: tuple[float, float],
-        frame_pixels: tuple[int, int],
-        settle_s: float = 0.0,
-    ) -> MotionResult:
-        motion = self.context.motion.move_relative_pixels(
-            result.dx_pixels,
-            result.dy_pixels,
-            frame_size_nm=frame_size_nm,
-            frame_pixels=frame_pixels,
-            reason="drift correction",
-            settle_s=settle_s,
-        )
-        self.context.event("motion_result", result=motion)
-        return motion
 
 
 class SurveyExecutor:

@@ -167,7 +167,29 @@ class MainWindow(QMainWindow):
             self._stm_label.setText("STM: mock")
             return
         connected = self._stm.connected
-        self._stm_label.setText(f"STM: {'connected' if connected else 'disconnected'}")
+        if not connected:
+            self._stm_label.setText("STM: disconnected")
+            return
+        try:
+            running = self._stm.scan.is_running
+            if running:
+                offset = self._stm.scan.get_offset_nm()
+                params = self._stm.scan.read()
+                pos_str = (
+                    f"X={offset[0]:+.2f} Y={offset[1]:+.2f} nm"
+                    if offset else "pos:n/a"
+                )
+                size_str = (
+                    f"{params.size_nm[0]:.1f}×{params.size_nm[1]:.1f} nm"
+                    if params.size_nm else ""
+                )
+                self._stm_label.setText(
+                    f"STM: scanning  |  {pos_str}  |  {size_str}"
+                )
+            else:
+                self._stm_label.setText("STM: connected")
+        except Exception:
+            self._stm_label.setText("STM: connected")
 
     def _toggle_theme(self) -> None:
         self._dark_mode = not self._dark_mode

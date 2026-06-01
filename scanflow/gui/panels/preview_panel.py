@@ -199,11 +199,31 @@ class _FeatureScanWorker(QThread):
     failed = Signal(str)
     progress = Signal(int, int, str)
 
-    def __init__(self, stm: STMClient, source_path: Path, targets: list[PreviewFeatureRow]) -> None:
+    def __init__(
+        self,
+        stm: STMClient,
+        source_path: Path,
+        targets: list[PreviewFeatureRow],
+        *,
+        bias_V: float | None = None,
+        setpoint_A: float | None = None,
+        n_reps: int = 1,
+        bias_sequence: list[float] | None = None,
+        size_nm: float | None = None,  # None → inherit current STM size
+    ) -> None:
         super().__init__()
         self._stm = stm
         self._source_path = Path(source_path)
         self._targets = list(targets)
+        self._stop_requested = False
+        self._bias_V = float(bias_V) if bias_V is not None else None
+        self._setpoint_A = float(setpoint_A) if setpoint_A is not None else None
+        self._n_reps = max(1, int(n_reps))
+        self._bias_sequence = list(bias_sequence) if bias_sequence else []
+        self._size_nm = float(size_nm) if size_nm is not None else None
+
+    def stop(self) -> None:
+        self._stop_requested = True
 
     def run(self) -> None:
         try:
@@ -220,43 +240,112 @@ class _FeatureScanWorker(QThread):
                 ),
             )
             current = self._stm.scan.read()
+            bias_V = self._bias_V if self._bias_V is not None else current.bias_V
+            setpoint_A = self._setpoint_A if self._setpoint_A is not None else current.setpoint_A
+            biases = self._bias_sequence if self._bias_sequence else [bias_V] * self._n_reps
             base_folder = self._source_path.parent
             base_stem = self._source_path.stem
             total = len(self._targets)
             for i, row in enumerate(self._targets, start=1):
+                if self._stop_requested:
+                    break
                 self.progress.emit(i, total, f"Target {row.index + 1}/{total}")
                 motion.assert_safe_to_move()
+                log.info(
+                    "Feature scan target %d/%d: relative move Δ=(%.3f, %.3f) nm",
+                    row.index + 1, total, row.dx_nm, row.dy_nm,
+                )
                 move = motion.move_relative_nm(
                     row.dx_nm,
                     row.dy_nm,
                     reason=f"preview follow-up target {row.index + 1}",
                     settle_s=3.0,
                 )
+                _move_msg = (
+                    f"Target {row.index + 1}/{total} move: {'ok' if move.ok else 'FAILED'} "
+                    f"Δ=({row.dx_nm:+.3f}, {row.dy_nm:+.3f}) nm"
+                )
+                if move.before_nm is not None:
+                    _move_msg += f"  before=({move.before_nm[0]:+.3f}, {move.before_nm[1]:+.3f}) nm"
+                if move.after_nm is not None:
+                    _move_msg += f"  after=({move.after_nm[0]:+.3f}, {move.after_nm[1]:+.3f}) nm"
+                    expected_x = (move.before_nm[0] if move.before_nm else 0.0) + row.dx_nm
+                    expected_y = (move.before_nm[1] if move.before_nm else 0.0) + row.dy_nm
+                    err_x = move.after_nm[0] - expected_x
+                    err_y = move.after_nm[1] - expected_y
+                    _move_msg += f"  err=({err_x:+.3f}, {err_y:+.3f}) nm"
+                    if abs(err_x) > 0.5 or abs(err_y) > 0.5:
+                        log.warning(
+                            "Target %d/%d positioning mismatch — err (%+.3f, %+.3f) nm",
+                            row.index + 1, total, err_x, err_y,
+                        )
+                if move.warnings:
+                    _move_msg += "  [" + "; ".join(move.warnings) + "]"
+                log.info(_move_msg) if move.ok else log.warning(_move_msg)
                 if not move.ok:
-                    raise RuntimeError(
+                    msg = (
                         f"target {row.index + 1} move failed: {move.reason} "
                         + ("; ".join(move.warnings) if move.warnings else "")
                     )
+                    log.warning("%s — skipping target", msg)
+                    self.failed.emit(msg)
+                    continue
 
-                params = ScanParams(
-                    bias_V=current.bias_V,
-                    setpoint_A=current.setpoint_A,
-                    size_nm=current.size_nm,
-                    speed_nm_s=current.speed_nm_s,
-                    pixels=current.pixels,
-                    rotation_deg=current.rotation_deg,
-                    const_height=current.const_height,
-                    channels=current.channels,
-                    preamp_exponent=current.preamp_exponent,
-                    memo=f"preview target {row.index + 1}",
-                )
-                self._stm.scan.apply(params)
-                target = _unique_dat_path(base_folder, f"{base_stem}_feature_{row.index + 1:02d}")
-                timeout_s = _estimate_scan_timeout(params)
-                saved = self._stm.scan.scan_and_save(str(target), timeout_s=timeout_s)
-                if saved is None:
-                    raise RuntimeError(f"scan timed out for target {row.index + 1}")
-                self.scan_saved.emit(str(saved))
+                for rep_idx, b in enumerate(biases):
+                    if self._stop_requested:
+                        break
+                    rep_label = (
+                        f"b{rep_idx + 1}/{len(biases)}" if self._bias_sequence
+                        else f"rep{rep_idx + 1}/{len(biases)}"
+                    ) if len(biases) > 1 else ""
+                    suffix = f"_b{rep_idx + 1}" if self._bias_sequence else (
+                        f"_rep{rep_idx + 1}" if len(biases) > 1 else ""
+                    )
+                    label = f"Target {row.index + 1}/{total}"
+                    if rep_label:
+                        label += f" {rep_label}"
+                    self.progress.emit(i, total, label)
+                    scan_size = (
+                        (self._size_nm, self._size_nm)
+                        if self._size_nm is not None
+                        else current.size_nm
+                    )
+                    params = ScanParams(
+                        bias_V=b,
+                        setpoint_A=setpoint_A,
+                        size_nm=scan_size,
+                        speed_nm_s=current.speed_nm_s,
+                        pixels=current.pixels,
+                        rotation_deg=current.rotation_deg,
+                        const_height=current.const_height,
+                        channels=current.channels,
+                        preamp_exponent=current.preamp_exponent,
+                        memo=f"preview target {row.index + 1}{suffix}",
+                    )
+                    self._stm.scan.apply(params)
+                    target = _unique_dat_path(
+                        base_folder,
+                        f"{base_stem}_feature_{row.index + 1:02d}{suffix}",
+                    )
+                    timeout_s = _estimate_scan_timeout(params)
+                    pos = self._stm.scan.get_offset_nm()
+                    log.info(
+                        "Feature %d/%d%s: scanning @ (%s) nm  bias=%.4f V  ~%s",
+                        row.index + 1, total,
+                        f" {rep_label}" if rep_label else "",
+                        f"{pos[0]:+.3f}, {pos[1]:+.3f}" if pos else "n/a",
+                        b,
+                        _format_duration(_estimate_scan_duration(params)),
+                    )
+                    try:
+                        saved = self._stm.scan.scan_and_save(str(target), timeout_s=timeout_s)
+                    except Exception as exc:
+                        log.warning("scan_and_save raised for target %d%s: %s", row.index + 1, f" {rep_label}" if rep_label else "", exc)
+                        continue
+                    if saved is None:
+                        log.warning("scan timed out for target %d%s, skipping", row.index + 1, f" {rep_label}" if rep_label else "")
+                        continue
+                    self.scan_saved.emit(str(saved))
         except Exception as exc:  # pragma: no cover - exercised via panel tests
             log.exception("Preview follow-up scan failed")
             self.failed.emit(str(exc))
@@ -276,8 +365,7 @@ class _FeatureGroupScanWorker(QThread):
        the wide-scan home, not accumulated from the previous group).
     2. Applies a group-sized ``ScanParams``.
     3. Runs ``group_iterations`` acquisition passes with a short settle
-       between each.  Cross-correlation drift correction is applied between
-       iterations when the DriftDetector is available.
+       between each.
 
     Signals
     -------
@@ -307,8 +395,11 @@ class _FeatureGroupScanWorker(QThread):
         group_iterations: int = 3,
         settling_s: float = 3.0,
         output_folder: str = "",
-        bias_V: float | None = None,       # None → keep current STM bias
-        setpoint_A: float | None = None,   # None → keep current STM setpoint
+        bias_V: float | None = None,
+        setpoint_A: float | None = None,
+        bias_sequence: list[float] | None = None,
+        home_nm: tuple[float, float] | None = None,  # anchor captured at segmentation time
+        scan_range_nm: tuple[float, float] | None = None,  # wide-scan extent for boundary clamping
     ) -> None:
         super().__init__()
         self._stm = stm
@@ -321,6 +412,9 @@ class _FeatureGroupScanWorker(QThread):
         self._output_folder = str(output_folder)
         self._bias_V = float(bias_V) if bias_V is not None else None
         self._setpoint_A = float(setpoint_A) if setpoint_A is not None else None
+        self._bias_sequence = list(bias_sequence) if bias_sequence else []
+        self._home_nm = home_nm  # pre-captured anchor; None → read from instrument at start
+        self._scan_range_nm = scan_range_nm  # wide-scan bounds for frame clamping
         self._stop_requested = False
 
     def stop(self) -> None:
@@ -348,19 +442,26 @@ class _FeatureGroupScanWorker(QThread):
             bias_V = self._bias_V if self._bias_V is not None else current.bias_V
             setpoint_A = self._setpoint_A if self._setpoint_A is not None else current.setpoint_A
 
-            # Record the scan-frame offset at the moment the worker starts.
-            # All group centres are offsets from the wide-scan centre, which
-            # corresponds to this home position.
-            home_pos = motion.read_position_nm()
-            if home_pos is None:
-                raise RuntimeError(
-                    "cannot read current scan offset — is the STM connected?"
+            # Home position: use the anchor captured at segmentation time if available.
+            # This ensures all groups are positioned relative to the wide-scan frame even
+            # if the tip was moved between segmentation and launching this worker.
+            if self._home_nm is not None:
+                home_x, home_y = self._home_nm
+                log.info(
+                    "Group scan worker: using pre-captured home X=%.3f nm  Y=%.3f nm",
+                    home_x, home_y,
                 )
-            home_x, home_y = home_pos.x_nm, home_pos.y_nm
-            log.info(
-                "Group scan worker: home offset X=%.3f nm  Y=%.3f nm",
-                home_x, home_y,
-            )
+            else:
+                home_pos = motion.read_position_nm()
+                if home_pos is None:
+                    raise RuntimeError(
+                        "cannot read current scan offset — is the STM connected?"
+                    )
+                home_x, home_y = home_pos.x_nm, home_pos.y_nm
+                log.info(
+                    "Group scan worker: home offset read at start X=%.3f nm  Y=%.3f nm",
+                    home_x, home_y,
+                )
 
             # Output folder
             output: Path
@@ -378,113 +479,180 @@ class _FeatureGroupScanWorker(QThread):
                 if self._stop_requested:
                     break
 
+                # Compute absolute target before emitting so position appears in the UI log panel
+                target_x = home_x + group.center_dx_nm
+                target_y = home_y + group.center_dy_nm
+
+                # Clamp target so the group frame stays within the wide-scan boundary.
+                if self._scan_range_nm is not None:
+                    half_sx = self._scan_range_nm[0] / 2.0
+                    half_sy = self._scan_range_nm[1] / 2.0
+                    half_fx = group.frame_nm[0] / 2.0
+                    half_fy = group.frame_nm[1] / 2.0
+                    # Allow clamping only when the frame fits within the scan range
+                    if group.frame_nm[0] <= self._scan_range_nm[0] and group.frame_nm[1] <= self._scan_range_nm[1]:
+                        clamped_x = max(home_x - half_sx + half_fx, min(home_x + half_sx - half_fx, target_x))
+                        clamped_y = max(home_y - half_sy + half_fy, min(home_y + half_sy - half_fy, target_y))
+                        if abs(clamped_x - target_x) > 0.01 or abs(clamped_y - target_y) > 0.01:
+                            log.warning(
+                                "Group %d/%d: target clamped (%.3f, %.3f) → (%.3f, %.3f) nm "
+                                "to keep %.1f×%.1f nm frame within %.1f×%.1f nm scan bounds",
+                                g_idx, total,
+                                target_x, target_y, clamped_x, clamped_y,
+                                group.frame_nm[0], group.frame_nm[1],
+                                self._scan_range_nm[0], self._scan_range_nm[1],
+                            )
+                            target_x, target_y = clamped_x, clamped_y
+
                 label = (
                     f"Group {g_idx}/{total} "
                     f"({len(group.members)} feature{'s' if len(group.members) != 1 else ''},"
-                    f" frame {group.frame_nm[0]:.1f}×{group.frame_nm[1]:.1f} nm)"
+                    f" frame {group.frame_nm[0]:.1f}×{group.frame_nm[1]:.1f} nm,"
+                    f" pos ({target_x:+.2f}, {target_y:+.2f}) nm)"
                 )
                 self.group_started.emit(g_idx, total, label)
                 log.info(
-                    "Group %d/%d: centre offset (%.2f, %.2f) nm  frame %.1f×%.1f nm",
-                    g_idx, total,
+                    "Group %d/%d: target (%.3f, %.3f) nm  Δ=(%.2f, %.2f) nm  frame %.1f×%.1f nm",
+                    g_idx, total, target_x, target_y,
                     group.center_dx_nm, group.center_dy_nm,
                     group.frame_nm[0], group.frame_nm[1],
                 )
 
-                # 1. Safety check
+                # 1. Safety check — hard stop: if tip is unsafe, abort entire session.
                 motion.assert_safe_to_move()
 
                 # 2. Move to group centre using ABSOLUTE positioning so that
                 #    groups are never offset relative to the previous group.
-                target_x = home_x + group.center_dx_nm
-                target_y = home_y + group.center_dy_nm
+                log.info(
+                    "Group %d/%d: moving to X=%.3f nm  Y=%.3f nm  "
+                    "[Δ from home: %+.3f, %+.3f nm]",
+                    g_idx, total, target_x, target_y,
+                    group.center_dx_nm, group.center_dy_nm,
+                )
                 move = motion.move_absolute_nm(
                     target_x,
                     target_y,
                     reason=f"group {g_idx:02d} centre",
                     settle_s=self._settling_s,
                 )
-                if not move.ok:
-                    raise RuntimeError(
-                        f"group {g_idx} positioning failed: "
-                        + ("; ".join(move.warnings) if move.warnings else move.reason or "")
-                    )
-
-                # 3. Apply group scan params (size changes per group)
-                params = ScanParams(
-                    bias_V=bias_V,
-                    setpoint_A=setpoint_A,
-                    size_nm=group.frame_nm,
-                    pixels=self._group_pixels,
-                    speed_nm_s=self._group_speed_nm_s,
-                    memo=f"group {g_idx:02d}",
+                # Log move result (mirrors mosaic _record_motion_result)
+                _move_msg = (
+                    f"Group {g_idx}/{total} move: {'ok' if move.ok else 'FAILED'} "
+                    f"target=({target_x:+.3f}, {target_y:+.3f}) nm"
                 )
-                self._stm.scan.apply(params)
-
-                # 4. Multi-iteration scan with optional drift correction
-                ref_img: np.ndarray | None = None
-
-                for it in range(self._group_iterations):
-                    if self._stop_requested:
-                        break
-
-                    if self._settling_s > 0:
-                        time.sleep(self._settling_s)
-
-                    target_path = _unique_dat_path(
-                        output,
-                        f"{base_stem}_group{g_idx:02d}_iter{it + 1}",
-                    )
-                    timeout_s = _estimate_scan_timeout(params)
-                    saved = self._stm.scan.scan_and_save(
-                        str(target_path), timeout_s=timeout_s
-                    )
-                    if saved is None:
-                        raise RuntimeError(
-                            f"scan timed out for group {g_idx}, iteration {it + 1}"
+                if move.before_nm is not None:
+                    _move_msg += f"  before=({move.before_nm[0]:+.3f}, {move.before_nm[1]:+.3f}) nm"
+                if move.after_nm is not None:
+                    _move_msg += f"  after=({move.after_nm[0]:+.3f}, {move.after_nm[1]:+.3f}) nm"
+                    err_x = move.after_nm[0] - target_x
+                    err_y = move.after_nm[1] - target_y
+                    _move_msg += f"  err=({err_x:+.3f}, {err_y:+.3f}) nm"
+                    if abs(err_x) > 0.5 or abs(err_y) > 0.5:
+                        log.warning(
+                            "Group %d/%d positioning mismatch — wanted (%.3f, %.3f) nm, "
+                            "got (%.3f, %.3f) nm, err (%+.3f, %+.3f) nm",
+                            g_idx, total, target_x, target_y,
+                            move.after_nm[0], move.after_nm[1], err_x, err_y,
                         )
-                    self.group_scan_saved.emit(g_idx, str(saved))
+                if move.warnings:
+                    _move_msg += "  [" + "; ".join(move.warnings) + "]"
+                log.info(_move_msg) if move.ok else log.warning(_move_msg)
+                if not move.ok:
+                    reason = ("; ".join(move.warnings) if move.warnings else move.reason or "unknown")
+                    msg = f"Group {g_idx} positioning failed ({reason}), skipping."
+                    log.warning(msg)
+                    self.failed.emit(msg)
+                    continue  # skip this group, keep going with the rest
 
-                    # Drift correction between iterations via cross-correlation
-                    img = self._stm.scan.live_data()
-                    if img is not None:
-                        if ref_img is None:
-                            ref_img = img
-                        elif it > 0:
-                            try:
-                                from scanflow.drift import DriftDetector
-                                result = DriftDetector().measure(ref_img, img)
-                                if result is not None and (
-                                    abs(result.dx_px) + abs(result.dy_px)
-                                ) > 0.5:
-                                    nm_per_px = (
-                                        group.frame_nm[0]
-                                        / max(self._group_pixels[0], 1)
-                                    )
-                                    dx_corr = -result.dx_px * nm_per_px
-                                    dy_corr = -result.dy_px * nm_per_px
-                                    cur_pos = motion.read_position_nm()
-                                    if cur_pos is not None:
-                                        motion.move_absolute_nm(
-                                            cur_pos.x_nm + dx_corr,
-                                            cur_pos.y_nm + dy_corr,
-                                            reason=(
-                                                f"group {g_idx:02d} "
-                                                f"iter {it + 1} drift corr"
-                                            ),
-                                            settle_s=1.0,
-                                        )
-                                        log.info(
-                                            "Group %d iter %d drift corr: "
-                                            "(%.2f, %.2f) nm",
-                                            g_idx, it + 1,
-                                            dx_corr, dy_corr,
-                                        )
-                            except Exception as exc:
-                                log.debug(
-                                    "Group %d iter %d: drift correction skipped: %s",
-                                    g_idx, it + 1, exc,
-                                )
+                # 3 & 4. Scan: bias-sequence mode or standard iteration mode
+                if self._bias_sequence:
+                    for b_idx, b in enumerate(self._bias_sequence):
+                        if self._stop_requested:
+                            break
+                        params = ScanParams(
+                            bias_V=b,
+                            setpoint_A=setpoint_A,
+                            size_nm=group.frame_nm,
+                            pixels=self._group_pixels,
+                            speed_nm_s=self._group_speed_nm_s,
+                            memo=f"group {g_idx:02d} b{b_idx + 1}",
+                        )
+                        self._stm.scan.apply(params)
+                        if self._settling_s > 0:
+                            time.sleep(self._settling_s)
+                        target_path = _unique_dat_path(
+                            output,
+                            f"{base_stem}_group{g_idx:02d}_b{b_idx + 1}",
+                        )
+                        timeout_s = _estimate_scan_timeout(params)
+                        log.info(
+                            "Group %d/%d b%d: scanning %.1f×%.1f nm @ (%.3f, %.3f) nm  "
+                            "bias=%.4f V  ~%s",
+                            g_idx, total, b_idx + 1,
+                            group.frame_nm[0], group.frame_nm[1],
+                            target_x, target_y, b,
+                            _format_duration(_estimate_scan_duration(params)),
+                        )
+                        try:
+                            saved = self._stm.scan.scan_and_save(
+                                str(target_path), timeout_s=timeout_s
+                            )
+                        except Exception as exc:
+                            log.warning("Group %d bias %s V scan error: %s — skipping", g_idx, b, exc)
+                            continue
+                        if saved is None:
+                            log.warning("Group %d bias %.3f V timed out — skipping", g_idx, b)
+                            continue
+                        self.group_scan_saved.emit(g_idx, str(saved))
+                else:
+                    # Standard: fixed bias, multi-iteration
+                    params = ScanParams(
+                        bias_V=bias_V,
+                        setpoint_A=setpoint_A,
+                        size_nm=group.frame_nm,
+                        pixels=self._group_pixels,
+                        speed_nm_s=self._group_speed_nm_s,
+                        memo=f"group {g_idx:02d}",
+                    )
+                    self._stm.scan.apply(params)
+
+                    for it in range(self._group_iterations):
+                        if self._stop_requested:
+                            break
+
+                        if self._settling_s > 0:
+                            time.sleep(self._settling_s)
+
+                        target_path = _unique_dat_path(
+                            output,
+                            f"{base_stem}_group{g_idx:02d}_iter{it + 1}",
+                        )
+                        timeout_s = _estimate_scan_timeout(params)
+                        log.info(
+                            "Group %d/%d iter %d/%d: scanning %.1f×%.1f nm @ (%.3f, %.3f) nm  "
+                            "bias=%.4f V  ~%s",
+                            g_idx, total, it + 1, self._group_iterations,
+                            group.frame_nm[0], group.frame_nm[1],
+                            target_x, target_y, bias_V,
+                            _format_duration(_estimate_scan_duration(params)),
+                        )
+                        try:
+                            saved = self._stm.scan.scan_and_save(
+                                str(target_path), timeout_s=timeout_s
+                            )
+                        except Exception as exc:
+                            log.warning(
+                                "Group %d iter %d scan error: %s — skipping iteration",
+                                g_idx, it + 1, exc,
+                            )
+                            continue
+                        if saved is None:
+                            log.warning(
+                                "Group %d iter %d timed out — skipping iteration",
+                                g_idx, it + 1,
+                            )
+                            continue
+                        self.group_scan_saved.emit(g_idx, str(saved))
 
             self.finished_all.emit(str(output))
 
@@ -560,11 +728,56 @@ class _GroupScanDialog(QDialog):
         self._speed.setValue(float(d.get("group_speed_nm_s", 20.0)))
         form.addRow("Scan speed", self._speed)
 
+        self._time_preset = QComboBox()
+        for _label, _minutes in [("5 min", 5), ("10 min", 10), ("15 min", 15), ("Custom", None)]:
+            self._time_preset.addItem(_label, _minutes)
+        self._time_preset.setCurrentIndex(3)  # default: Custom
+        self._time_preset.setToolTip(
+            "Shortcut: sets Scan speed so one full pass takes the chosen time.\n"
+            "Uses Max frame size × Resolution to compute the speed."
+        )
+        form.addRow("Target scan time", self._time_preset)
+
+        self._time_preset.currentIndexChanged.connect(self._on_time_preset_changed)
+        self._max_group_nm.valueChanged.connect(self._on_time_preset_changed)
+        self._pixels.currentIndexChanged.connect(self._on_time_preset_changed)
+        self._speed.valueChanged.connect(self._on_speed_manual_edit)
+
+        self._bias = QDoubleSpinBox()
+        self._bias.setRange(-10.0, 10.0)
+        self._bias.setDecimals(4)
+        self._bias.setSingleStep(0.1)
+        self._bias.setSuffix(" V")
+        self._bias.setValue(float(d.get("bias_V", 0.1)))
+        self._bias.setToolTip("Tip-sample bias for the group scan (must not be 0 V).")
+        form.addRow("Bias", self._bias)
+
+        self._setpoint = QDoubleSpinBox()
+        self._setpoint.setRange(0.001, 1000.0)
+        self._setpoint.setDecimals(3)
+        self._setpoint.setSingleStep(0.1)
+        self._setpoint.setSuffix(" nA")
+        self._setpoint.setValue(float(d.get("setpoint_nA", 0.1)))
+        self._setpoint.setToolTip("Tunnelling setpoint current.")
+        form.addRow("Setpoint", self._setpoint)
+
         self._iterations = QSpinBox()
         self._iterations.setRange(1, 10)
         self._iterations.setValue(int(d.get("group_iterations", 3)))
         self._iterations.setToolTip("Number of repeat acquisitions per group (drift corrected).")
         form.addRow("Iterations / group", self._iterations)
+
+        self._bias_seq = QLineEdit()
+        self._bias_seq.setPlaceholderText("e.g. -1.0, -0.5, 0.5, 1.0  (overrides Bias + Iterations)")
+        self._bias_seq.setText(str(d.get("bias_sequence_str", "")))
+        self._bias_seq.setToolTip(
+            "Comma-separated bias values (V).  Each group is scanned once per value.\n"
+            "Leave empty to use Bias + Iterations instead."
+        )
+        form.addRow("Bias sequence", self._bias_seq)
+
+        self._bias_seq.textChanged.connect(self._on_seq_changed)
+        self._on_seq_changed(self._bias_seq.text())
 
         self._settling = QDoubleSpinBox()
         self._settling.setRange(0.0, 60.0)
@@ -593,7 +806,7 @@ class _GroupScanDialog(QDialog):
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.accepted.connect(self.accept)
+        buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
 
         layout = QVBoxLayout(self)
@@ -602,6 +815,61 @@ class _GroupScanDialog(QDialog):
         self.adjustSize()
 
     # ------------------------------------------------------------------
+    def _on_time_preset_changed(self) -> None:
+        minutes = self._time_preset.currentData()
+        if minutes is None:
+            return
+        px = int(self._pixels.currentData() or 256)
+        frame_nm = float(self._max_group_nm.value())
+        target_s = minutes * 60.0
+        speed = max(1.0, min(1000.0, (2.0 * frame_nm * px) / target_s))
+        self._speed.blockSignals(True)
+        try:
+            self._speed.setValue(speed)
+        finally:
+            self._speed.blockSignals(False)
+
+    def _on_speed_manual_edit(self) -> None:
+        for i in range(self._time_preset.count()):
+            if self._time_preset.itemData(i) is None:
+                self._time_preset.blockSignals(True)
+                try:
+                    self._time_preset.setCurrentIndex(i)
+                finally:
+                    self._time_preset.blockSignals(False)
+                break
+
+    def _on_seq_changed(self, text: str) -> None:
+        active = bool(text.strip())
+        self._bias.setEnabled(not active)
+        self._iterations.setEnabled(not active)
+
+    def _on_accept(self) -> None:
+        seq_text = self._bias_seq.text().strip()
+        if seq_text:
+            try:
+                biases = [float(x.strip()) for x in seq_text.split(",") if x.strip()]
+            except ValueError:
+                QMessageBox.warning(
+                    self, "Invalid bias sequence",
+                    "Bias sequence must be comma-separated numbers, e.g. -1.0, -0.5, 0.5, 1.0"
+                )
+                return
+            if any(abs(b) < 1e-9 for b in biases):
+                QMessageBox.warning(
+                    self, "Invalid bias",
+                    "Bias must not be 0 V — scanning at 0 V in constant-current mode crashes the tip."
+                )
+                return
+        else:
+            if abs(self._bias.value()) < 1e-9:
+                QMessageBox.warning(
+                    self, "Invalid bias",
+                    "Bias must not be 0 V — scanning at 0 V in constant-current mode crashes the tip."
+                )
+                return
+        self.accept()
+
     def _pick_folder(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Output folder for group scans")
         if path:
@@ -609,6 +877,10 @@ class _GroupScanDialog(QDialog):
 
     def values(self) -> dict:
         px = int(self._pixels.currentData() or 256)
+        seq_text = self._bias_seq.text().strip()
+        bias_sequence: list[float] = []
+        if seq_text:
+            bias_sequence = [float(x.strip()) for x in seq_text.split(",") if x.strip()]
         return {
             "max_per_group": int(self._max_per_group.value()),
             "max_group_nm": float(self._max_group_nm.value()),
@@ -618,6 +890,138 @@ class _GroupScanDialog(QDialog):
             "group_iterations": int(self._iterations.value()),
             "settling_s": float(self._settling.value()),
             "output_folder": self._folder_edit.text().strip(),
+            "bias_V": float(self._bias.value()),
+            "setpoint_nA": float(self._setpoint.value()),
+            "bias_sequence": bias_sequence,
+            "bias_sequence_str": seq_text,
+        }
+
+
+class _FeatureScanDialog(QDialog):
+    """Parameter dialog for the Queue-selected follow-up scan flow.
+
+    Collects bias, setpoint, repetition count, and an optional multi-bias
+    sequence.  When a bias sequence is provided it takes precedence: each
+    feature is scanned once per bias value in the list and the single-bias /
+    repetitions fields are ignored.
+    """
+
+    def __init__(self, parent=None, *, defaults: dict | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Queue selected — scan parameters")
+        self.setModal(True)
+        d = defaults or {}
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(10)
+
+        # ── Scan geometry ────────────────────────────────────────────────
+        self._size = QDoubleSpinBox()
+        self._size.setRange(1.0, 500.0)
+        self._size.setSingleStep(1.0)
+        self._size.setDecimals(1)
+        self._size.setSuffix(" nm")
+        self._size.setValue(float(d.get("size_nm", 10.0)))
+        self._size.setToolTip("Square scan frame side length for each follow-up feature scan.")
+        form.addRow("Scan size", self._size)
+
+        # ── Electrical parameters ─────────────────────────────────────────
+        self._bias = QDoubleSpinBox()
+        self._bias.setRange(-10.0, 10.0)
+        self._bias.setDecimals(4)
+        self._bias.setSingleStep(0.1)
+        self._bias.setSuffix(" V")
+        self._bias.setValue(float(d.get("bias_V", 0.1)))
+        self._bias.setToolTip("Tip-sample bias for the follow-up scan (must not be 0 V).")
+        form.addRow("Bias", self._bias)
+
+        self._setpoint = QDoubleSpinBox()
+        self._setpoint.setRange(0.001, 1000.0)
+        self._setpoint.setDecimals(3)
+        self._setpoint.setSingleStep(0.1)
+        self._setpoint.setSuffix(" nA")
+        self._setpoint.setValue(float(d.get("setpoint_nA", 0.1)))
+        self._setpoint.setToolTip("Tunnelling setpoint current.")
+        form.addRow("Setpoint", self._setpoint)
+
+        # ── Repetitions ───────────────────────────────────────────────────
+        self._repetitions = QSpinBox()
+        self._repetitions.setRange(1, 20)
+        self._repetitions.setValue(int(d.get("repetitions", 1)))
+        self._repetitions.setToolTip(
+            "How many times each feature is scanned at the chosen bias/setpoint."
+        )
+        form.addRow("Repetitions", self._repetitions)
+
+        # ── Bias sequence (optional) ──────────────────────────────────────
+        self._bias_seq = QLineEdit()
+        self._bias_seq.setPlaceholderText("e.g. -1.0, -0.5, 0.5, 1.0  (overrides Bias + Repetitions)")
+        self._bias_seq.setText(str(d.get("bias_sequence_str", "")))
+        self._bias_seq.setToolTip(
+            "Comma-separated bias values (V).  Each feature is scanned once per value.\n"
+            "Leave empty to use Bias + Repetitions instead."
+        )
+        form.addRow("Bias sequence", self._bias_seq)
+
+        self._bias_seq.textChanged.connect(self._on_seq_changed)
+        self._on_seq_changed(self._bias_seq.text())
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+        self.adjustSize()
+
+    def _on_seq_changed(self, text: str) -> None:
+        active = bool(text.strip())
+        self._bias.setEnabled(not active)
+        self._repetitions.setEnabled(not active)
+
+    def _on_accept(self) -> None:
+        seq_text = self._bias_seq.text().strip()
+        if seq_text:
+            try:
+                biases = [float(x.strip()) for x in seq_text.split(",") if x.strip()]
+            except ValueError:
+                QMessageBox.warning(
+                    self, "Invalid bias sequence",
+                    "Bias sequence must be comma-separated numbers, e.g. -1.0, -0.5, 0.5, 1.0"
+                )
+                return
+            if any(abs(b) < 1e-9 for b in biases):
+                QMessageBox.warning(
+                    self, "Invalid bias",
+                    "Bias must not be 0 V — scanning at 0 V in constant-current mode crashes the tip."
+                )
+                return
+        else:
+            if abs(self._bias.value()) < 1e-9:
+                QMessageBox.warning(
+                    self, "Invalid bias",
+                    "Bias must not be 0 V — scanning at 0 V in constant-current mode crashes the tip."
+                )
+                return
+        self.accept()
+
+    def values(self) -> dict:
+        seq_text = self._bias_seq.text().strip()
+        bias_sequence: list[float] = []
+        if seq_text:
+            bias_sequence = [float(x.strip()) for x in seq_text.split(",") if x.strip()]
+        return {
+            "size_nm": float(self._size.value()),
+            "bias_V": float(self._bias.value()),
+            "setpoint_nA": float(self._setpoint.value()),
+            "repetitions": int(self._repetitions.value()),
+            "bias_sequence": bias_sequence,
+            "bias_sequence_str": seq_text,
         }
 
 
@@ -853,6 +1257,7 @@ class PreviewPanel(QWidget):
         self._scan_worker: _FeatureScanWorker | None = None
         self._group_scan_worker: _FeatureGroupScanWorker | None = None
         self._group_scan_defaults: dict = {}
+        self._feature_scan_defaults: dict = {}
         self._building_table = False
         self._stage = "raw"
         self._zero_plane_points: list[tuple[int, int]] = []
@@ -866,6 +1271,14 @@ class PreviewPanel(QWidget):
         self._analysis_timer.setInterval(40)
         self._analysis_timer.timeout.connect(self._refresh_live_segmentation)
         self._queue_armed = False
+        # Position captured at segmentation-apply time; used as group-scan anchor
+        self._preview_home_nm: tuple[float, float] | None = None
+        # Periodic STM scan status poller (2 s)
+        self._scan_info_timer = QTimer(self)
+        self._scan_info_timer.setInterval(2000)
+        self._scan_info_timer.timeout.connect(self._refresh_scan_info)
+        self._scan_info_timer.start()
+        self._scan_was_running: bool = False  # tracks transition to log scan-start once
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -890,6 +1303,22 @@ class PreviewPanel(QWidget):
             }
         """)
         root.addWidget(self._status)
+
+        self._scan_info_label = QLabel("")
+        self._scan_info_label.setWordWrap(True)
+        self._scan_info_label.setStyleSheet("""
+            QLabel {
+                background: #f0fdf4;
+                color: #14532d;
+                border: 1px solid #86efac;
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-family: monospace;
+                min-height: 22px;
+            }
+        """)
+        self._scan_info_label.setVisible(False)
+        root.addWidget(self._scan_info_label)
 
         self._viewer = _PreviewImageView()
         self._viewer.feature_clicked.connect(self._toggle_feature_selection)
@@ -967,6 +1396,10 @@ class PreviewPanel(QWidget):
         self._scan_groups_btn.setToolTip(
             "Group checked features spatially and scan each group in one frame."
         )
+        self._stop_scan_btn = QPushButton("Stop scan")
+        self._stop_scan_btn.clicked.connect(self._stop_active_scan)
+        self._stop_scan_btn.setToolTip("Request graceful stop after the current feature/group finishes.")
+        self._stop_scan_btn.setStyleSheet("QPushButton { color: #c0392b; font-weight: bold; }")
         self._select_class_btn = QPushButton("Select class")
         self._select_class_btn.clicked.connect(self._select_class_rows_from_combo)
         self._select_class_btn.setToolTip("Select every structure that belongs to the chosen class.")
@@ -980,6 +1413,7 @@ class PreviewPanel(QWidget):
         self._classify_btn.setEnabled(False)
         self._scan_selected_btn.setEnabled(False)
         self._scan_groups_btn.setEnabled(False)
+        self._stop_scan_btn.setEnabled(False)
         self._select_class_btn.setEnabled(False)
         self._queue_class_btn.setEnabled(False)
         self._reset_btn.setEnabled(False)
@@ -1195,6 +1629,7 @@ class PreviewPanel(QWidget):
         class_container.addWidget(self._classify_btn)
         class_container.addWidget(self._scan_selected_btn)
         class_container.addWidget(self._scan_groups_btn)
+        class_container.addWidget(self._stop_scan_btn)
         controls.addWidget(self._classification_section)
 
         self._feature_mode.currentIndexChanged.connect(lambda *_: self._schedule_live_segmentation())
@@ -1684,12 +2119,27 @@ class PreviewPanel(QWidget):
         self._render_current_state()
         self._set_stage("classification")
         self._render_current_state()
+
+        # Capture tip position as the anchor reference for all follow-up group scans.
+        # Reading here (not at scan-start time) ensures groups stay within the wide image
+        # even if there is a delay between segmentation and launching the scan worker.
+        self._preview_home_nm = None
+        try:
+            if self._stm.connected:
+                self._preview_home_nm = self._stm.scan.get_offset_nm()
+        except Exception:
+            pass
+        home_str = (
+            f"  |  home ({self._preview_home_nm[0]:+.2f}, {self._preview_home_nm[1]:+.2f}) nm"
+            if self._preview_home_nm else ""
+        )
+
         self._show_status(
-            f"{self._current_source.name}: applied {len(self._current_state.feature_rows)} feature(s)"
+            f"{self._current_source.name}: applied {len(self._current_state.feature_rows)} feature(s){home_str}"
         )
         self.log_message.emit(
             f"Segmentation settings applied for {self._current_source.name} "
-            f"({len(self._current_state.feature_rows)} feature(s))"
+            f"({len(self._current_state.feature_rows)} feature(s)){home_str}"
         )
 
     def _label_selected_samples(self) -> None:
@@ -2193,14 +2643,47 @@ class PreviewPanel(QWidget):
             QMessageBox.information(self, "Busy", "A follow-up scan is already running.")
             return
 
+        # Pre-populate dialog with current STM parameters (fall back to last-used defaults)
+        feat_defaults = dict(self._feature_scan_defaults)
+        try:
+            current = self._stm.scan.read()
+            feat_defaults.setdefault("bias_V", current.bias_V)
+            feat_defaults.setdefault("setpoint_nA", current.setpoint_A * 1e9)
+            # Default size to 1/5 of the current scan width if not previously set
+            if "size_nm" not in feat_defaults and current.size_nm:
+                feat_defaults["size_nm"] = round(current.size_nm[0] / 5.0, 1)
+        except Exception:
+            pass
+
+        dlg = _FeatureScanDialog(self, defaults=feat_defaults)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        scan_params = dlg.values()
+        self._feature_scan_defaults = dict(scan_params)
+
         self._scan_selected_btn.setEnabled(False)
-        self._scan_worker = _FeatureScanWorker(self._stm, self._current_state.source_path, selected)
+        self._stop_scan_btn.setEnabled(True)
+        self._scan_worker = _FeatureScanWorker(
+            self._stm,
+            self._current_state.source_path,
+            selected,
+            bias_V=scan_params["bias_V"],
+            setpoint_A=scan_params["setpoint_nA"] * 1e-9,
+            n_reps=scan_params["repetitions"],
+            bias_sequence=scan_params["bias_sequence"] or None,
+            size_nm=scan_params["size_nm"],
+        )
         self._scan_worker.progress.connect(self._on_scan_progress)
         self._scan_worker.scan_saved.connect(self._on_followup_scan_saved)
         self._scan_worker.failed.connect(self._on_followup_scan_failed)
         self._scan_worker.finished.connect(lambda: self._scan_selected_btn.setEnabled(True))
+        self._scan_worker.finished.connect(lambda: self._stop_scan_btn.setEnabled(False))
         self._scan_worker.start()
-        self._show_status(f"Scanning {len(selected)} selected feature(s)...")
+        n_reps = len(scan_params["bias_sequence"]) if scan_params["bias_sequence"] else scan_params["repetitions"]
+        self._show_status(
+            f"Scanning {len(selected)} feature(s)"
+            + (f" × {n_reps} bias steps" if n_reps > 1 else "") + "…"
+        )
 
     def _on_scan_progress(self, idx: int, total: int, label: str) -> None:
         self._show_status(f"{label} ({idx}/{total})")
@@ -2238,8 +2721,18 @@ class PreviewPanel(QWidget):
                                     "Wait for it to finish before launching a group scan.")
             return
 
-        # Show parameter dialog (pre-populated with last-used values)
-        dlg = _GroupScanDialog(self, defaults=self._group_scan_defaults)
+        # Show parameter dialog (pre-populated with last-used values, then current STM)
+        group_defaults = dict(self._group_scan_defaults)
+        # Bias sequences are one-off; don't carry them over so iterations is always editable
+        group_defaults.pop("bias_sequence_str", None)
+        group_defaults.pop("bias_sequence", None)
+        try:
+            current = self._stm.scan.read()
+            group_defaults.setdefault("bias_V", current.bias_V)
+            group_defaults.setdefault("setpoint_nA", current.setpoint_A * 1e9)
+        except Exception:
+            pass
+        dlg = _GroupScanDialog(self, defaults=group_defaults)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         params = dlg.values()
@@ -2281,6 +2774,8 @@ class PreviewPanel(QWidget):
         px = params["group_pixels"]
         self._scan_groups_btn.setEnabled(False)
         self._scan_selected_btn.setEnabled(False)
+        self._stop_scan_btn.setEnabled(True)
+        bias_seq = params.get("bias_sequence") or []
         self._group_scan_worker = _FeatureGroupScanWorker(
             self._stm,
             self._current_state.source_path,
@@ -2290,6 +2785,14 @@ class PreviewPanel(QWidget):
             group_iterations=params["group_iterations"],
             settling_s=params["settling_s"],
             output_folder=params["output_folder"],
+            bias_V=params.get("bias_V"),
+            setpoint_A=params["setpoint_nA"] * 1e-9 if params.get("setpoint_nA") else None,
+            bias_sequence=bias_seq or None,
+            home_nm=self._preview_home_nm,
+            scan_range_nm=(
+                (scan_range_m[0] * 1e9, scan_range_m[1] * 1e9)
+                if scan_range_m is not None else None
+            ),
         )
         self._group_scan_worker.group_started.connect(self._on_group_started)
         self._group_scan_worker.group_scan_saved.connect(self._on_group_scan_saved)
@@ -2297,11 +2800,14 @@ class PreviewPanel(QWidget):
         self._group_scan_worker.finished_all.connect(self._on_group_scan_finished_all)
         self._group_scan_worker.finished.connect(self._on_group_scan_thread_done)
         self._group_scan_worker.start()
+        n_steps = len(bias_seq) if bias_seq else params["group_iterations"]
         self.log_message.emit(
             f"Group scan started: {n_feat} feature(s) → {n_groups} group(s)"
+            + (f" × {n_steps} bias steps" if bias_seq else f" × {n_steps} iter(s)")
         )
         self._show_status(
-            f"Scanning {n_groups} group(s) ({n_feat} feature(s) total)…"
+            f"Scanning {n_groups} group(s) ({n_feat} feature(s) total)"
+            + (f" × {n_steps} bias steps" if bias_seq else "") + "…"
         )
 
     def _on_group_started(self, group_idx: int, total: int, label: str) -> None:
@@ -2310,7 +2816,6 @@ class PreviewPanel(QWidget):
 
     def _on_group_scan_saved(self, group_idx: int, path: str) -> None:
         self.scan_completed.emit(path)
-        self.handle_scan_completed(path)
         self.log_message.emit(f"Group {group_idx} scan saved: {path}")
 
     def _on_group_scan_failed(self, message: str) -> None:
@@ -2322,6 +2827,7 @@ class PreviewPanel(QWidget):
         self._show_status(f"Group scan complete → {folder}")
 
     def _on_group_scan_thread_done(self) -> None:
+        self._stop_scan_btn.setEnabled(False)
         self._scan_groups_btn.setEnabled(
             self._stage == "classification"
             and self._current_state is not None
@@ -2332,6 +2838,60 @@ class PreviewPanel(QWidget):
             and self._current_state is not None
             and bool(self._current_state.feature_rows)
         )
+
+    def _stop_active_scan(self) -> None:
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            self._scan_worker.stop()
+            self._show_status("Stop requested — will halt after current target.")
+        if self._group_scan_worker is not None and self._group_scan_worker.isRunning():
+            self._group_scan_worker.stop()
+            self._show_status("Stop requested — will halt after current group.")
+        self._stop_scan_btn.setEnabled(False)
+
+    # ------------------------------------------------------------------
+    # Scan status poller
+    # ------------------------------------------------------------------
+
+    def _refresh_scan_info(self) -> None:
+        """Called every 2 s — shows position + size whenever a scan is running."""
+        try:
+            if not self._stm.connected:
+                self._scan_info_label.setVisible(False)
+                self._scan_was_running = False
+                return
+            running = self._stm.scan.is_running
+            if not running:
+                self._scan_info_label.setVisible(False)
+                self._scan_was_running = False
+                return
+            offset = self._stm.scan.get_offset_nm()
+            params = self._stm.scan.read()
+            pos_str = (
+                f"X={offset[0]:+.2f}  Y={offset[1]:+.2f} nm"
+                if offset else "pos: n/a"
+            )
+            size_str = (
+                f"{params.size_nm[0]:.1f} × {params.size_nm[1]:.1f} nm"
+                if params.size_nm else "size: n/a"
+            )
+            est_s = _estimate_scan_duration(params)
+            est_str = _format_duration(est_s)
+            self._scan_info_label.setText(
+                f"Scanning  |  {pos_str}  |  {size_str}  |  ~{est_str}"
+            )
+            self._scan_info_label.setVisible(True)
+            # Log once on the scan-start transition so position appears in the log panel
+            if not self._scan_was_running:
+                self.log_message.emit(
+                    f"Scan started  |  {pos_str}  |  {size_str}  |  ~{est_str}"
+                )
+                log.info(
+                    "Scan detected: offset %s  size %s  est %s",
+                    pos_str, size_str, est_str,
+                )
+            self._scan_was_running = True
+        except Exception:
+            self._scan_info_label.setVisible(False)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -2448,6 +3008,7 @@ class PreviewPanel(QWidget):
         self._classify_btn.setVisible(stage == "classification")
         self._scan_selected_btn.setVisible(stage == "classification")
         self._scan_groups_btn.setVisible(stage == "classification")
+        self._stop_scan_btn.setVisible(stage == "classification")
         self._select_class_btn.setVisible(stage == "classification")
         self._queue_class_btn.setVisible(stage == "classification")
         self._label_btn.setEnabled(stage == "classification" and self._current_state is not None and bool(self._current_state.feature_rows))
@@ -2591,6 +3152,20 @@ def _unique_dat_path(folder: Path, stem: str) -> Path:
 def _estimate_scan_timeout(params: ScanParams) -> float:
     line_time = 2.0 * float(params.size_nm[0]) / max(float(params.speed_nm_s), 0.01)
     return max(120.0, line_time * int(params.pixels[1]) + 90.0)
+
+
+def _estimate_scan_duration(params: ScanParams) -> float:
+    """Best-estimate scan duration in seconds (fwd+bwd, no settle padding)."""
+    line_time = 2.0 * float(params.size_nm[0]) / max(float(params.speed_nm_s), 0.01)
+    return line_time * int(params.pixels[1])
+
+
+def _format_duration(seconds: float) -> str:
+    s = int(round(seconds))
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    return f"{m}m {s:02d}s"
 
 
 def _pixel_size_x_m_from_scan_range(scan_range_m: tuple[float, float] | None, shape: tuple[int, int]) -> float:

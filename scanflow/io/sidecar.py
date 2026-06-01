@@ -103,7 +103,6 @@ def write_scan_sidecar(
     scan_parameters: Any | None = None,
     position_nm: tuple[float, float] | None = None,
     motion: Any | None = None,
-    drift: Any | None = None,
     quality: dict[str, Any] | None = None,
     safety: dict[str, Any] | None = None,
     include_hash: bool = False,
@@ -134,7 +133,6 @@ def write_scan_sidecar(
             "scan_offset_nm": list(position_nm) if position_nm is not None else None,
         },
         "motion": _json_safe(motion) if motion is not None else None,
-        "drift": _drift_payload(drift),
         "quality": quality or {},
         "safety": safety or {},
     }
@@ -148,16 +146,6 @@ def _scan_params_payload(params: Any | None) -> dict[str, Any]:
     if isinstance(data, dict):
         return data
     return {}
-
-
-def _drift_payload(drift: Any | None) -> dict[str, Any]:
-    if drift is None:
-        return {"enabled": False}
-    data = _json_safe(drift)
-    if isinstance(data, dict):
-        data.setdefault("enabled", True)
-        return data
-    return {"enabled": True, "value": data}
 
 
 def _json_safe(value: Any) -> Any:
