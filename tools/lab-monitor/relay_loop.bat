@@ -32,6 +32,9 @@ if not exist "%SCRIPT%" (
     exit /b 1
 )
 
+:: Authenticate to the lab PC share (safe to run even if already connected)
+net use "%FOLDER%" /user:SMP-F26VB33\ltspm ltspm >nul 2>&1
+
 echo ScanFlow relay — forwarding new screenshots to Slack every %INTERVAL%s
 echo Folder : %FOLDER%
 echo Press Ctrl-C to stop.
