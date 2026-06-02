@@ -18,7 +18,7 @@ pushd "%~dp0"
 
 :: --- Configuration ---------------------------------------------------
 set "PYTHON=python"
-set "SCRIPT=%~dp0relay_to_slack.py"
+set "SCRIPT=relay_to_slack.py"
 set "FOLDER=\\SMP-F26VB33\ScanflowMonitor\screenshots"
 set "INTERVAL=60"
 :: --------------------------------------------------------------------
@@ -30,7 +30,7 @@ if errorlevel 1 (
     exit /b 1
 )
 if not exist "%SCRIPT%" (
-    echo [ERROR] relay_to_slack.py not found at: %SCRIPT%
+    echo [ERROR] relay_to_slack.py not found in: %CD%
     pause
     exit /b 1
 )
@@ -44,3 +44,4 @@ echo Press Ctrl-C to stop.
 echo.
 
 "%PYTHON%" "%SCRIPT%" --folder "%FOLDER%" --interval %INTERVAL% --catch-up
+pause
