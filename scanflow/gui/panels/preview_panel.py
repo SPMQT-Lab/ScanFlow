@@ -435,6 +435,7 @@ class _FeatureGroupScanWorker(QThread):
         bias_sequence: list[float] | None = None,
         home_nm: tuple[float, float] | None = None,  # anchor captured at segmentation time
         scan_range_nm: tuple[float, float] | None = None,  # wide-scan extent for boundary clamping
+        target_scan_time_s: float | None = None,  # if set, speed is recomputed per group
     ) -> None:
         super().__init__()
         self._stm = stm
@@ -442,6 +443,7 @@ class _FeatureGroupScanWorker(QThread):
         self._groups = list(groups)
         self._group_pixels = tuple(int(v) for v in group_pixels)
         self._group_speed_nm_s = float(group_speed_nm_s)
+        self._target_scan_time_s = float(target_scan_time_s) if target_scan_time_s is not None else None
         self._group_iterations = int(group_iterations)
         self._settling_s = float(settling_s)
         self._output_folder = str(output_folder)
@@ -615,6 +617,21 @@ class _FeatureGroupScanWorker(QThread):
                     continue  # skip this group, keep going with the rest
 
                 # 3 & 4. Scan: bias-sequence mode or standard iteration mode
+                # Per-group speed: if a target scan time was requested, recompute
+                # speed from the actual frame size so every group takes ~the same time.
+                if self._target_scan_time_s is not None and self._target_scan_time_s > 0:
+                    group_speed = max(1.0, min(1000.0,
+                        (2.0 * group.frame_nm[0] * self._group_pixels[1]) / self._target_scan_time_s
+                    ))
+                    log.info(
+                        "Group %d/%d: speed adjusted to %.1f nm/s "
+                        "for %.1f nm frame to match ~%s target",
+                        g_idx, total, group_speed, group.frame_nm[0],
+                        _format_duration(self._target_scan_time_s),
+                    )
+                else:
+                    group_speed = self._group_speed_nm_s
+
                 if self._bias_sequence:
                     for b_idx, b in enumerate(self._bias_sequence):
                         if self._stop_requested:
@@ -624,7 +641,7 @@ class _FeatureGroupScanWorker(QThread):
                             setpoint_A=setpoint_A,
                             size_nm=group.frame_nm,
                             pixels=self._group_pixels,
-                            speed_nm_s=self._group_speed_nm_s,
+                            speed_nm_s=group_speed,
                             memo=f"group {g_idx:02d} b{b_idx + 1}",
                         )
                         self._stm.scan.apply(params)
@@ -661,7 +678,7 @@ class _FeatureGroupScanWorker(QThread):
                         setpoint_A=setpoint_A,
                         size_nm=group.frame_nm,
                         pixels=self._group_pixels,
-                        speed_nm_s=self._group_speed_nm_s,
+                        speed_nm_s=group_speed,
                         memo=f"group {g_idx:02d}",
                     )
                     self._stm.scan.apply(params)
@@ -931,12 +948,14 @@ class _GroupScanDialog(QDialog):
         bias_sequence: list[float] = []
         if seq_text:
             bias_sequence = [float(x.strip()) for x in seq_text.split(",") if x.strip()]
+        preset_minutes = self._time_preset.currentData()  # int or None (Custom)
         return {
             "max_per_group": int(self._max_per_group.value()),
             "max_group_nm": float(self._max_group_nm.value()),
             "feature_padding_nm": float(self._padding_nm.value()),
             "group_pixels": px,
             "group_speed_nm_s": float(self._speed.value()),
+            "target_scan_time_s": float(preset_minutes * 60) if preset_minutes is not None else None,
             "group_iterations": int(self._iterations.value()),
             "settling_s": float(self._settling.value()),
             "output_folder": self._folder_edit.text().strip(),
@@ -2849,6 +2868,7 @@ class PreviewPanel(QWidget):
                 (scan_range_m[0] * 1e9, scan_range_m[1] * 1e9)
                 if scan_range_m is not None else None
             ),
+            target_scan_time_s=params.get("target_scan_time_s"),
         )
         self._group_scan_worker.group_started.connect(self._on_group_started)
         self._group_scan_worker.group_scan_saved.connect(self._on_group_scan_saved)
