@@ -21,7 +21,7 @@
 ::     pip install pillow pywin32
 set "PYTHON=python"
 set "SCRIPT=C:\Users\ltspm\Desktop\scanflow\tools\lab-monitor\take_screenshots.py"
-set "OUTPUT=C:\ScanflowMonitor\screenshots"
+set "OUTPUT=C:\Users\ltspm\Desktop\scanflow\screenshots"
 set "INTERVAL=600"
 :: --------------------------------------------------------------------
 
