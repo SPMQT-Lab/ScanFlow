@@ -210,6 +210,8 @@ class _FeatureScanWorker(QThread):
         n_reps: int = 1,
         bias_sequence: list[float] | None = None,
         size_nm: float | None = None,  # None → inherit current STM size
+        home_nm: tuple[float, float] | None = None,  # wide-scan anchor (X_centre, Y_top_edge)
+        scan_range_nm: tuple[float, float] | None = None,  # wide-scan physical size for Y correction
     ) -> None:
         super().__init__()
         self._stm = stm
@@ -221,6 +223,8 @@ class _FeatureScanWorker(QThread):
         self._n_reps = max(1, int(n_reps))
         self._bias_sequence = list(bias_sequence) if bias_sequence else []
         self._size_nm = float(size_nm) if size_nm is not None else None
+        self._home_nm = home_nm
+        self._scan_range_nm = scan_range_nm
 
     def stop(self) -> None:
         self._stop_requested = True
@@ -251,28 +255,59 @@ class _FeatureScanWorker(QThread):
                     break
                 self.progress.emit(i, total, f"Target {row.index + 1}/{total}")
                 motion.assert_safe_to_move()
-                log.info(
-                    "Feature scan target %d/%d: relative move Δ=(%.3f, %.3f) nm",
-                    row.index + 1, total, row.dx_nm, row.dy_nm,
+                # Use absolute positioning so each feature is placed correctly relative
+                # to the wide scan, regardless of where the previous scan left the tip.
+                # SCAN.OFFSET.X.NM = centre (X unchanged). SCAN.OFFSET.Y.NM = top edge.
+                # feature centre Y = home_y + scan_range_y/2 + dy_nm; top edge = centre - size/2.
+                scan_size_for_move = (
+                    (self._size_nm, self._size_nm)
+                    if self._size_nm is not None
+                    else current.size_nm
                 )
-                move = motion.move_relative_nm(
-                    row.dx_nm,
-                    row.dy_nm,
-                    reason=f"preview follow-up target {row.index + 1}",
-                    settle_s=3.0,
-                )
+                if self._home_nm is not None and self._scan_range_nm is not None:
+                    home_x, home_y = self._home_nm
+                    scan_range_y = self._scan_range_nm[1]
+                    feat_top_y = home_y + scan_range_y / 2.0 + row.dy_nm - scan_size_for_move[1] / 2.0
+                    abs_target_x = home_x + row.dx_nm
+                    abs_target_y = feat_top_y
+                    log.info(
+                        "Feature scan target %d/%d: absolute move → (%.3f, %.3f) nm  "
+                        "[home (%.3f, %.3f)  Δ=(%.3f, %.3f)]",
+                        row.index + 1, total, abs_target_x, abs_target_y,
+                        home_x, home_y, row.dx_nm, row.dy_nm,
+                    )
+                    move = motion.move_absolute_nm(
+                        abs_target_x,
+                        abs_target_y,
+                        reason=f"preview follow-up target {row.index + 1}",
+                        settle_s=3.0,
+                    )
+                else:
+                    log.info(
+                        "Feature scan target %d/%d: relative move Δ=(%.3f, %.3f) nm",
+                        row.index + 1, total, row.dx_nm, row.dy_nm,
+                    )
+                    move = motion.move_relative_nm(
+                        row.dx_nm,
+                        row.dy_nm,
+                        reason=f"preview follow-up target {row.index + 1}",
+                        settle_s=3.0,
+                    )
                 _move_msg = (
                     f"Target {row.index + 1}/{total} move: {'ok' if move.ok else 'FAILED'} "
-                    f"Δ=({row.dx_nm:+.3f}, {row.dy_nm:+.3f}) nm"
                 )
                 if move.before_nm is not None:
                     _move_msg += f"  before=({move.before_nm[0]:+.3f}, {move.before_nm[1]:+.3f}) nm"
                 if move.after_nm is not None:
                     _move_msg += f"  after=({move.after_nm[0]:+.3f}, {move.after_nm[1]:+.3f}) nm"
-                    expected_x = (move.before_nm[0] if move.before_nm else 0.0) + row.dx_nm
-                    expected_y = (move.before_nm[1] if move.before_nm else 0.0) + row.dy_nm
-                    err_x = move.after_nm[0] - expected_x
-                    err_y = move.after_nm[1] - expected_y
+                    if self._home_nm is not None and self._scan_range_nm is not None:
+                        want_x, want_y = abs_target_x, abs_target_y
+                    else:
+                        bx = move.before_nm[0] if move.before_nm else 0.0
+                        by = move.before_nm[1] if move.before_nm else 0.0
+                        want_x, want_y = bx + row.dx_nm, by + row.dy_nm
+                    err_x = move.after_nm[0] - want_x
+                    err_y = move.after_nm[1] - want_y
                     _move_msg += f"  err=({err_x:+.3f}, {err_y:+.3f}) nm"
                     if abs(err_x) > 0.5 or abs(err_y) > 0.5:
                         log.warning(
@@ -479,30 +514,45 @@ class _FeatureGroupScanWorker(QThread):
                 if self._stop_requested:
                     break
 
-                # Compute absolute target before emitting so position appears in the UI log panel
+                # Compute absolute target.
+                # SCAN.OFFSET.X.NM = centre of scan frame (X).
+                # SCAN.OFFSET.Y.NM = top edge of scan frame (Y), NOT centre — see runner.py.
+                # center_dx_nm / center_dy_nm are offsets from wide-scan image centre (positive = right / down).
+                # Wide-scan image centre in Y = home_y + scan_range_y/2.
+                # The group frame must be positioned with its TOP EDGE as the Y target.
+                scan_range_y = self._scan_range_nm[1] if self._scan_range_nm is not None else 0.0
+                scan_range_x = self._scan_range_nm[0] if self._scan_range_nm is not None else 0.0
                 target_x = home_x + group.center_dx_nm
-                target_y = home_y + group.center_dy_nm
+                # group_center_y = home_y + scan_range_y/2 + center_dy_nm
+                # top edge of group frame = group_center_y - frame_nm_y/2
+                target_y = home_y + scan_range_y / 2.0 + group.center_dy_nm - group.frame_nm[1] / 2.0
 
                 # Clamp target so the group frame stays within the wide-scan boundary.
                 if self._scan_range_nm is not None:
-                    half_sx = self._scan_range_nm[0] / 2.0
-                    half_sy = self._scan_range_nm[1] / 2.0
                     half_fx = group.frame_nm[0] / 2.0
-                    half_fy = group.frame_nm[1] / 2.0
-                    # Allow clamping only when the frame fits within the scan range
-                    if group.frame_nm[0] <= self._scan_range_nm[0] and group.frame_nm[1] <= self._scan_range_nm[1]:
-                        clamped_x = max(home_x - half_sx + half_fx, min(home_x + half_sx - half_fx, target_x))
-                        clamped_y = max(home_y - half_sy + half_fy, min(home_y + half_sy - half_fy, target_y))
-                        if abs(clamped_x - target_x) > 0.01 or abs(clamped_y - target_y) > 0.01:
-                            log.warning(
-                                "Group %d/%d: target clamped (%.3f, %.3f) → (%.3f, %.3f) nm "
-                                "to keep %.1f×%.1f nm frame within %.1f×%.1f nm scan bounds",
-                                g_idx, total,
-                                target_x, target_y, clamped_x, clamped_y,
-                                group.frame_nm[0], group.frame_nm[1],
-                                self._scan_range_nm[0], self._scan_range_nm[1],
-                            )
-                            target_x, target_y = clamped_x, clamped_y
+                    frame_y = group.frame_nm[1]
+                    # X: offset = centre → clamp centre within [home_x ± half_sx, keeping half_fx margin]
+                    if group.frame_nm[0] <= scan_range_x:
+                        clamped_x = max(home_x - scan_range_x / 2.0 + half_fx,
+                                        min(home_x + scan_range_x / 2.0 - half_fx, target_x))
+                    else:
+                        clamped_x = target_x
+                    # Y: offset = top edge → clamp top_edge within [home_y, home_y + scan_range_y - frame_y]
+                    if frame_y <= scan_range_y:
+                        clamped_y = max(home_y,
+                                        min(home_y + scan_range_y - frame_y, target_y))
+                    else:
+                        clamped_y = target_y
+                    if abs(clamped_x - target_x) > 0.01 or abs(clamped_y - target_y) > 0.01:
+                        log.warning(
+                            "Group %d/%d: target clamped (%.3f, %.3f) → (%.3f, %.3f) nm "
+                            "to keep %.1f×%.1f nm frame within %.1f×%.1f nm scan bounds",
+                            g_idx, total,
+                            target_x, target_y, clamped_x, clamped_y,
+                            group.frame_nm[0], group.frame_nm[1],
+                            scan_range_x, scan_range_y,
+                        )
+                        target_x, target_y = clamped_x, clamped_y
 
                 label = (
                     f"Group {g_idx}/{total} "
@@ -2663,6 +2713,7 @@ class PreviewPanel(QWidget):
 
         self._scan_selected_btn.setEnabled(False)
         self._stop_scan_btn.setEnabled(True)
+        feat_scan_range_m = getattr(self._current_scan, "scan_range_m", None)
         self._scan_worker = _FeatureScanWorker(
             self._stm,
             self._current_state.source_path,
@@ -2672,6 +2723,11 @@ class PreviewPanel(QWidget):
             n_reps=scan_params["repetitions"],
             bias_sequence=scan_params["bias_sequence"] or None,
             size_nm=scan_params["size_nm"],
+            home_nm=self._preview_home_nm,
+            scan_range_nm=(
+                (feat_scan_range_m[0] * 1e9, feat_scan_range_m[1] * 1e9)
+                if feat_scan_range_m is not None else None
+            ),
         )
         self._scan_worker.progress.connect(self._on_scan_progress)
         self._scan_worker.scan_saved.connect(self._on_followup_scan_saved)
