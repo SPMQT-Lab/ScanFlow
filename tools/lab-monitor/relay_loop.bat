@@ -35,13 +35,13 @@ if not exist "%SCRIPT%" (
     exit /b 1
 )
 
-:: Authenticate to the lab PC share (safe to run even if already connected)
-net use "%FOLDER%" /user:SMP-8HSN6L3\ltspm ltspm >nul 2>&1
+:: Authenticate to the lab PC share root (not the subfolder)
+net use "\\SMP-8HSN6L3\scanflow" /user:SMP-8HSN6L3\ltspm ltspm >nul 2>&1
 
 echo ScanFlow relay — forwarding new screenshots to Slack every %INTERVAL%s
 echo Folder : %FOLDER%
 echo Press Ctrl-C to stop.
 echo.
 
-"%PYTHON%" "%SCRIPT%" --folder "%FOLDER%" --interval %INTERVAL% --catch-up
+"%PYTHON%" "%SCRIPT%" --folder "%FOLDER%" --interval %INTERVAL%
 pause
