@@ -176,7 +176,7 @@ def relay_once(folder: Path, sent: SentState, upload) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Forward lab screenshots to Slack / Telegram.")
     ap.add_argument("--folder", type=Path,
-                    default=Path(r"\\SMP-F26VB33\ScanflowMonitor\screenshots"),
+                    default=Path(r"\\SMP-8HSN6L3\scanflow\screenshots"),
                     help="Shared folder containing PNGs to forward")
     ap.add_argument("--state", type=Path, default=Path("relay_state.json"),
                     help="JSON file remembering which images have been sent")

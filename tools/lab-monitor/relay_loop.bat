@@ -19,7 +19,7 @@ pushd "%~dp0"
 :: --- Configuration ---------------------------------------------------
 set "PYTHON=python"
 set "SCRIPT=relay_to_slack.py"
-set "FOLDER=\\SMP-F26VB33\ScanflowMonitor\screenshots"
+set "FOLDER=\\SMP-8HSN6L3\scanflow\screenshots"
 set "INTERVAL=60"
 :: --------------------------------------------------------------------
 
@@ -36,7 +36,7 @@ if not exist "%SCRIPT%" (
 )
 
 :: Authenticate to the lab PC share (safe to run even if already connected)
-net use "%FOLDER%" /user:SMP-F26VB33\ltspm ltspm >nul 2>&1
+net use "%FOLDER%" /user:SMP-8HSN6L3\ltspm ltspm >nul 2>&1
 
 echo ScanFlow relay — forwarding new screenshots to Slack every %INTERVAL%s
 echo Folder : %FOLDER%
