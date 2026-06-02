@@ -1,4 +1,7 @@
 @echo off
+:: pushd maps UNC paths (e.g. \\wsl.localhost\...) to a temp drive letter
+:: so CMD can use it as the working directory.
+pushd "%~dp0"
 :: =====================================================================
 ::  relay_loop.bat
 ::
