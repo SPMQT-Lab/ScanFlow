@@ -24,8 +24,11 @@ from scanflow.gui.panels.mosaic_panel import MosaicPanel
 from scanflow.gui.panels.preview_panel import PreviewWindow
 from scanflow.gui.panels.z_stability_panel import ZStabilityPanel
 from scanflow.gui.panels.positioning_diag_panel import PositioningDiagPanel
+from scanflow.gui.panels.temperature_panel import TemperaturePanel
+from scanflow.gui.panels.atom_tracker_panel import AtomTrackerPanel
 from scanflow.gui.panels.log_panel import LogPanel
 from scanflow.core.z_monitor import ZMonitor
+from scanflow.core.temp_poller import TemperaturePoller
 from scanflow.gui import theme as _theme
 
 _LOGO = Path(__file__).parents[2] / "Logo.png"
@@ -94,6 +97,10 @@ class MainWindow(QMainWindow):
         self._z_monitor = ZMonitor(self._stm, interval_s=1.0)
         self._z_stability = ZStabilityPanel(self._z_monitor)
         self._z_monitor.start()
+        self._temp_poller = TemperaturePoller(self._stm, poll_interval_s=30.0)
+        self._temperature = TemperaturePanel(self._temp_poller)
+        self._temp_poller.start()
+        self._atom_tracker = AtomTrackerPanel(self._stm)
         self._log = LogPanel()
 
         self._tabs.addTab(self._sweep, "Sweep")
@@ -101,6 +108,8 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._mosaic, "Mosaic")
         self._tabs.addTab(self._positioning_diag, "Positioning Test")
         self._tabs.addTab(self._z_stability, "Z Stability")
+        self._tabs.addTab(self._temperature, "Temperature")
+        self._tabs.addTab(self._atom_tracker, "Atom Tracker")
         self._tabs.addTab(self._log, "Log")
 
         self._sweep.log_message.connect(self._log.append)
@@ -113,11 +122,20 @@ class MainWindow(QMainWindow):
         self._preview_window.error_message.connect(self._log.append_error)
         self._positioning_diag.log_message.connect(self._log.append)
         self._z_stability.log_message.connect(self._log.append)
+        self._temperature.log_message.connect(self._log.append)
+        self._atom_tracker.log_message.connect(self._log.append)
+        self._atom_tracker.error_message.connect(self._log.append_error)
 
         self._sweep.scan_completed.connect(self._preview_window.handle_scan_completed)
         self._survey.scan_completed.connect(self._preview_window.handle_scan_completed)
         self._mosaic.scan_completed.connect(self._preview_window.handle_scan_completed)
         self._preview_window.scan_completed.connect(self._log.append)
+        self._sweep.scan_completed.connect(
+            lambda _: self._atom_tracker.handle_scan_completed()
+        )
+        self._survey.scan_completed.connect(
+            lambda _: self._atom_tracker.handle_scan_completed()
+        )
 
         # -- Status bar --
         self._status_bar = QStatusBar()
