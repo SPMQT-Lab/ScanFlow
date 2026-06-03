@@ -21,6 +21,10 @@ set "PYTHON=python"
 set "SCRIPT=relay_to_slack.py"
 set "FOLDER=\\SMP-8HSN6L3\scanflow\screenshots"
 set "INTERVAL=60"
+set "DELAY=3"
+:: State file: written to %%TEMP%% (always a valid Windows path — avoids
+:: UNC/WSL write failures that silently break state between restarts).
+set "STATE=%TEMP%\scanflow_relay_state.json"
 :: --------------------------------------------------------------------
 
 where "%PYTHON%" >nul 2>&1
@@ -43,5 +47,7 @@ echo Folder : %FOLDER%
 echo Press Ctrl-C to stop.
 echo.
 
-"%PYTHON%" "%SCRIPT%" --folder "%FOLDER%" --interval %INTERVAL%
+echo State  : %STATE%
+echo.
+"%PYTHON%" "%SCRIPT%" --folder "%FOLDER%" --interval %INTERVAL% --delay %DELAY% --state "%STATE%"
 pause
