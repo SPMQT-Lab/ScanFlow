@@ -56,6 +56,11 @@ from probeflow.core.scan_loader import load_scan
 from probeflow.processing.geometry import set_zero_plane
 
 from scanflow.core import STMClient, SafetyConfig, SafetyMonitor, TipMotionManager, ScanParams
+from scanflow.core.scan import (
+    estimate_scan_duration_s as _estimate_scan_duration,
+    estimate_scan_timeout_s as _estimate_scan_timeout,
+    format_duration as _format_duration,
+)
 from scanflow.automation.group_survey import FeatureGroup, group_features
 
 log = logging.getLogger(__name__)
@@ -3223,25 +3228,6 @@ def _unique_dat_path(folder: Path, stem: str) -> Path:
         if not candidate.exists():
             return candidate
         idx += 1
-
-
-def _estimate_scan_timeout(params: ScanParams) -> float:
-    line_time = 2.0 * float(params.size_nm[0]) / max(float(params.speed_nm_s), 0.01)
-    return max(120.0, line_time * int(params.pixels[1]) + 90.0)
-
-
-def _estimate_scan_duration(params: ScanParams) -> float:
-    """Best-estimate scan duration in seconds (fwd+bwd, no settle padding)."""
-    line_time = 2.0 * float(params.size_nm[0]) / max(float(params.speed_nm_s), 0.01)
-    return line_time * int(params.pixels[1])
-
-
-def _format_duration(seconds: float) -> str:
-    s = int(round(seconds))
-    if s < 60:
-        return f"{s}s"
-    m, s = divmod(s, 60)
-    return f"{m}m {s:02d}s"
 
 
 def _pixel_size_x_m_from_scan_range(scan_range_m: tuple[float, float] | None, shape: tuple[int, int]) -> float:

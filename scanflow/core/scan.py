@@ -600,3 +600,27 @@ class ScanController:
             return self._c.raw.scandatabitmap()
         except Exception:
             return None
+
+
+# ------------------------------------------------------------------
+# Scan timing helpers (used by GUI panels and automation executors)
+# ------------------------------------------------------------------
+
+def estimate_scan_duration_s(params: "ScanParams") -> float:
+    """Best-estimate scan duration in seconds (forward + reverse, no settle padding)."""
+    line_time = 2.0 * float(params.size_nm[0]) / max(float(params.speed_nm_s), 0.01)
+    return line_time * int(params.pixels[1])
+
+
+def estimate_scan_timeout_s(params: "ScanParams") -> float:
+    """Scan duration estimate plus generous safety margin, floored at 2 min."""
+    return max(120.0, estimate_scan_duration_s(params) + 90.0)
+
+
+def format_duration(seconds: float) -> str:
+    """Human-readable mm:ss formatting (or 'Ns' under one minute)."""
+    s = int(round(seconds))
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    return f"{m}m {s:02d}s"

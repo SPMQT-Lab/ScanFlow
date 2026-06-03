@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .acquisition_log import write_json_atomic
+from .json_util import json_safe as _json_safe
 
 SCAN_SIDECAR_SCHEMA = "scanflow.acquisition.v1"
 SESSION_SCHEMA = "scanflow.session.v1"
@@ -146,23 +146,6 @@ def _scan_params_payload(params: Any | None) -> dict[str, Any]:
     if isinstance(data, dict):
         return data
     return {}
-
-
-def _json_safe(value: Any) -> Any:
-    if is_dataclass(value):
-        return _json_safe(asdict(value))
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {str(k): _json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(v) for v in value]
-    if hasattr(value, "item"):
-        try:
-            return value.item()
-        except Exception:
-            pass
-    return value
 
 
 def _sha256(path: Path) -> str:

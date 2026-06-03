@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import tempfile
-from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from .json_util import json_safe as _json_safe
 
 
 def _utc_now() -> str:
@@ -69,19 +70,4 @@ def write_json_atomic(path: Path | str, payload: dict[str, Any]) -> Path:
     return target
 
 
-def _json_safe(value: Any) -> Any:
-    if is_dataclass(value):
-        return _json_safe(asdict(value))
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {str(k): _json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(v) for v in value]
-    if hasattr(value, "item"):
-        try:
-            return value.item()
-        except Exception:
-            pass
-    return value
 
