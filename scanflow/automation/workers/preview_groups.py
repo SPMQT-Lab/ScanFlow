@@ -34,6 +34,10 @@ from scanflow.core.scan import (
     estimate_scan_timeout_s as _estimate_scan_timeout,
     format_duration as _format_duration,
 )
+from scanflow.core.scan_geometry import (
+    clamp_frame_to_wide_bounds,
+    feature_target_xy_nm,
+)
 
 from .paths import unique_dat_path
 
@@ -208,38 +212,33 @@ class FeatureGroupScanWorker(QThread):
         g_idx: int,
         total: int,
     ) -> tuple[float, float]:
-        """Createc convention:
-        - SCAN.OFFSET.X.NM = centre of scan frame (X)
-        - SCAN.OFFSET.Y.NM = TOP EDGE (first scanline) of scan frame (Y)
-        ProbeFlow's center_d{x,y}_nm are offsets from the wide-scan image centre.
-        Wide-scan image centre Y = home_y + scan_range_y/2.
+        """Absolute target offset for ``group``, clamped to wide-scan bounds.
+
+        Returns ``(X_centre, Y_top_edge)`` ready for ``SCAN.OFFSET.{X,Y}.NM``.
+        Createc Y convention lives in :mod:`scanflow.core.scan_geometry`.
         """
-        scan_range_y = self._scan_range_nm[1] if self._scan_range_nm is not None else 0.0
         scan_range_x = self._scan_range_nm[0] if self._scan_range_nm is not None else 0.0
-        target_x = home_x + group.center_dx_nm
-        target_y = (
-            home_y
-            + scan_range_y / 2.0
-            + group.center_dy_nm
-            - group.frame_nm[1] / 2.0
+        scan_range_y = self._scan_range_nm[1] if self._scan_range_nm is not None else 0.0
+
+        target_x, target_y = feature_target_xy_nm(
+            home_x_nm=home_x,
+            home_y_nm=home_y,
+            scan_range_y_nm=scan_range_y,
+            feature_dx_nm=group.center_dx_nm,
+            feature_dy_nm=group.center_dy_nm,
+            frame_height_nm=group.frame_nm[1],
         )
 
         if self._scan_range_nm is None:
             return target_x, target_y
 
-        half_fx = group.frame_nm[0] / 2.0
-        frame_y = group.frame_nm[1]
-        if group.frame_nm[0] <= scan_range_x:
-            clamped_x = max(
-                home_x - scan_range_x / 2.0 + half_fx,
-                min(home_x + scan_range_x / 2.0 - half_fx, target_x),
-            )
-        else:
-            clamped_x = target_x
-        if frame_y <= scan_range_y:
-            clamped_y = max(home_y, min(home_y + scan_range_y - frame_y, target_y))
-        else:
-            clamped_y = target_y
+        clamped_x, clamped_y = clamp_frame_to_wide_bounds(
+            target_x, target_y,
+            home_x_nm=home_x, home_y_nm=home_y,
+            scan_range_x_nm=scan_range_x, scan_range_y_nm=scan_range_y,
+            frame_width_nm=group.frame_nm[0],
+            frame_height_nm=group.frame_nm[1],
+        )
 
         if abs(clamped_x - target_x) > 0.01 or abs(clamped_y - target_y) > 0.01:
             log.warning(

@@ -36,6 +36,7 @@ from scanflow.core.scan import (
     estimate_scan_timeout_s as _estimate_scan_timeout,
     format_duration as _format_duration,
 )
+from scanflow.core.scan_geometry import feature_target_xy_nm
 
 from .paths import unique_dat_path
 
@@ -122,10 +123,14 @@ class FeatureScanWorker(QThread):
                 )
                 if self._home_nm is not None and self._scan_range_nm is not None:
                     home_x, home_y = self._home_nm
-                    scan_range_y = self._scan_range_nm[1]
-                    feat_top_y = home_y + scan_range_y / 2.0 + row.dy_nm - scan_size_for_move[1] / 2.0
-                    abs_target_x = home_x + row.dx_nm
-                    abs_target_y = feat_top_y
+                    abs_target_x, abs_target_y = feature_target_xy_nm(
+                        home_x_nm=home_x,
+                        home_y_nm=home_y,
+                        scan_range_y_nm=self._scan_range_nm[1],
+                        feature_dx_nm=row.dx_nm,
+                        feature_dy_nm=row.dy_nm,
+                        frame_height_nm=scan_size_for_move[1],
+                    )
                     log.info(
                         "Feature scan target %d/%d: absolute move → (%.3f, %.3f) nm  "
                         "[home (%.3f, %.3f)  Δ=(%.3f, %.3f)]",
