@@ -103,8 +103,15 @@ chosen, the rules are:
   proposed correction), so strategies are swappable and comparable.
 - Corrections that move the tip go through `TipMotionManager` and are
   logged to the acquisition log — no exceptions.
-- Experimental strategies are compared on saved/mock data first
-  (the review's tracking test-dataset idea) before touching the rig.
+- Experimental strategies are compared on saved/mock data first, before
+  touching the rig. **The harness exists:** ten deterministic scenes in
+  `tests/synthetic_surfaces.py` (sparse monomers, clusters, high density,
+  low contrast, step edge, bare lattice, edge features, drifted repeat
+  scans, inverted polarity, partial scan) with pinned expected behaviour
+  in `tests/test_tracking_dataset.py` — including a sub-pixel
+  drift-recovery baseline that any new drift estimator must match or
+  beat, and documented conservative failure modes (low contrast, bright
+  terraces, depressions, partial frames fail EMPTY, never hallucinate).
 
 **Inventory of current and former strategies** (so nobody re-invents or
 resurrects one unknowingly):
