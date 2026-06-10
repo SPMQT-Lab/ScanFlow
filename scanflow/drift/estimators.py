@@ -160,6 +160,11 @@ class PhaseCorrelationDriftEstimator:
                            f"shape mismatch {before.shape} vs {after.shape}")
         a = _level_correct(np.asarray(before, dtype=float))
         b = _level_correct(np.asarray(after, dtype=float))
+        # NaN rows (partial frames) would propagate through the FFT and
+        # could yield a confidently-wrong result; zero-fill them so they
+        # contribute nothing to the correlation.
+        a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+        b = np.nan_to_num(b, nan=0.0, posinf=0.0, neginf=0.0)
         ny, nx = a.shape
         window = np.outer(np.hanning(ny), np.hanning(nx))
         fa = np.fft.fft2(a * window)
@@ -192,6 +197,11 @@ class PhaseCorrelationDriftEstimator:
         dx = _subpixel(nx, dx_i, corr[peak_idx[0], :])
 
         confidence = peak_val  # normalised cross-power peak height
+        # Never emit a confidently-wrong estimate: any non-finite number
+        # in the result means the correlation was degenerate.
+        if not (np.isfinite(dx) and np.isfinite(dy) and np.isfinite(confidence)):
+            return _failed(self.name, self.version,
+                           "degenerate correlation (non-finite result)")
         max_dx = nx * self.max_shift_fraction
         max_dy = ny * self.max_shift_fraction
         if confidence < self.min_confidence:

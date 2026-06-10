@@ -42,6 +42,24 @@ next unattended run.
 > The Qt-free blocking runner and a `[gui]` packaging extra are deferred
 > into the H2 executor extraction (see the doc's *Deferred* section).
 >
+> **NaN / bad-readback robustness pass (2026-06-11):** audit of the data
+> paths for the historical "NaN crashes the program / freezes the
+> controller" failures. Found and fixed: a NaN ADC reading passed the
+> safety check as `ok=True` **and reset the fail-closed counter** (NaN
+> compares False against any threshold) — now counted as a failed
+> reading; the plane fit (`_level_correct`) fitted through NaNs —
+> silently zeroing ALL detections on macOS LAPACK and raising "SVD did
+> not converge" on Windows (the likely historical crash) — now fitted on
+> finite pixels only, with median fill before thresholding so
+> partial-NaN frames still yield valid-region detections; phase
+> correlation could return `ok=True` with garbage on NaN frames — now
+> sanitised and refuses non-finite results; `''`/garbage parameter
+> readbacks from a busy STMAFM crashed `scan.read()` mid-automation —
+> now parsed defensively with logged defaults; one NaN Z sample poisoned
+> the Z-stability statistics — now skipped; temperature refill-event
+> list bounded. `scan_metrics` and `events.py` audited clean (already
+> NaN-safe / bounded). Coverage: tests/test_nan_robustness.py.
+>
 > Still open: **B2 [needs rig validation]** (survey vs mosaic frame-resize
 > convention — one manual experiment required, then unify on
 > `scan_geometry` and upgrade the mock, see U5; flagged in code with

@@ -115,11 +115,16 @@ class ZMonitor(QObject):
         if self._stm is None:
             return
         try:
-            raw = self._stm.raw.getdacvalfb()
+            raw = float(self._stm.raw.getdacvalfb())
         except Exception as e:
             log.debug("getdacvalfb() failed: %s", e)
             return
-        self.add_sample(time.time(), float(raw))
+        if not np.isfinite(raw):
+            # One NaN sample would poison every rolling statistic (ptp,
+            # std, polyfit slope all become NaN) — skip it.
+            log.debug("non-finite Z sample skipped: %r", raw)
+            return
+        self.add_sample(time.time(), raw)
 
     # ------------------------------------------------------------------
     # Statistics

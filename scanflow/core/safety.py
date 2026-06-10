@@ -98,11 +98,17 @@ class SafetyMonitor:
           2. Fallback: peek at the latest live scan-data current channel
              and return the peak |I| in the partial frame.
         """
-        # Method 1: instantaneous voltage from ADC0 / preamp
+        # Method 1: instantaneous voltage from ADC0 / preamp.
+        # A NaN/Inf ADC reading must NOT be returned: NaN passes every
+        # `abs(I) > threshold` comparison as False, which would silently
+        # disable tip-crash protection while looking like a good reading.
         try:
             v = float(stm.raw.getadcvalf(0, 0))
             preamp_exp = int(stm.getp("SCAN.PREAMPGAIN.EXPONENT", 9) or 9)
-            return v / (10.0 ** preamp_exp)
+            current = v / (10.0 ** preamp_exp)
+            if np.isfinite(current):
+                return current
+            log.debug("ADC current reading non-finite (%r) — falling back", v)
         except Exception:
             pass
         # Method 2: max from live scan data — full-frame COM transfer, so
@@ -115,10 +121,15 @@ class SafetyMonitor:
         try:
             arr = stm.scan.live_data(channel=2, unit=3)  # CURRENT_FWD, AMPERE
             if arr is not None:
-                arr = np.asarray(arr)
-                # Ignore the leading rows in case partial-scan blanks are nonzero
-                value = float(np.max(np.abs(arr)))
+                arr = np.asarray(arr, dtype=float)
+                finite = arr[np.isfinite(arr)]
+                # NaN rows happen on real rigs (partial frames, DSP hiccups);
+                # ignore them rather than letting one NaN poison the max.
+                if finite.size:
+                    value = float(np.max(np.abs(finite)))
         except Exception:
+            value = None
+        if value is not None and not np.isfinite(value):
             value = None
         self._fallback_cached_at = now
         self._fallback_cached_value = value
@@ -133,6 +144,10 @@ class SafetyMonitor:
         if not cfg.enable_current_check:
             return SafetyStatus(ok=True)
         I = self.measure_current_A(stm)
+        # Belt and braces: a non-finite reading is a FAILED reading. It
+        # must count toward the fail-closed escalation, never reset it.
+        if I is not None and not np.isfinite(I):
+            I = None
         if I is None:
             # Fail CLOSED on persistent readback failure: a monitor that
             # cannot read the current cannot protect the tip, so it must
