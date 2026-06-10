@@ -30,6 +30,7 @@ from scanflow.gui.panels.z_stability_panel import ZStabilityPanel
 from scanflow.gui.panels.positioning_diag_panel import PositioningDiagPanel
 from scanflow.gui.panels.temperature_panel import TemperaturePanel
 from scanflow.gui.panels.atom_tracker_panel import AtomTrackerPanel
+from scanflow.gui.panels.tipform_panel import TipFormPanel
 from scanflow.gui.panels.log_panel import LogPanel
 from scanflow.core.z_monitor import ZMonitor
 from scanflow.core.temp_poller import TemperaturePoller
@@ -106,6 +107,9 @@ class MainWindow(QMainWindow):
         self._temperature = TemperaturePanel(self._temp_poller)
         self._temp_poller.start()
         self._atom_tracker = AtomTrackerPanel(self._stm)
+        # Tip Form panel: supervisor-sanctioned tab; adds ZERO pollers
+        # (COM only on explicit button clicks) per ROADMAP §2.5/§6.
+        self._tipform = TipFormPanel(self._stm)
         self._log = LogPanel()
 
         self._tabs.addTab(self._sweep, "Sweep")
@@ -115,6 +119,7 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._z_stability, "Z Stability")
         self._tabs.addTab(self._temperature, "Temperature")
         self._tabs.addTab(self._atom_tracker, "Atom Tracker")
+        self._tabs.addTab(self._tipform, "Tip Form")
         self._tabs.addTab(self._log, "Log")
 
         self._sweep.log_message.connect(self._log.append)
@@ -128,6 +133,8 @@ class MainWindow(QMainWindow):
         self._temperature.log_message.connect(self._log.append)
         self._atom_tracker.log_message.connect(self._log.append)
         self._atom_tracker.error_message.connect(self._log.append_error)
+        self._tipform.log_message.connect(self._log.append)
+        self._tipform.error_message.connect(self._log.append_error)
 
         self._sweep.scan_completed.connect(self._forward_scan_to_preview)
         self._survey.scan_completed.connect(self._forward_scan_to_preview)

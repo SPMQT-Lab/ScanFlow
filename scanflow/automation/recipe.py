@@ -333,6 +333,30 @@ class MeasurementRecipe:
                     f"WARNING: {tag}: tip-form step requires explicit operator "
                     "approval (approve_next_tip_form) or the run will halt there"
                 )
+                # Createc quirk: the move to the tip-form spot happens at
+                # the step's lateral speed, not the scan speed, and cannot
+                # be interrupted. Flag big mismatches against the scan
+                # speeds present in this recipe.
+                scan_speeds = [
+                    s.speed_nm_s for s in self.steps
+                    if getattr(s, "kind", "") == "scan"
+                ]
+                if scan_speeds:
+                    ratio = step.lateral_speed_nm_s / max(min(scan_speeds), 1e-9)
+                    if ratio > 10.0:
+                        issues.append(
+                            f"WARNING: {tag}: tip-form lateral speed "
+                            f"{step.lateral_speed_nm_s:.1f} nm/s is {ratio:.0f}× "
+                            "the recipe's scan speed — the move to the target "
+                            "will be a fast jump"
+                        )
+                    elif ratio < 0.1:
+                        issues.append(
+                            f"WARNING: {tag}: tip-form lateral speed "
+                            f"{step.lateral_speed_nm_s:.1f} nm/s is far below the "
+                            "recipe's scan speed — slow travel that cannot be "
+                            "interrupted once commanded"
+                        )
 
         if mode == "live" and not self.safety_enable:
             issues.append("WARNING: tip-crash safety abort is DISABLED")

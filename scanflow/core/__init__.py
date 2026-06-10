@@ -20,7 +20,10 @@ from .coarse import CoarseController, ApproachConfig, RampParams
 from .lockin import LockInController, LockInMode
 from .spectroscopy import SpectroscopyController, IVTable
 from .afm import AFMController
-from .tipform import TipFormController, TipFormParams
+from .tipform import (
+    TipFormController, TipFormParams,
+    TipFormMotionAssessment, assess_tip_form_motion,
+)
 from .temperature import TemperatureMonitor
 from .scan_geometry import (
     clamp_frame_to_wide_bounds,
@@ -63,6 +66,7 @@ __all__ = [
     "SpectroscopyController", "IVTable",
     "AFMController",
     "TipFormController", "TipFormParams",
+    "TipFormMotionAssessment", "assess_tip_form_motion",
     "TemperatureMonitor",
     "clamp_frame_to_wide_bounds", "feature_target_xy_nm",
     "frame_top_edge_y_nm", "image_center_y_nm",

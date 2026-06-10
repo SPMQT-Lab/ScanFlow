@@ -34,6 +34,11 @@ Verified on the rig and/or covered by the mock-STM test suite (177 tests):
   `scanflow.contracts.ScanRecord`) and session manifests; everything a
   run did is reconstructable afterwards.
 - **Mock STM** — full offline development and CI without the instrument.
+- **Supervised tip forming** — Tip Form tab arms exactly ONE pulse per
+  typed-confirmation (`ARM`), with a motion pre-flight for the Createc
+  travel-speed quirk (lateral speed vs scan speed: fast-jump / 
+  uninterruptible-crawl warnings); CLI recipes need an explicit
+  `--arm-tip-form`. Unattended tip forming remains impossible by design.
 
 ## 2. Architecture rules (must hold — enforced, not aspirational)
 
@@ -161,7 +166,10 @@ Mark any future edits in these areas with `PLACEHOLDER(spectroscopy)` /
   through the contracts chain (`ProposedAction` → validation), but torch/
   CLIP/sklearn never become imports of core/automation/gui (enforced).
 - **No new GUI tabs ahead of the executor extraction** — every tab adds
-  COM pollers and lag surface; consolidate first.
+  COM pollers and lag surface; consolidate first. *Sanctioned exception
+  (supervisor-requested, 2026-06-11): the Tip Form tab — it adds ZERO
+  pollers/timers; the instrument is touched only on explicit button
+  clicks.*
 
 ## 7. Document map
 

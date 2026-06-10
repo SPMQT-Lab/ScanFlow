@@ -651,6 +651,31 @@ class AutomationRunner(QThread):
         if not self._capture_tip_form_snapshot("pre", label):
             return
 
+        # Pre-flight motion assessment (Createc quirk: the tip travels to
+        # the target at TIP-FORM.LATSPEED, not the scan speed, and the
+        # command cannot be interrupted once issued). Warn loudly but do
+        # not abort — the operator armed this step knowingly and the GUI
+        # showed the same warnings before arming.
+        try:
+            from scanflow.core import assess_tip_form_motion
+            assessment = assess_tip_form_motion(
+                step.lateral_speed_nm_s,
+                scan_speed_nm_s=self._stm.scan.speed_nm_s or 50.0,
+                frame_size_nm=self._stm.scan.size_nm,
+            )
+            self._acq_log.emit(
+                "tip_form_motion_assessment",
+                label=label,
+                speed_ratio=assessment.speed_ratio,
+                worst_travel_s=assessment.worst_travel_s,
+                warnings=assessment.warnings,
+            )
+            for warning in assessment.warnings:
+                log.warning("TipFormStep '%s': %s", label, warning)
+                self.info_message.emit(f"⚠ tip form: {warning}")
+        except Exception:
+            log.debug("tip-form motion assessment failed", exc_info=True)
+
         params = TipFormParams(
             voltage_V=step.voltage_V,
             z_approach_nm=step.z_approach_nm,

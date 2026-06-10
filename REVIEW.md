@@ -60,12 +60,22 @@ next unattended run.
 > list bounded. `scan_metrics` and `events.py` audited clean (already
 > NaN-safe / bounded). Coverage: tests/test_nan_robustness.py.
 >
+> **H5 closed (2026-06-11):** tip-form arming now has its GUI and CLI
+> paths — a Tip Form tab (zero pollers) with a typed-`ARM` confirmation
+> dialog that calls `approve_next_tip_form()` for exactly one pulse, and
+> `scanflow run --arm-tip-form` for recipes. Both surface a motion
+> pre-flight (`core.tipform.assess_tip_form_motion`) for the Createc
+> quirk where the tip travels at TIP-FORM.LATSPEED rather than the scan
+> speed (fast jump / uninterruptible crawl); the runner logs the same
+> assessment to the acquisition log before each pulse, and
+> `recipe.validate()` flags static speed mismatches.
+>
 > Still open: **B2 [needs rig validation]** (survey vs mosaic frame-resize
 > convention — one manual experiment required, then unify on
 > `scan_geometry` and upgrade the mock, see U5; flagged in code with
 > `FIXME(B2-frame-resize)` markers in runner.py / scan_geometry.py /
 > mock_dispatch.py, guarded by `tests/test_open_findings.py`), **H2** (executor
-> extraction), **H5** (tip-form GUI arming path), **H6** (remaining inline
+> extraction), **H6** (remaining inline
 > survey coordinate math — blocked on B2), **U5**, **U8**, **U9**.
 
 ## Answers to the four review questions

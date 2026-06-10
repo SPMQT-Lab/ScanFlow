@@ -100,7 +100,8 @@ def _connect(mock: bool):
     return stm
 
 
-def _run_blocking(stm, recipe: MeasurementRecipe) -> int:
+def _run_blocking(stm, recipe: MeasurementRecipe,
+                  arm_tip_form: bool = False) -> int:
     """Execute a recipe and stream progress to stdout. Returns the exit code."""
     from PySide6.QtCore import QCoreApplication
     from scanflow.automation import AutomationRunner
@@ -108,6 +109,11 @@ def _run_blocking(stm, recipe: MeasurementRecipe) -> int:
     app = QCoreApplication.instance() or QCoreApplication(sys.argv)
 
     runner = AutomationRunner(stm, recipe)
+    if arm_tip_form:
+        # One supervised pulse for THIS run only (--arm-tip-form). The
+        # runner halts at any further tip-form steps.
+        runner.approve_next_tip_form()
+        print("Tip forming ARMED for this run (one pulse).")
     state = {"err": None}
 
     def on_progress(i, n, label):
@@ -224,12 +230,18 @@ def cmd_run(a) -> int:
     _print_plan(recipe, f"Recipe from {a.recipe}")
     if not _check_recipe(recipe, a.mock):
         return 2
+    has_tip_form = any(getattr(s, "kind", "") == "tip_form" for s in recipe.steps)
+    if has_tip_form and not a.arm_tip_form:
+        print("NOTE: this recipe contains tip-form step(s). Without "
+              "--arm-tip-form the run will HALT at the first one "
+              "(operator approval required).")
     if not _confirm(a.yes):
         print("Aborted.")
         return 1
     stm = _connect(a.mock)
     try:
-        return _run_blocking(stm, recipe)
+        return _run_blocking(stm, recipe,
+                             arm_tip_form=has_tip_form and a.arm_tip_form)
     finally:
         stm.disconnect()
 
@@ -326,6 +338,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("recipe", help="Path to a recipe.yaml")
     p_run.add_argument("--mock", action="store_true", help="Use mock STM")
     p_run.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
+    p_run.add_argument("--arm-tip-form", action="store_true",
+                       help="Explicitly arm ONE supervised tip-form pulse for "
+                            "this run (never implied by --yes)")
     p_run.set_defaults(func=cmd_run)
 
     # diagnostics (operator-guided rig experiments)
