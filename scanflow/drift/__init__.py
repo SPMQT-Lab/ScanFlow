@@ -29,6 +29,7 @@ from .estimators import (
     DriftEstimator,
     FeatureMatchDriftEstimator,
     PhaseCorrelationDriftEstimator,
+    estimate_with_all,
 )
 
 __all__ = [
@@ -37,4 +38,5 @@ __all__ = [
     "DriftEstimator",
     "FeatureMatchDriftEstimator",
     "PhaseCorrelationDriftEstimator",
+    "estimate_with_all",
 ]

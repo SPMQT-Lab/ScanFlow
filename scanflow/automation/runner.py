@@ -1033,6 +1033,59 @@ class AutomationRunner(QThread):
             )
 
 
+    def _measure_and_log_drift(
+        self,
+        tag: str,
+        before_img,
+        after_img,
+        size_nm: tuple[float, float],
+        pixels: tuple[int, int],
+    ) -> None:
+        """Measure apparent drift between two same-frame images and LOG it.
+
+        Observation only — never moves anything. Both registered
+        estimators run so real campaigns accumulate side-by-side method
+        comparisons (the evidence base for picking the lab's drift
+        strategy, ROADMAP §4). Frames must be the same size/position, so
+        this is independent of the B2 frame-resize question. Refusals are
+        logged too: "estimator declined" is data. Failures never abort a
+        run.
+        """
+        if before_img is None or after_img is None:
+            return
+        try:
+            from scanflow.drift import estimate_with_all
+            nm_per_px = float(size_nm[0]) / max(int(pixels[0]), 1)
+            estimates = estimate_with_all(before_img, after_img, nm_per_px)
+        except Exception:
+            log.debug("drift measurement failed for %s", tag, exc_info=True)
+            return
+        for e in estimates:
+            self._acq_log.emit(
+                "drift_measurement",
+                tag=tag,
+                method=e.method,
+                method_version=e.method_version,
+                ok=e.ok,
+                dx_nm=e.dx_nm,
+                dy_nm=e.dy_nm,
+                dx_px=e.dx_px,
+                dy_px=e.dy_px,
+                confidence=e.confidence,
+                reason=e.reason,
+                details=e.details,
+            )
+        ok_parts = [
+            f"{e.method}: ({e.dx_nm:+.3f}, {e.dy_nm:+.3f}) nm "
+            f"conf={e.confidence:.2f}"
+            for e in estimates if e.ok
+        ]
+        if ok_parts:
+            self.info_message.emit(f"drift {tag}: " + "  |  ".join(ok_parts))
+        else:
+            reasons = "; ".join(e.reason for e in estimates)
+            self.info_message.emit(f"drift {tag}: no estimate ({reasons})")
+
     def _emit_z_stability(self) -> None:
         """Pull the just-completed scan's topography and emit a stability metric."""
         try:
@@ -1228,6 +1281,13 @@ class AutomationRunner(QThread):
             zoom_nm_per_px_x = tile_size_nm[0] / max(cfg.tile_pixels[0], 1)
             zoom_nm_per_px_y = tile_size_nm[1] / max(cfg.tile_pixels[1], 1)
 
+            # Drift measurement baseline: iteration 1's image. Later
+            # iterations of the SAME tile frame are compared against it
+            # (observation only — no correction is applied). In bias-sweep
+            # mode contrast changes between iterations and estimators may
+            # refuse; the logged refusal is itself useful data.
+            tile_iter1_img = None
+
             for it, iter_bias_V in enumerate(bias_seq):
                 if self._stop_requested:
                     break
@@ -1292,6 +1352,16 @@ class AutomationRunner(QThread):
                 except Exception:
                     pass
 
+                # Inter-iteration drift measurement (same frame, no motion)
+                if tile_iter1_img is None:
+                    tile_iter1_img = img
+                else:
+                    self._measure_and_log_drift(
+                        f"tile{tile_idx:02d}_iter{it + 1}_vs_iter1",
+                        tile_iter1_img, img,
+                        tile_size_nm, cfg.tile_pixels,
+                    )
+
 
 
             self.mosaic_tile_done.emit(tile_idx)
@@ -1342,6 +1412,15 @@ class AutomationRunner(QThread):
             if output is not None and wide_after_img is not None:
                 _save_image_preview(wide_after_img, output / "wide_after.png")
             self._log_offset(f"{cfg.name}: wide_after scan complete")
+
+            # Campaign-duration drift: the after-overview was taken at the
+            # same anchored XY and frame size as the before-overview, so
+            # their apparent shift is the net drift over the whole mosaic.
+            self._measure_and_log_drift(
+                "wide_after_vs_wide_before",
+                wide_before_img, wide_after_img,
+                cfg.wide_size_nm, cfg.wide_pixels,
+            )
 
 
 

@@ -223,3 +223,25 @@ ALL_ESTIMATORS: tuple[type, ...] = (
     FeatureMatchDriftEstimator,
     PhaseCorrelationDriftEstimator,
 )
+
+
+def estimate_with_all(before: np.ndarray, after: np.ndarray,
+                      nm_per_px: float) -> list[DriftEstimate]:
+    """Run every registered estimator on one frame pair.
+
+    Used by campaign code to LOG drift measurements from both methods
+    side by side — that comparison, accumulated over real runs, is the
+    evidence base for choosing the lab's drift-correction strategy.
+    Estimator exceptions are converted into failed estimates so a broken
+    strategy can never take down an acquisition run.
+    """
+    results: list[DriftEstimate] = []
+    for cls in ALL_ESTIMATORS:
+        est = cls()
+        try:
+            results.append(est.estimate(before, after, nm_per_px))
+        except Exception as exc:  # estimator bugs must not kill a campaign
+            log.exception("drift estimator %s raised", est.name)
+            results.append(_failed(est.name, est.version,
+                                   f"estimator raised: {exc}"))
+    return results

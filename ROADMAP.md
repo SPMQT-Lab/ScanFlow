@@ -132,7 +132,8 @@ resurrects one unknowingly):
 | Z-drift *measurement* (no correction) | `scanflow/core/z_monitor.py` | Working (monitoring only) |
 | Hybrid feature/phase-correlation alignment scans | **removed** — `recipe.from_yaml` still strips its `drift_*` keys from old YAML | Deprecated; do not resurrect without the comparison harness |
 | DSP-side drift feed (`Drift_X/Y[A./sec]` keys) | not implemented | Candidate: lets the instrument correct inline, no alignment scans |
-| Inter-tile drift correction in mosaics | not implemented | The gap §3.2 is about |
+| Inter-tile drift **measurement** in mosaics | `runner._measure_and_log_drift` → `scanflow/drift` | **Wired (2026-06-11), observation only**: every mosaic logs `drift_measurement` events (both estimators, side by side) between tile iterations and between the wide before/after overviews — same-frame comparisons, so independent of B2. The accumulated logs from real 77 K campaigns are the evidence for choosing a strategy |
+| Inter-tile drift **correction** in mosaics | not implemented | The remaining §3.2 gap — choose a strategy from the measurement logs, then wire correction through TipMotionManager (after B2) |
 
 ## 5. Placeholders — deliberately NOT being developed now
 
