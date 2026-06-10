@@ -1,5 +1,15 @@
 # ScanFlow Long-Term Architecture: Separating STM Control, Analysis, and ML
 
+> **STATUS (2026-06-10): this is the PRIMARY planning reference for
+> ScanFlow2.** All other plans are subordinate to it or archived
+> (`docs/archive/` — historical, not guidance). Current working rules and
+> priorities: [`ROADMAP.md`](../ROADMAP.md).
+>
+> Phase progress (§14): Phase 1 (package boundaries) ✅ done ·
+> Phase 2 (contracts) ✅ done — `scanflow/contracts/` +
+> `scanflow/automation/proposals.py` · Phase 3 (Qt-free execution) ⏳ next,
+> gated on the `FIXME(B2-frame-resize)` rig experiment · Phases 4–7 planned.
+
 **Purpose:** propose a clean long-term architecture for ScanFlow and related lab software so that STM control remains safe, simple, and maintainable, while image analysis and ML modules can evolve independently.
 
 **Context:** ScanFlow is becoming more than a simple sweep runner. It now touches instrument control, GUI workflows, feature detection, survey/mosaic automation, ProbeFlow integration, and potentially ML-based image interpretation. This is useful, but it creates an architectural risk: methods for analysing images may change often, while the hardware-control layer must remain conservative, testable, and safe.

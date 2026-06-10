@@ -4,6 +4,12 @@ The PLL drives the qPlus tuning fork on resonance and detects the frequency
 shift (Δf) caused by tip-sample forces. This controller wraps frequency
 scanning, PLL configuration, amplitude/frequency tuning, and switching the
 main feedback loop between STM (current) and AFM (Δf) modes.
+
+PLACEHOLDER(afm): this module is a thin wrapper and is NOT under active
+development — see ROADMAP.md §5. AFM/qPlus support is explicitly deferred
+(lower priority than spectroscopy): no panels, no tuning wizards, no
+feedback-mode switching workflows until the lab needs them. Mark related
+edits with PLACEHOLDER(afm) so they are findable.
 """
 
 from __future__ import annotations

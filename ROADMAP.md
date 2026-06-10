@@ -1,210 +1,155 @@
-# ScanFlow Roadmap
+# ScanFlow2 — Roadmap and Working Rules
 
-This document describes the planned evolution of ScanFlow beyond the current
-phase. Each phase has a clear goal, exit criteria, and concrete tasks.
-
-The current state (post-refactor) covers:
-
-- New `setp`/`getp` API with SI units
-- Coarse approach + Z-limit + slider panels
-- Scan control panel with channel selector
-- Lock-in + I/V point spectroscopy
-- Cryo temperature readout
-- Drift detection + correction during automation
-- Overnight-safe recipes (DST suppression, configurable save folder)
+**Last revised:** 2026-06-10.
+**Primary planning reference:**
+[docs/long_term_architecture.md](docs/long_term_architecture.md) — the
+layered control/analysis/ML architecture this program is converging on.
+This file records *current status, working rules, immediate priorities,
+placeholders, and explicit non-goals*. Older plans live in
+[docs/archive/](docs/archive/) and must not guide new work.
 
 ---
 
-## Phase 2 — Live awareness (next, ~1 week)
+## 1. What works today
 
-**Goal:** the user can see what the STM is doing without leaving ScanFlow.
+Verified on the rig and/or covered by the mock-STM test suite (177 tests):
 
-### 2.1 Live scan viewer
-- Embed a `pyqtgraph.ImageView` in a new **Live View** tab.
-- After each scan saves, load the `.dat` via `createc.Createc_pyFile.DAT_IMG`
-  and update the viewer.
-- Add a channel selector (TOPOGRAPHY / CURRENT / DF / Lock-in X) and an
-  auto-clip percentile slider.
-- Overlay the cumulative drift trail.
+- **Createc/STMAFM connection** — thread-safe COM proxy handling, retry
+  policy for transient faults, careful stop/teardown sequencing. COM load
+  was recently reduced substantially (opt-in conflated live frames,
+  throttled GUI polling) to address controller-window lag.
+- **Safety** — tip-crash current abort (fails closed on broken readback),
+  0 V constant-current guard, emergency-stop path, Z-limit retract, and a
+  motion policy gate (`TipMotionManager`) for all automated XY movement.
+- **Mosaic campaigns** — wide overview → N×N tiles with per-tile
+  parameters (including bias sweeps per tile) → wide overview, with
+  absolute, clamped tile positioning.
+- **Survey campaigns** — wide scan → feature discovery → per-feature
+  zooms (see the open positioning question in §3.1 before trusting zoom
+  centring unattended).
+- **Bias/current sweeps** — GUI and CLI, with validation and time estimates.
+- **Temperature monitoring** and **Z-stability monitoring**.
+- **Acquisition logging** — JSONL event log plus per-scan
+  `.scanflow.json` sidecars (schema `scanflow.acquisition.v1` via
+  `scanflow.contracts.ScanRecord`) and session manifests; everything a
+  run did is reconstructable afterwards.
+- **Mock STM** — full offline development and CI without the instrument.
 
-### 2.2 Watchdog + notifications
-- `scanflow/notify/` module with three back-ends: `sound`, `email`, `desktop`.
-- Trigger on: scan finished, recipe finished, error, drift confidence < threshold.
-- Configurable per recipe.
+## 2. Architecture rules (must hold — enforced, not aspirational)
 
-### 2.3 Approach-status integration
-- Couple the approach result back to the **Scan Control** tab — auto-refresh
-  parameters when the tip enters tunnelling.
-- Disable scan controls while approach is in progress.
+These are the rules the supervisor requires the architecture to maintain.
+They are enforced by `tests/test_import_boundaries.py` and
+`tools/dev/import_audit.py`; PRs that break them should not merge.
 
-**Exit criteria:** a user can run an overnight recipe, watch scans appear in
-real time, and get a phone notification when the run finishes or errors out.
+1. **Module separation.** Layer dependency arrows point one way only
+   (see [docs/dependency_architecture.md](docs/dependency_architecture.md)):
+   `contracts` (stdlib-only) ← `core` ← `automation` ← `gui`. Analysis
+   and ML are optional extras and never imported by control paths.
+2. **Only the control layer commands the STM.** Analysis/ML/GUI code
+   proposes; the control core validates
+   (`scanflow/automation/proposals.py`); only validated actions execute.
+   All automated XY motion goes through `TipMotionManager`.
+3. **One schema per artefact.** Scan metadata is
+   `scanflow.contracts.ScanRecord` = the sidecar. No parallel models.
+4. **Coordinates carry their frame.** Positions crossing a module
+   boundary use the `scanflow.contracts.coordinates` frame identifiers —
+   never bare tuples with an implicit convention.
+5. **Performance / memory discipline.** Every COM call executes on
+   STMAFM's GUI thread, so COM traffic *is* controller lag:
+   - no full-frame (`DATA.SCAN`) transfers inside polling loops — frame
+     pulls are opt-in, rate-limited, and conflated (latest-frame-wins);
+   - no Qt queued signals carrying large payloads (they accumulate when
+     the GUI falls behind — use a slot + notification instead);
+   - new pollers/timers must state their COM cost and be bounded;
+     run `tools/dev/import_audit.py` and watch the acquisition-log volume
+     when adding any periodic task.
 
----
+## 3. Immediate priorities (in order)
 
-## Phase 3 — Spectroscopy maturity (~1–2 weeks)
+### 3.1 Resolve the frame-resize convention question (gates everything positional)
+One manual experiment on the rig: place the frame over a visible feature,
+halve `SCAN.IMAGESIZE.NM.Y`, observe whether the top edge or the centre
+is preserved. Survey and mosaic currently embody *contradictory*
+assumptions; at most one is right. Flagged in code as
+`FIXME(B2-frame-resize)` (runner / scan_geometry / mock_dispatch),
+guarded by `tests/test_open_findings.py`. Afterwards: unify all
+positioning on `scan_geometry` helpers and encode the verified behaviour
+in the mock.
 
-**Goal:** ScanFlow can drive every spectroscopy mode the CreaTec supports,
-saving raw `.VERT` plus a sidecar JSON with metadata + lock-in state.
+### 3.2 Drift handling for mosaic/survey campaigns at 77 K
+The active hard problem — see §4 for the policy and inventory.
 
-### 3.1 Multi-point and line spectroscopy
-- Wrap `btn_vertspec_mult` and `btn_vertspec_line` in dedicated panels.
-- Pick positions visually on the live image (click to add a marker).
-- Export marker lists as YAML, alongside the recipe.
+### 3.3 Executor extraction (long_term_architecture Phase 3)
+Move survey/mosaic/scan execution out of the 1,500-line `AutomationRunner`
+QThread into Qt-free executor classes; runner becomes a thread/signal
+shell; a Qt-free `BlockingRecipeRunner` becomes possible for the CLI.
+Do **after** 3.1 so positioning code only moves once.
 
-### 3.2 Spectroscopy on a grid
-- Wrap `btn_spectraongrid` with a UI for defining the grid (origin, spacing,
-  N×M).
-- Auto-name files: `<datestamp>_grid_<i>_<j>.VERT`.
+## 4. Drift correction policy
 
-### 3.3 Spectroscopy recipes
-- Extend `MeasurementRecipe` with a `SpectroscopyStep` type.
-- Allow mixed image+spectroscopy recipes (e.g. "scan, then grid-spec, then
-  scan again").
+Drift at 77 K is reduced but not gone, and several correction strategies
+have been tried over the project's history. Until a best approach is
+chosen, the rules are:
 
-### 3.4 dI/dV imaging
-- Add a panel that runs a normal scan with `Lock-in X` as a recorded channel,
-  with the lock-in configured for bias modulation.
+**Rules**
 
-**Exit criteria:** a user can define a recipe that runs an overview scan,
-records dI/dV grid spectroscopy at picked points, and returns to image scanning
-— all unattended.
+- All drift-estimation/correction logic lives in **one dedicated module
+  area** (target: `scanflow/drift/` when consolidation happens). It must
+  not be intermingled with runner logic, panels, or core controllers.
+- Each strategy sits behind a common, small interface (estimate →
+  proposed correction), so strategies are swappable and comparable.
+- Corrections that move the tip go through `TipMotionManager` and are
+  logged to the acquisition log — no exceptions.
+- Experimental strategies are compared on saved/mock data first
+  (the review's tracking test-dataset idea) before touching the rig.
 
----
+**Inventory of current and former strategies** (so nobody re-invents or
+resurrects one unknowingly):
 
-## Phase 4 — AFM / qPlus support (~1 week)
+| Strategy | Where | Status |
+|---|---|---|
+| 5-point Z-gradient atom tracker | `scanflow/core/atom_tracker.py` + Atom Tracker tab | Working; policy-gated; per-feature, not campaign-wide |
+| Survey zoom re-centring (feature re-detection between zoom iterations) | `runner._do_feature_zoom` | Working, subject to §3.1 |
+| Manufacturer cross-correlation | `STMClient.crosscorr()` passthrough | Available, unused by automation |
+| Z-drift *measurement* (no correction) | `scanflow/core/z_monitor.py` | Working (monitoring only) |
+| Hybrid feature/phase-correlation alignment scans | **removed** — `recipe.from_yaml` still strips its `drift_*` keys from old YAML | Deprecated; do not resurrect without the comparison harness |
+| DSP-side drift feed (`Drift_X/Y[A./sec]` keys) | not implemented | Candidate: lets the instrument correct inline, no alignment scans |
+| Inter-tile drift correction in mosaics | not implemented | The gap §3.2 is about |
 
-**Goal:** the AFM Mode in `stmafm.ini` is fully usable from ScanFlow.
+## 5. Placeholders — deliberately NOT being developed now
 
-### 4.1 PLL / qPlus tuning panel
-- Wrap `AFMController.find_resonance` in a wizard:
-  1. Broad scan → display amplitude vs frequency curve
-  2. Auto-fit + zoom in
-  3. Apply → set centre frequency, enable amplitude control
-- Tune controller bandwidth sliders.
+Mark any future edits in these areas with `PLACEHOLDER(spectroscopy)` /
+`PLACEHOLDER(afm)` comments and keep them minimal.
 
-### 4.2 Feedback channel switcher
-- A clearly labelled toggle between STM (current) and AFM (Δf) feedback,
-  with safety prompts (Z-limit on/off, ramp setpoint slowly).
+- **Spectroscopy.** Works minimally today (`SpectroscopyStep` in recipes,
+  `core/spectroscopy.py` wrappers, `.VERT` saving). It stays at this
+  level for now. When it is eventually developed: the controller work
+  goes in `core/spectroscopy.py`, execution goes in a dedicated
+  spectroscopy executor (after §3.3), and safety polling during spectra —
+  a known gap noted in REVIEW.md — gets addressed at the same time.
+- **AFM / qPlus.** `core/afm.py` exists as a thin wrapper and stays that
+  way. Lower priority than spectroscopy; no panels, no wizards, no
+  feedback-mode switching work until the lab needs it.
 
-### 4.3 dF-Z spectroscopy
-- New spec mode in the spectroscopy panel: ramp Z while logging Δf.
+## 6. Explicit non-goals
 
-**Exit criteria:** the existing manufacturer `STM_AFM_operation.py` and
-`AFM_STM_operation.py` example scripts can both be expressed entirely through
-ScanFlow.
+- **No `.sxm` / SpmImageTycoon export, no format conversion.** The
+  Createc instrument writes `.dat`; that is the lab's data format.
+  Downstream analysis uses tools that read `.dat` directly (ProbeFlow,
+  WSxM, Gwyddion). ScanFlow's job is `.dat` + sidecar metadata, nothing
+  else.
+- **No ML in the control path.** ML may eventually propose actions
+  through the contracts chain (`ProposedAction` → validation), but torch/
+  CLIP/sklearn never become imports of core/automation/gui (enforced).
+- **No new GUI tabs ahead of the executor extraction** — every tab adds
+  COM pollers and lag surface; consolidate first.
 
----
+## 7. Document map
 
-## Phase 5 — Sample mapping & navigation (~1–2 weeks)
-
-**Goal:** track where the tip has been on the sample, and let the user revisit
-previous locations.
-
-### 5.1 Sample map widget
-- A 2-D view of all scans taken in a session, plotted by their absolute
-  offsets (slider position + scan-frame offset).
-- Click a scan → reload its parameters into the **Scan Control** tab.
-
-### 5.2 Coordinate bookkeeping
-- Add an `XYPosition` accumulator that integrates slider pulses (with the
-  user supplying a per-pulse nm calibration).
-- Save the position log to disk so it survives restarts.
-
-### 5.3 "Return to previous location"
-- One-click reverse of slider motion to a prior bookmark.
-
-**Exit criteria:** after moving across the sample for two hours, a user can
-visually identify and re-approach to any earlier scan area.
-
----
-
-## Phase 6 — Robustness & dev experience (~1 week)
-
-**Goal:** ScanFlow can be developed and tested without the instrument, and
-gracefully handles real-world failures.
-
-### 6.1 Mock STM
-- `scanflow.core.mock.MockSTMClient` that simulates the COM API.
-- Generates synthetic images (with controllable drift, noise, atomic lattice).
-- Used by tests and as an offline-mode toggle in the GUI.
-
-### 6.2 Comprehensive tests
-- `pytest-qt` integration to test GUI panels with the mock client.
-- Property-based tests for the recipe builders.
-- Smoke test for every panel (boot, click around, no exceptions).
-
-### 6.3 Error handling
-- Per-call retry policy for COM operations (transient errors are common).
-- Recipe-level "on error" handler: stop / pause / retry / continue.
-- Crash log with the last 1000 lines of the session log.
-
-### 6.4 Settings & preferences
-- `~/.scanflow/config.yaml` with all defaults user-tweakable.
-- Settings dialog in the GUI.
-
-**Exit criteria:** the test suite covers every public method on every
-controller and every GUI panel, all using the mock client.
-
----
-
-## Phase 7 — Smarter drift correction (~2 weeks, research-y)
-
-**Goal:** beat the current phase-cross-correlation approach on tricky surfaces.
-
-### 7.1 Feature-based tracking
-- Optional ORB/SIFT feature matching path for highly textured surfaces.
-- Compare cross-correlation vs feature shift; pick the higher-confidence.
-
-### 7.2 Anisotropic drift model
-- Fit drift rate per axis from the last N corrections.
-- Predict the next drift instead of always doing an alignment scan.
-- Skip alignment scans when prediction confidence is high.
-
-### 7.3 Drift compensation via STM's internal mechanism
-- Wire `Drift_X[A./sec]` and `Drift_Y[A./sec]` into the GUI.
-- Let ScanFlow estimate these and push them to the instrument so the DSP
-  does the correction inline — eliminates the need for alignment scans.
-
-### 7.4 Atomic-resolution drift sub-pixel
-- When the lattice is resolved, use lattice-vector tracking for sub-pixel
-  accuracy (interface with `AiSurf` for lattice extraction).
-
-**Exit criteria:** drift correction works on bias values where features are
-weak, and overnight runs need 30–50% fewer alignment scans.
-
----
-
-## Phase 8 — Integration with the wider ScanFlow ecosystem (~1 week)
-
-**Goal:** ScanFlow feeds clean data into the existing lab tools without manual
-file shuffling.
-
-### 8.1 ProbeFlow handoff
-- Optional folder-watcher that exports finished `.dat` files plus metadata as
-  ProbeFlow-compatible JSON sidecars.
-- Single "Open last scan in ProbeFlow" button.
-
-### 8.2 SpmImageTycoon export
-- Optional batch-export to the `.sxm` format used by SpmImageTycoon.
-
-### 8.3 AiSurf trigger
-- Per-scan checkbox: "auto-analyse lattice with AiSurf" — runs the analysis
-  after each scan and writes the result alongside the `.dat`.
-
-**Exit criteria:** a user can run an overnight session and wake up to scans
-already lattice-analysed, organised by ProbeFlow, with the data ready for
-review.
-
----
-
-## Cross-cutting concerns (continuous)
-
-- **Documentation:** every public method on a controller has a docstring; the
-  README and ROADMAP are kept in sync with reality.
-- **Logging:** every COM call logs at DEBUG; every user-visible action logs
-  at INFO. Daily rotating log file at `~/.scanflow/logs/`.
-- **Performance:** keep the GUI responsive under 1-Hz scan completion rates.
-  Use QThreads for any operation that can block.
-- **Versioning:** SemVer; the recipe YAML format gets a `schema_version` field
-  before the first 1.0 release.
+| Document | Role |
+|---|---|
+| [docs/long_term_architecture.md](docs/long_term_architecture.md) | **Primary** planning reference (phases: 1 ✅ boundaries, 2 ✅ contracts, 3 ⏳ executors, 4+ planned) |
+| `ROADMAP.md` (this file) | Current status, rules, priorities, non-goals |
+| [docs/dependency_architecture.md](docs/dependency_architecture.md) | Dependency boundaries: rules, measurements, enforcement |
+| [REVIEW.md](REVIEW.md) | 2026-06-10 instrument-control review: findings + fix log |
+| [docs/archive/](docs/archive/) | Historical plans — provenance only, never guidance |

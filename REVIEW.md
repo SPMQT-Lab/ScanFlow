@@ -1,7 +1,7 @@
 # ScanFlow Code Review — 2026-06-10
 
 **Scope:** full pass over `scanflow/` (~15k lines), tests, docs, and packaging, following
-`scanflow_review_plan.md`. Reviewed statically plus mock-mode test runs
+the review brief (archived: `docs/archive/2026-06_review_plan.md`). Reviewed statically plus mock-mode test runs
 (`pytest`: 120 passed; 2 failures were a missing `pyqtgraph` in the review
 environment, not code defects). No live-rig validation was possible — items
 marked **[needs rig validation]** must be checked on the CreaTec before the

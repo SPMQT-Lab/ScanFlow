@@ -1,9 +1,10 @@
 # ScanFlow Dependency Architecture
 
 **Status:** boundaries enforced as of 2026-06-10 (see *Enforcement* below).
-**Companion:** `docs/dependency_investigation_brief.md` (the investigation
-brief this work followed), `docs/long_term_architecture.md` (the target
-layered control/analysis/ML architecture), `REVIEW.md` (full code review).
+**Companion:** `docs/long_term_architecture.md` (the target layered
+control/analysis/ML architecture — the primary planning reference),
+`REVIEW.md` (full code review). The investigation brief that prompted this
+work is archived at `docs/archive/2026-06_dependency_investigation_brief.md`.
 
 ## The rule
 

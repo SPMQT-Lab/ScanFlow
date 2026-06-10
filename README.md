@@ -20,6 +20,18 @@ ScanFlow adds the things STMAFM doesn't help with — unattended sweeps,
 automated survey and mosaic campaigns, positioning diagnostics, stability
 monitoring, and a hard tip-crash safety abort.
 
+Data stays in Createc's native `.dat` format (plus ScanFlow's JSON
+sidecars) — downstream analysis uses any `.dat`-capable tool (ProbeFlow,
+WSxM, Gwyddion). Format conversion is an explicit non-goal.
+
+**Planning documents** (in order of authority): current status, working
+rules, and priorities live in [ROADMAP.md](ROADMAP.md); the target
+architecture is [docs/long_term_architecture.md](docs/long_term_architecture.md)
+(the primary planning reference); dependency-boundary rules are in
+[docs/dependency_architecture.md](docs/dependency_architecture.md).
+Anything in [docs/archive/](docs/archive/) is historical and must not
+guide new work.
+
 > **This is instrument-control software.** It changes bias, setpoint, scan
 > frame, spectroscopy state, and XY offset on a live microscope. Test every
 > workflow in mock mode first, and read the *Safety model* section before
@@ -40,6 +52,9 @@ monitoring, and a hard tip-crash safety abort.
 - **Preview / follow-up** — browse incoming scans, detect features
   (ProbeFlow integration), and queue follow-up scans on selected targets.
 - **Spectroscopy steps** — single/multi-point I/V inside recipes.
+  Deliberately minimal: spectroscopy is a placeholder, not a development
+  area right now (see [ROADMAP.md](ROADMAP.md) §5). Same for AFM/qPlus,
+  at even lower priority.
 - **Atom tracker** — 5-point Z-gradient drift tracking around a reference
   feature; all moves go through the motion safety layer.
 - **Z stability & temperature tabs** — rolling ΔZ statistics and cryostat
