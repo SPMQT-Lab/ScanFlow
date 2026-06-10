@@ -105,6 +105,20 @@ def test_no_ml_stack_anywhere_in_control_paths():
         assert not loaded & _ANALYSIS_ML, f"{code!r} loaded {loaded & _ANALYSIS_ML}"
 
 
+def test_drift_package_is_observation_only():
+    """scanflow.drift estimates drift from images — it must not import Qt
+    or the instrument layer (scanflow.core) at import time. Applying
+    corrections is control-layer work and lives elsewhere by design."""
+    loaded = _loaded_top_level_modules("import scanflow.drift")
+    assert "PySide6" not in loaded
+    assert not loaded & _ANALYSIS_ML
+    proc_modules = _loaded_top_level_modules(
+        "import scanflow.drift, sys\n"
+        "assert 'scanflow.core' not in sys.modules, 'drift imported core'"
+    )
+    assert "scanflow" in proc_modules  # the assert inside ran without firing
+
+
 def test_gui_startup_does_not_require_probeflow():
     """The GUI must launch without the optional analysis stack installed.
 

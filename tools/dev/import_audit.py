@@ -37,6 +37,7 @@ ENTRY_PATHS = {
     "scanflow.core": set(),
     "scanflow.automation": set(),
     "scanflow.cli": set(),
+    "scanflow.drift": set(),
     "scanflow.io": set(),
     "scanflow.gui.main_window": {"PySide6", "pyqtgraph"},
 }

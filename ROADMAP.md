@@ -97,10 +97,16 @@ chosen, the rules are:
 **Rules**
 
 - All drift-estimation/correction logic lives in **one dedicated module
-  area** (target: `scanflow/drift/` when consolidation happens). It must
-  not be intermingled with runner logic, panels, or core controllers.
-- Each strategy sits behind a common, small interface (estimate →
-  proposed correction), so strategies are swappable and comparable.
+  area**: `scanflow/drift/` (created 2026-06-11; import-boundary
+  enforced — no Qt, no instrument imports). It must not be intermingled
+  with runner logic, panels, or core controllers. The legacy in-place
+  strategies (atom tracker, survey re-centring) migrate here during the
+  Phase 3 extraction.
+- Each strategy implements the one `DriftEstimator` interface
+  (`estimate(before, after, nm_per_px) → DriftEstimate` with ok /
+  confidence / refusal reason), so strategies are swappable and
+  comparable. Estimation only — applying a correction is control-layer
+  work (TipMotionManager / proposals), wired up after B2.
 - Corrections that move the tip go through `TipMotionManager` and are
   logged to the acquisition log — no exceptions.
 - Experimental strategies are compared on saved/mock data first, before
@@ -118,7 +124,9 @@ resurrects one unknowingly):
 
 | Strategy | Where | Status |
 |---|---|---|
-| 5-point Z-gradient atom tracker | `scanflow/core/atom_tracker.py` + Atom Tracker tab | Working; policy-gated; per-feature, not campaign-wide |
+| Feature-match estimator (nearest-neighbour median shift) | `scanflow/drift/estimators.py` | **New (estimation-only)**: sub-0.1 px on sparse molecules; refuses on lattices/low contrast |
+| Phase-correlation estimator (windowed, sub-pixel) | `scanflow/drift/estimators.py` | **New (estimation-only)**: works on lattices/texture; refuses on non-overlap |
+| 5-point Z-gradient atom tracker | `scanflow/core/atom_tracker.py` + Atom Tracker tab | Working; policy-gated; per-feature, not campaign-wide; migrates to `scanflow/drift/` in Phase 3 |
 | Survey zoom re-centring (feature re-detection between zoom iterations) | `runner._do_feature_zoom` | Working, subject to §3.1 |
 | Manufacturer cross-correlation | `STMClient.crosscorr()` passthrough | Available, unused by automation |
 | Z-drift *measurement* (no correction) | `scanflow/core/z_monitor.py` | Working (monitoring only) |
