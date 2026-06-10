@@ -149,6 +149,10 @@ readable. ProbeFlow consumes these sidecars directly.
 ```
 scanflow/
 ├── __main__.py / cli.py     # GUI if no args, else argparse CLI
+├── contracts/               # stdlib-only shared data models:
+│   │                        #   coordinate frames, ScanRecord (= sidecar),
+│   │                        #   Feature/AnalysisResult,
+│   │                        #   ProposedAction -> Validation -> ValidatedAction
 ├── core/                    # CreaTec COM facade (setp/getp, SI units)
 │   ├── stm_client.py        #   thread-local COM proxies, connect/bind/retry policy
 │   ├── scan.py              #   ScanController — params, start/stop/save, offsets

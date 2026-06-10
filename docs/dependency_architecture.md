@@ -14,14 +14,28 @@ layered control/analysis/ML architecture), `REVIEW.md` (full code review).
 Layer rules (no arrow may point upward):
 
 ```
-core        -> stdlib, numpy           (NO Qt, NO analysis/ML)
-automation  -> core, pyyaml, numpy     (Qt only inside runner.py / workers/)
-io          -> stdlib                  (pptx lazy inside pptx_export)
+contracts   -> stdlib ONLY             (the shared data models — every layer
+                                        may import it; it imports nothing)
+core        -> contracts, stdlib, numpy   (NO Qt, NO analysis/ML)
+automation  -> core, contracts, pyyaml, numpy  (Qt only in runner.py / workers/)
+io          -> contracts, stdlib       (pptx lazy inside pptx_export)
 gui         -> PySide6, pyqtgraph      (ProbeFlow/analysis lazy, on demand)
-analysis    -> scikit-image (lazy), ProbeFlow (lazy)  — optional extras
-ml          -> torch/CLIP/sklearn      — extras only, never imported by scanflow
+analysis    -> contracts + scikit-image (lazy), ProbeFlow (lazy) — extras
+ml          -> contracts + torch/CLIP/sklearn — extras only, never imported
 createc     -> pywin32                 — Windows lab PC only
 ```
+
+**Contracts (Phase 2 of docs/long_term_architecture.md — done 2026-06-10):**
+`scanflow/contracts/` holds the cross-layer data models — coordinate-frame
+identifiers (every position names its frame; bare tuples with implicit
+conventions are how the positioning bugs happened), `ScanRecord` (the
+in-memory form of the `scanflow.acquisition.v1` sidecar — the sidecar
+writer serialises it, so there is one schema, not two), `Feature` /
+`AnalysisResult`, and the `ProposedAction` → `ValidationResult` →
+`ValidatedAction` authority chain. Validation lives in the control layer
+(`scanflow/automation/proposals.py`); only validated actions become recipe
+steps. First consumer: the preview follow-up worker validates every
+operator-selected target through this path before any motion.
 
 ## Dependency classification (pyproject.toml)
 

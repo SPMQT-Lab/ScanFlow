@@ -33,6 +33,7 @@ HEAVY = {
 # tests/test_import_boundaries.py (the enforced version of this table).
 ENTRY_PATHS = {
     "scanflow": set(),
+    "scanflow.contracts": set(),   # must additionally stay numpy/yaml-free
     "scanflow.core": set(),
     "scanflow.automation": set(),
     "scanflow.cli": set(),

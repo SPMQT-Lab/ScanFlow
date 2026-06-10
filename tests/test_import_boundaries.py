@@ -46,6 +46,21 @@ def _loaded_top_level_modules(code: str) -> set[str]:
     raise AssertionError(f"marker line not found in output:\n{proc.stdout}")
 
 
+def test_contracts_is_stdlib_only():
+    """scanflow.contracts is the stabilising layer every other layer may
+    import — it must depend on nothing but the standard library (not even
+    numpy), so analysis/ML tools can consume it in any environment.
+    """
+    loaded = _loaded_top_level_modules("import scanflow.contracts")
+    forbidden = {"numpy", "yaml", "PySide6", "pyqtgraph"} | _ANALYSIS_ML
+    assert not loaded & forbidden, (
+        f"scanflow.contracts loaded {sorted(loaded & forbidden)} — "
+        "it must stay stdlib-only"
+    )
+    # And it must not pull in other scanflow layers either.
+    assert "scanflow" in loaded  # sanity: the import actually happened
+
+
 def test_core_is_qt_free():
     loaded = _loaded_top_level_modules("import scanflow.core")
     assert "PySide6" not in loaded, (

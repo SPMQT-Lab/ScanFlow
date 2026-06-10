@@ -24,6 +24,11 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
+from scanflow.contracts import (
+    CREATEC_SCAN_OFFSET_NM,
+    IMAGE_CENTER_RELATIVE_NM,
+    ProposedAction,
+)
 from scanflow.core import (
     STMClient,
     ScanParams,
@@ -37,6 +42,8 @@ from scanflow.core.scan import (
     format_duration as _format_duration,
 )
 from scanflow.core.scan_geometry import feature_target_xy_nm
+from scanflow.automation.proposals import validate_proposed_action
+from scanflow.automation.recipe import MIN_CONST_CURRENT_BIAS_V
 
 from .paths import unique_dat_path
 
@@ -121,7 +128,9 @@ class FeatureScanWorker(QThread):
                     if self._size_nm is not None
                     else current.size_nm
                 )
-                if self._home_nm is not None and self._scan_range_nm is not None:
+                use_absolute = (self._home_nm is not None
+                                and self._scan_range_nm is not None)
+                if use_absolute:
                     home_x, home_y = self._home_nm
                     abs_target_x, abs_target_y = feature_target_xy_nm(
                         home_x_nm=home_x,
@@ -131,6 +140,41 @@ class FeatureScanWorker(QThread):
                         feature_dy_nm=row.dy_nm,
                         frame_height_nm=scan_size_for_move[1],
                     )
+
+                # Contract boundary: every follow-up target goes through
+                # the control core's proposal validation before any motion
+                # (kind/frame/bias/setpoint checks; the dynamic checks stay
+                # in TipMotionManager below). The operator already selected
+                # these targets in the preview panel, which is the operator
+                # approval for this path.
+                proposal = ProposedAction(
+                    action_id=f"preview-target-{row.index + 1}",
+                    source_analysis_id=str(self._source_path),
+                    kind="scan_region",
+                    reason="operator-selected preview follow-up",
+                    target_nm=((abs_target_x, abs_target_y) if use_absolute
+                               else (row.dx_nm, row.dy_nm)),
+                    frame=(CREATEC_SCAN_OFFSET_NM if use_absolute
+                           else IMAGE_CENTER_RELATIVE_NM),
+                    size_nm=scan_size_for_move,
+                    bias_V=biases[0],
+                    setpoint_A=setpoint_A,
+                    pixels=current.pixels,
+                    speed_nm_s=current.speed_nm_s,
+                    requires_operator_confirmation=False,
+                    source="preview_panel_operator_selection",
+                )
+                verdict = validate_proposed_action(proposal)
+                for warning in verdict.warnings:
+                    log.warning("Target %d/%d: %s", row.index + 1, total, warning)
+                if not verdict.ok:
+                    msg = (f"target {row.index + 1} rejected by control "
+                           f"validation: {'; '.join(verdict.errors)}")
+                    log.warning("%s — skipping target", msg)
+                    self.failed.emit(msg)
+                    continue
+
+                if use_absolute:
                     log.info(
                         "Feature scan target %d/%d: absolute move → (%.3f, %.3f) nm  "
                         "[home (%.3f, %.3f)  Δ=(%.3f, %.3f)]",
@@ -190,6 +234,18 @@ class FeatureScanWorker(QThread):
                 for rep_idx, b in enumerate(biases):
                     if self._stop_requested:
                         break
+                    # 0 V guard per sequence entry — validation above only
+                    # checked the first bias; a sweep can contain others.
+                    if not current.const_height and abs(b) < MIN_CONST_CURRENT_BIAS_V:
+                        msg = (
+                            f"target {row.index + 1} rep {rep_idx + 1}: "
+                            f"|bias|={abs(b) * 1000:.2f} mV below the "
+                            f"{MIN_CONST_CURRENT_BIAS_V * 1000:.1f} mV "
+                            "constant-current guard — skipping this repetition"
+                        )
+                        log.warning(msg)
+                        self.failed.emit(msg)
+                        continue
                     rep_label = (
                         f"b{rep_idx + 1}/{len(biases)}" if self._bias_sequence
                         else f"rep{rep_idx + 1}/{len(biases)}"
