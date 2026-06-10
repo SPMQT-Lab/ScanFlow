@@ -79,6 +79,66 @@ class ProposedAction:
             require_known_frame(self.frame,
                                 context=f"ProposedAction {self.action_id!r}")
 
+    # ------------------------------------------------------------------
+    # JSON payloads — cross-process hand-off format (an external planner
+    # may write proposals to disk for the operator to review in ScanFlow).
+    # ------------------------------------------------------------------
+
+    def to_payload(self) -> dict:
+        def _pair(v):
+            return list(v) if v is not None else None
+
+        return {
+            "action_id": self.action_id,
+            "source_analysis_id": self.source_analysis_id,
+            "kind": self.kind,
+            "reason": self.reason,
+            "confidence": self.confidence,
+            "target_nm": _pair(self.target_nm),
+            "frame": self.frame,
+            "size_nm": _pair(self.size_nm),
+            "bias_V": self.bias_V,
+            "setpoint_A": self.setpoint_A,
+            "pixels": _pair(self.pixels),
+            "speed_nm_s": self.speed_nm_s,
+            "spectroscopy_points_nm": (
+                [list(p) for p in self.spectroscopy_points_nm]
+                if self.spectroscopy_points_nm is not None else None
+            ),
+            "requires_operator_confirmation": self.requires_operator_confirmation,
+            "source": self.source,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict) -> "ProposedAction":
+        def _tuple(key):
+            v = payload.get(key)
+            return tuple(v) if v is not None else None
+
+        spec_points = payload.get("spectroscopy_points_nm")
+        return cls(
+            action_id=payload.get("action_id", ""),
+            source_analysis_id=payload.get("source_analysis_id", ""),
+            kind=payload["kind"],
+            reason=payload.get("reason", ""),
+            confidence=payload.get("confidence"),
+            target_nm=_tuple("target_nm"),
+            frame=payload.get("frame"),
+            size_nm=_tuple("size_nm"),
+            bias_V=payload.get("bias_V"),
+            setpoint_A=payload.get("setpoint_A"),
+            pixels=_tuple("pixels"),
+            speed_nm_s=payload.get("speed_nm_s"),
+            spectroscopy_points_nm=(
+                [tuple(p) for p in spec_points]
+                if spec_points is not None else None
+            ),
+            requires_operator_confirmation=bool(
+                payload.get("requires_operator_confirmation", True)
+            ),
+            source=payload.get("source", ""),
+        )
+
 
 @dataclass
 class ValidationResult:

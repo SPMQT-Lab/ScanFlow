@@ -175,3 +175,34 @@ def build_validated_action(
         recipe_steps=steps,
         validation=validation,
     )
+
+
+def validated_actions_to_recipe(
+    actions: list[ValidatedAction],
+    *,
+    name: str = "Validated proposals",
+    save_folder: str = "",
+) -> "MeasurementRecipe":
+    """Bundle validated actions into a runnable MeasurementRecipe.
+
+    NOTE (until the Phase 3 executor extraction): the recipe's ScanSteps
+    carry parameters but NOT the motion to each action's ``target_nm`` —
+    moving there is performed by position-aware executors through
+    TipMotionManager (today: the preview follow-up worker pattern).
+    Running this recipe as-is scans at the current frame position, which
+    is correct only for ``rescan_current_region``-style use. The
+    end-to-end target chain is tested up to this point in
+    tests/test_analysis_handoff.py.
+    """
+    from scanflow.automation.recipe import MeasurementRecipe
+
+    recipe = MeasurementRecipe(name=name, save_folder=save_folder)
+    for validated in actions:
+        if validated.validation is None or not validated.validation.ok:
+            raise ValueError(
+                f"action {validated.action_id} is not validated — refuse to "
+                "build a recipe from it"
+            )
+        for step in validated.recipe_steps:
+            recipe.add_step(step)
+    return recipe

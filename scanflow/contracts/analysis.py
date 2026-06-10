@@ -65,3 +65,63 @@ class AnalysisResult:
     features: list[Feature] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     quality_metrics: dict[str, float] = field(default_factory=dict)
+
+    # ------------------------------------------------------------------
+    # JSON payloads — the cross-process hand-off format. An ML detector
+    # running in its own environment writes this next to the sidecar;
+    # ScanFlow-side planners/GUI read it back. Keep stable.
+    # ------------------------------------------------------------------
+
+    def to_payload(self) -> dict:
+        return {
+            "schema": self.schema,
+            "analysis_id": self.analysis_id,
+            "input_scan_id": self.input_scan_id,
+            "algorithm": self.algorithm,
+            "algorithm_version": self.algorithm_version,
+            "created_at": self.created_at,
+            "features": [
+                {
+                    "feature_id": f.feature_id,
+                    "x_nm": f.x_nm,
+                    "y_nm": f.y_nm,
+                    "frame": f.frame,
+                    "bbox_nm": list(f.bbox_nm) if f.bbox_nm is not None else None,
+                    "label": f.label,
+                    "confidence": f.confidence,
+                    "source": f.source,
+                    "source_version": f.source_version,
+                }
+                for f in self.features
+            ],
+            "warnings": list(self.warnings),
+            "quality_metrics": dict(self.quality_metrics),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict) -> "AnalysisResult":
+        features = [
+            Feature(
+                feature_id=f.get("feature_id", ""),
+                x_nm=f["x_nm"],
+                y_nm=f["y_nm"],
+                frame=f["frame"],
+                bbox_nm=tuple(f["bbox_nm"]) if f.get("bbox_nm") else None,
+                label=f.get("label"),
+                confidence=f.get("confidence"),
+                source=f.get("source", ""),
+                source_version=f.get("source_version", ""),
+            )
+            for f in payload.get("features", [])
+        ]
+        return cls(
+            analysis_id=payload.get("analysis_id", ""),
+            input_scan_id=payload.get("input_scan_id", ""),
+            algorithm=payload.get("algorithm", ""),
+            algorithm_version=payload.get("algorithm_version", ""),
+            created_at=payload.get("created_at", ""),
+            schema=payload.get("schema", ANALYSIS_RESULT_SCHEMA),
+            features=features,
+            warnings=list(payload.get("warnings", [])),
+            quality_metrics=dict(payload.get("quality_metrics", {})),
+        )

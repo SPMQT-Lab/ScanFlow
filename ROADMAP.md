@@ -170,5 +170,6 @@ Mark any future edits in these areas with `PLACEHOLDER(spectroscopy)` /
 | [docs/long_term_architecture.md](docs/long_term_architecture.md) | **Primary** planning reference (phases: 1 ✅ boundaries, 2 ✅ contracts, 3 ⏳ executors, 4+ planned) |
 | `ROADMAP.md` (this file) | Current status, rules, priorities, non-goals |
 | [docs/dependency_architecture.md](docs/dependency_architecture.md) | Dependency boundaries: rules, measurements, enforcement |
+| [docs/analysis_ml_handoff.md](docs/analysis_ml_handoff.md) | How analysis/ML plug in via contracts (detector/planner guide) |
 | [REVIEW.md](REVIEW.md) | 2026-06-10 instrument-control review: findings + fix log |
 | [docs/archive/](docs/archive/) | Historical plans — provenance only, never guidance |

@@ -168,6 +168,9 @@ scanflow/
 │   │                        #   coordinate frames, ScanRecord (= sidecar),
 │   │                        #   Feature/AnalysisResult,
 │   │                        #   ProposedAction -> Validation -> ValidatedAction
+├── analysis/                # detectors + planners (hardware/control-free;
+│                            #   see docs/analysis_ml_handoff.md)
+├── drift/                   # drift estimators (observation-only)
 ├── core/                    # CreaTec COM facade (setp/getp, SI units)
 │   ├── stm_client.py        #   thread-local COM proxies, connect/bind/retry policy
 │   ├── scan.py              #   ScanController — params, start/stop/save, offsets

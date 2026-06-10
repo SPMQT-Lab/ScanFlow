@@ -8,7 +8,10 @@
 > Phase progress (§14): Phase 1 (package boundaries) ✅ done ·
 > Phase 2 (contracts) ✅ done — `scanflow/contracts/` +
 > `scanflow/automation/proposals.py` · Phase 3 (Qt-free execution) ⏳ next,
-> gated on the `FIXME(B2-frame-resize)` rig experiment · Phases 4–7 planned.
+> gated on the `FIXME(B2-frame-resize)` rig experiment · Phase 4
+> (analysis namespace) ⏳ started — `scanflow/analysis/` with detector/
+> planner interfaces and the hand-off chain demonstrated end-to-end
+> (docs/analysis_ml_handoff.md) · Phases 5–7 planned.
 
 **Purpose:** propose a clean long-term architecture for ScanFlow and related lab software so that STM control remains safe, simple, and maintainable, while image analysis and ML modules can evolve independently.
 

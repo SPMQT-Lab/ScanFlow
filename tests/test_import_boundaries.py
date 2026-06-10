@@ -105,6 +105,21 @@ def test_no_ml_stack_anywhere_in_control_paths():
         assert not loaded & _ANALYSIS_ML, f"{code!r} loaded {loaded & _ANALYSIS_ML}"
 
 
+def test_analysis_package_is_hardware_and_control_free():
+    """scanflow.analysis observes and proposes — importing it must load
+    neither Qt, nor the instrument layer (scanflow.core), nor the control
+    layer (scanflow.automation). It talks to them only via contracts."""
+    loaded = _loaded_top_level_modules("import scanflow.analysis")
+    assert "PySide6" not in loaded
+    assert not loaded & {"torch", "torchvision", "clip", "sklearn", "cv2"}
+    _loaded_top_level_modules(
+        "import scanflow.analysis, sys\n"
+        "assert 'scanflow.core' not in sys.modules, 'analysis imported core'\n"
+        "assert 'scanflow.automation' not in sys.modules, "
+        "'analysis imported the control layer'"
+    )
+
+
 def test_drift_package_is_observation_only():
     """scanflow.drift estimates drift from images — it must not import Qt
     or the instrument layer (scanflow.core) at import time. Applying

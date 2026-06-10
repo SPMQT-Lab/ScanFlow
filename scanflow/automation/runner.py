@@ -28,7 +28,7 @@ from scanflow.automation.recipe import (
 )
 from scanflow.automation.survey import SurveyConfig, FeatureRecord, SurveyManifest
 from scanflow.automation.mosaic import MosaicConfig, tile_targets_nm
-from scanflow.automation.feature_discovery import discover_features, FeatureCandidate
+from scanflow.analysis.feature_discovery import discover_features, FeatureCandidate
 from scanflow.automation.scan_metrics import compute_z_stability, format_z_stability
 from scanflow.io.acquisition_log import AcquisitionLog, default_acquisition_log_path
 from scanflow.io.sidecar import (
@@ -1690,7 +1690,7 @@ def _save_image_preview(arr: np.ndarray, path: Path) -> Optional[Path]:
         import matplotlib
         matplotlib.use("Agg")  # headless backend
         import matplotlib.pyplot as plt
-        from scanflow.automation.feature_discovery import _level_correct
+        from scanflow.analysis.feature_discovery import _level_correct
 
         levelled = _level_correct(arr.astype(float))
         fig, ax = plt.subplots(figsize=(4, 4), dpi=150)
@@ -1717,7 +1717,7 @@ def _save_overview_preview(
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         from matplotlib.patches import Rectangle
-        from scanflow.automation.feature_discovery import _level_correct
+        from scanflow.analysis.feature_discovery import _level_correct
 
         levelled = _level_correct(arr.astype(float))
         fig, ax = plt.subplots(figsize=(6, 6), dpi=150)

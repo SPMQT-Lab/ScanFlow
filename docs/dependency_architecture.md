@@ -18,10 +18,15 @@ Layer rules (no arrow may point upward):
 contracts   -> stdlib ONLY             (the shared data models — every layer
                                         may import it; it imports nothing)
 core        -> contracts, stdlib, numpy   (NO Qt, NO analysis/ML)
-automation  -> core, contracts, pyyaml, numpy  (Qt only in runner.py / workers/)
+automation  -> core, contracts, pyyaml, numpy  (Qt only in runner.py / workers/;
+                                        also analysis.feature_discovery — an
+                                        acknowledged interim arrow while the
+                                        survey lives inside the runner; goes
+                                        away with the Phase 3 extraction)
 io          -> contracts, stdlib       (pptx lazy inside pptx_export)
 gui         -> PySide6, pyqtgraph      (ProbeFlow/analysis lazy, on demand)
-analysis    -> contracts + scikit-image (lazy), ProbeFlow (lazy) — extras
+analysis    -> contracts, numpy, scikit-image (lazy)  (scanflow/analysis —
+                                        NO Qt, NO core, NO automation)
 ml          -> contracts + torch/CLIP/sklearn — extras only, never imported
 createc     -> pywin32                 — Windows lab PC only
 ```

@@ -36,6 +36,7 @@ ENTRY_PATHS = {
     "scanflow.contracts": set(),   # must additionally stay numpy/yaml-free
     "scanflow.core": set(),
     "scanflow.automation": set(),
+    "scanflow.analysis": set(),
     "scanflow.cli": set(),
     "scanflow.drift": set(),
     "scanflow.io": set(),

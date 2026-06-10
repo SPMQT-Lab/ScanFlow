@@ -87,7 +87,7 @@ class FeatureMatchDriftEstimator:
 
     def estimate(self, before: np.ndarray, after: np.ndarray,
                  nm_per_px: float) -> DriftEstimate:
-        from scanflow.automation.feature_discovery import discover_features
+        from scanflow.analysis.feature_discovery import discover_features
 
         feats_a = discover_features(before, nm_per_px,
                                     max_features=self.max_features)
@@ -153,7 +153,7 @@ class PhaseCorrelationDriftEstimator:
 
     def estimate(self, before: np.ndarray, after: np.ndarray,
                  nm_per_px: float) -> DriftEstimate:
-        from scanflow.automation.feature_discovery import _level_correct
+        from scanflow.analysis.feature_discovery import _level_correct
 
         if before.shape != after.shape:
             return _failed(self.name, self.version,

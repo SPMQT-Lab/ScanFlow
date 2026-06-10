@@ -10,7 +10,7 @@ from .recipe import (
 )
 from .survey import SurveyConfig, FeatureRecord, SurveyManifest
 from .mosaic import MosaicConfig, tile_centers_in_wide_pixels
-from .feature_discovery import FeatureCandidate, discover_features
+from scanflow.analysis.feature_discovery import FeatureCandidate, discover_features
 
 __all__ = [
     "MeasurementRecipe",
