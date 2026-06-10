@@ -67,10 +67,13 @@ They are enforced by `tests/test_import_boundaries.py` and
 ## 3. Immediate priorities (in order)
 
 ### 3.1 Resolve the frame-resize convention question (gates everything positional)
-One manual experiment on the rig: place the frame over a visible feature,
-halve `SCAN.IMAGESIZE.NM.Y`, observe whether the top edge or the centre
-is preserved. Survey and mosaic currently embody *contradictory*
-assumptions; at most one is right. Flagged in code as
+One ~10-minute experiment at the rig. **The kit is ready:** run
+`python -m scanflow diag frame-resize` and follow the prompts — it
+records all offset readbacks, takes confirmed before/after scans,
+restores the frame, and writes a JSON report. Protocol, interpretation,
+and the fix decision tree: [docs/b2_frame_resize_experiment.md](docs/b2_frame_resize_experiment.md).
+Survey and mosaic currently embody *contradictory* assumptions about
+what a resize preserves; at most one is right. Flagged in code as
 `FIXME(B2-frame-resize)` (runner / scan_geometry / mock_dispatch),
 guarded by `tests/test_open_findings.py`. Afterwards: unify all
 positioning on `scan_geometry` helpers and encode the verified behaviour

@@ -817,7 +817,10 @@ class AutomationRunner(QThread):
         ~57 nm for the default 120 nm wide / 5 nm zoom, i.e. the feature is
         not in the zoom frame at all.
 
-        To resolve (one manual experiment on the CreaTec):
+        To resolve, run the prepared experiment at the rig:
+        ``python -m scanflow diag frame-resize`` — protocol and the fix
+        decision tree are in docs/b2_frame_resize_experiment.md. Manual
+        equivalent:
           1. Park the scan frame over a visible feature, note
              SCAN.OFFSET.Y.NM and where the feature sits in the image.
           2. Halve SCAN.IMAGESIZE.NM.Y and rescan without moving the offset.

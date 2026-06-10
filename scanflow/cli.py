@@ -234,6 +234,31 @@ def cmd_run(a) -> int:
         stm.disconnect()
 
 
+def cmd_diag_frame_resize(a) -> int:
+    """Operator-guided experiment for the B2 frame-resize question."""
+    from scanflow.diagnostics import run_frame_resize_experiment
+
+    stm = _connect(a.mock)
+    try:
+        report = run_frame_resize_experiment(
+            stm,
+            shrink_factor=a.shrink_factor,
+            with_scans=not a.no_scans,
+            save_folder=a.save_folder or "frame_resize_diag",
+            interactive=not a.no_input,
+        )
+    finally:
+        stm.disconnect()
+    derived = report.get("derived")
+    if derived:
+        print(f"\nOffset-Y readback shift: "
+              f"{derived['offset_y_readback_shift_nm']:+.3f} nm "
+              f"(centre-preserved predicts "
+              f"{derived['expected_shift_if_centre_preserved_nm']:+.3f}, "
+              f"top-edge-preserved predicts +0.000)")
+    return 0
+
+
 def cmd_estimate(a) -> int:
     """Print the plan without connecting or running."""
     if a.kind == "bias":
@@ -302,6 +327,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--mock", action="store_true", help="Use mock STM")
     p_run.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
     p_run.set_defaults(func=cmd_run)
+
+    # diagnostics (operator-guided rig experiments)
+    p_diag = sub.add_parser("diag", help="Operator-guided rig diagnostics")
+    diag_sub = p_diag.add_subparsers(dest="what", required=True)
+    p_fr = diag_sub.add_parser(
+        "frame-resize",
+        help="Resolve the B2 frame-resize convention question "
+             "(docs/b2_frame_resize_experiment.md)",
+    )
+    p_fr.add_argument("--mock", action="store_true", help="Use mock STM")
+    p_fr.add_argument("--shrink-factor", type=float, default=2.0,
+                      help="Frame-height divisor for the resize step (default 2)")
+    p_fr.add_argument("--no-scans", action="store_true",
+                      help="Skip the before/after scans (offset readbacks only)")
+    p_fr.add_argument("--no-input", action="store_true",
+                      help="Non-interactive: auto-confirm every step (mock/testing)")
+    p_fr.add_argument("--save-folder", default="",
+                      help="Report/scan output folder (default ./frame_resize_diag)")
+    p_fr.set_defaults(func=cmd_diag_frame_resize)
 
     # estimate (no execution)
     p_est = sub.add_parser("estimate", help="Estimate run time without scanning")
