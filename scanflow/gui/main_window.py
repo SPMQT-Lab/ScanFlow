@@ -19,7 +19,6 @@ from PySide6.QtGui import QAction, QIcon, QPixmap
 from scanflow.core import STMClient
 from scanflow.io import Session
 from scanflow.gui.panels.sweep_panel import SweepPanel
-from scanflow.gui.panels.survey_panel import SurveyPanel
 from scanflow.gui.panels.mosaic_panel import MosaicPanel
 from scanflow.gui.panels.preview_panel import PreviewWindow
 from scanflow.gui.panels.z_stability_panel import ZStabilityPanel
@@ -88,7 +87,6 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self._tabs)
 
         self._sweep = SweepPanel(self._stm)
-        self._survey = SurveyPanel(self._stm)
         self._mosaic = MosaicPanel(self._stm)
         self._preview_window = PreviewWindow(self._stm, self)
         self._positioning_diag = PositioningDiagPanel(self._stm)
@@ -104,7 +102,6 @@ class MainWindow(QMainWindow):
         self._log = LogPanel()
 
         self._tabs.addTab(self._sweep, "Sweep")
-        self._tabs.addTab(self._survey, "Survey")
         self._tabs.addTab(self._mosaic, "Mosaic")
         self._tabs.addTab(self._positioning_diag, "Positioning Test")
         self._tabs.addTab(self._z_stability, "Z Stability")
@@ -114,8 +111,6 @@ class MainWindow(QMainWindow):
 
         self._sweep.log_message.connect(self._log.append)
         self._sweep.error_message.connect(self._log.append_error)
-        self._survey.log_message.connect(self._log.append)
-        self._survey.error_message.connect(self._log.append_error)
         self._mosaic.log_message.connect(self._log.append)
         self._mosaic.error_message.connect(self._log.append_error)
         self._preview_window.log_message.connect(self._log.append)
@@ -127,13 +122,9 @@ class MainWindow(QMainWindow):
         self._atom_tracker.error_message.connect(self._log.append_error)
 
         self._sweep.scan_completed.connect(self._preview_window.handle_scan_completed)
-        self._survey.scan_completed.connect(self._preview_window.handle_scan_completed)
         self._mosaic.scan_completed.connect(self._preview_window.handle_scan_completed)
         self._preview_window.scan_completed.connect(self._log.append)
         self._sweep.scan_completed.connect(
-            lambda _: self._atom_tracker.handle_scan_completed()
-        )
-        self._survey.scan_completed.connect(
             lambda _: self._atom_tracker.handle_scan_completed()
         )
 
@@ -155,7 +146,7 @@ class MainWindow(QMainWindow):
             self._stm_label.setText("STM: connected")
             self._log.append("Connected to STMAFM")
             self._sweep.load_from_stm()
-            self._survey.load_from_stm()
+            self._temp_poller.poll_now()
             QMessageBox.information(
                 self, "STM Connected",
                 "Successfully connected to the CreaTec STMAFM software."
@@ -174,6 +165,7 @@ class MainWindow(QMainWindow):
         if self._stm.connect_mock():
             self._stm_label.setText("STM: mock")
             self._log.append("Mock STM connected (offline simulation)")
+            self._temp_poller.poll_now()
 
     def _disconnect_stm(self) -> None:
         self._stm.disconnect()
@@ -223,5 +215,11 @@ class MainWindow(QMainWindow):
         self._preview_window.show_window()
 
     def closeEvent(self, event) -> None:
+        # Stop any running automation first so Createc receives scan.stop()
+        # before the COM apartment is torn down. Without this, Createc keeps
+        # scanning indefinitely after ScanFlow exits.
+        self._sweep.stop_for_close()
+        self._temp_poller.stop()
+        self._z_monitor.stop()
         self._session.save()
         super().closeEvent(event)

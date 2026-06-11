@@ -115,14 +115,6 @@ class ScanExecutor:
         return True
 
 
-class SurveyExecutor:
-    """Placeholder for the Qt-free survey algorithm extraction."""
-
-    def __init__(self, context: ExecutorContext, scan: ScanExecutor) -> None:
-        self.context = context
-        self.scan = scan
-
-
 class MosaicExecutor:
     """Placeholder for the Qt-free mosaic algorithm extraction."""
 

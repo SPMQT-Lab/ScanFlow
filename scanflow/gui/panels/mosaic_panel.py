@@ -18,10 +18,12 @@ Workflow when Start is pressed:
 
 from __future__ import annotations
 
+import datetime
+import time
 from pathlib import Path
 from typing import List
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Signal, QTimer
 from PySide6.QtWidgets import (
     QCheckBox, QDoubleSpinBox, QFileDialog, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton,
@@ -48,7 +50,13 @@ class MosaicPanel(QWidget):
         self._stm = stm
         self._runner: AutomationRunner | None = None
         self._last_output: Path | None = None
+        self._run_start_t: float | None = None
+        self._total_steps_eta: int = 0
+        self._recipe_eta: MeasurementRecipe | None = None
         self._build_ui()
+        self._eta_timer = QTimer(self)
+        self._eta_timer.setInterval(60_000)
+        self._eta_timer.timeout.connect(self._refresh_eta_from_runner)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -79,6 +87,10 @@ class MosaicPanel(QWidget):
 
         self._status = QLabel("Ready")
         root.addWidget(self._status)
+
+        self._time_label = QLabel("")
+        self._time_label.setStyleSheet("color: #555; font-style: italic;")
+        root.addWidget(self._time_label)
         root.addStretch(1)
 
         # ── Connect signals ─────────────────────────────────────────────
@@ -503,6 +515,11 @@ class MosaicPanel(QWidget):
         self._runner.info_message.connect(self.log_message)
         self._runner.start()
 
+        self._run_start_t = time.time()
+        self._total_steps_eta = n_tiles + 2
+        self._recipe_eta = recipe
+        self._time_label.setText("")
+        self._eta_timer.start()
         self._progress.setMaximum(n_tiles + 2)
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
@@ -550,10 +567,14 @@ class MosaicPanel(QWidget):
             self._progress.setMaximum(total)
             self._progress.setValue(current)
         self._status.setText(label)
+        self._update_eta(current, total)
 
     def _on_state(self, state) -> None:
         self._status.setText(state.name.capitalize())
         if state in (RunnerState.FINISHED, RunnerState.ERROR, RunnerState.IDLE):
+            self._eta_timer.stop()
+            self._time_label.setText("")
+            self._run_start_t = None
             self._start_btn.setEnabled(True)
             self._stop_btn.setEnabled(False)
             self._force_quit_btn.setEnabled(False)
@@ -561,6 +582,37 @@ class MosaicPanel(QWidget):
 
     def _on_settling(self, remaining_s: int, label: str) -> None:
         self._status.setText(f"{label} — {remaining_s} s")
+
+    def _refresh_eta_from_runner(self) -> None:
+        if self._runner is None:
+            return
+        current = self._runner._current_step_index or 0
+        self._update_eta(current, self._total_steps_eta)
+
+    def _update_eta(self, completed: int, total: int) -> None:
+        if self._run_start_t is None or total == 0:
+            return
+        elapsed = time.time() - self._run_start_t
+        # progress(N) fires at step N *start*, so only N-1 steps have actually finished
+        finished = max(completed - 1, 0)
+        if finished > 0:
+            pace_s = elapsed / finished
+            remaining_s = (total - finished) * pace_s
+        elif self._recipe_eta is not None:
+            remaining_s = max(0.0, self._recipe_eta.estimate_duration_s() - elapsed)
+        else:
+            return
+        remaining_s = max(0.0, remaining_s)
+        if remaining_s < 60:
+            rem_str = "< 1 min"
+        elif remaining_s < 3600:
+            rem_str = f"~{int(remaining_s / 60)}m"
+        else:
+            h = int(remaining_s / 3600)
+            m = int((remaining_s % 3600) / 60)
+            rem_str = f"~{h}h {m:02d}m"
+        eta = datetime.datetime.now() + datetime.timedelta(seconds=remaining_s)
+        self._time_label.setText(f"Remaining: {rem_str}  (ETA {eta.strftime('%H:%M')})")
 
     def _on_tile_started(self, idx: int, total: int) -> None:
         self.log_message.emit(f"Tile {idx:02d}/{total} starting")

@@ -39,6 +39,11 @@ from scanflow.core.scan import (
 from scanflow.core.scan_geometry import feature_target_xy_nm
 
 from .paths import unique_dat_path
+from scanflow.automation.feature_centerer import (
+    CenteringResult,
+    CorrectionTracker,
+    find_feature_center_offset,
+)
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +78,8 @@ class FeatureScanWorker(QThread):
         size_nm: float | None = None,  # None → inherit current STM size
         home_nm: tuple[float, float] | None = None,
         scan_range_nm: tuple[float, float] | None = None,
+        enable_centering: bool = False,
+        quick_pixels: int = 64,
     ) -> None:
         super().__init__()
         self._stm = stm
@@ -86,6 +93,8 @@ class FeatureScanWorker(QThread):
         self._size_nm = float(size_nm) if size_nm is not None else None
         self._home_nm = home_nm
         self._scan_range_nm = scan_range_nm
+        self._enable_centering = bool(enable_centering)
+        self._quick_pixels = max(16, int(quick_pixels))
 
     def stop(self) -> None:
         self._stop_requested = True
@@ -111,6 +120,7 @@ class FeatureScanWorker(QThread):
             base_folder = self._source_path.parent
             base_stem = self._source_path.stem
             total = len(self._targets)
+            correction_tracker = CorrectionTracker()
             for i, row in enumerate(self._targets, start=1):
                 if self._stop_requested:
                     break
@@ -187,6 +197,52 @@ class FeatureScanWorker(QThread):
                     self.failed.emit(msg)
                     continue
 
+                if self._enable_centering:
+                    size_nm = (
+                        self._size_nm
+                        if self._size_nm is not None
+                        else (current.size_nm[0] if current.size_nm else 10.0)
+                    )
+                    quick_params = ScanParams(
+                        bias_V=biases[0],
+                        setpoint_A=setpoint_A,
+                        size_nm=(size_nm, size_nm),
+                        speed_nm_s=current.speed_nm_s,
+                        pixels=(self._quick_pixels, self._quick_pixels),
+                        rotation_deg=current.rotation_deg,
+                        const_height=current.const_height,
+                        channels=current.channels,
+                        preamp_exponent=current.preamp_exponent,
+                        memo=f"auto-center quick scan target {row.index + 1}",
+                    )
+                    self._stm.scan.apply(quick_params)
+                    self._stm.scan.start()
+                    timeout_s = max(60.0, size_nm * self._quick_pixels / max(current.speed_nm_s or 1.0, 0.1) * 2)
+                    self._stm.scan.wait_until_done(timeout_s=timeout_s)
+                    quick_image = self._stm.scan.live_data()
+                    if quick_image is not None and np.asarray(quick_image).ndim == 2:
+                        nm_per_pixel = size_nm / self._quick_pixels
+                        dx_nm, dy_nm, method, quality = find_feature_center_offset(
+                            quick_image, nm_per_pixel
+                        )
+                        pos = self._stm.scan.get_offset_nm()
+                        if pos is not None:
+                            self._stm.scan.set_offset_nm(pos[0] + dx_nm, pos[1] + dy_nm)
+                            center_result = CenteringResult(
+                                feature_idx=row.index,
+                                dx_nm=dx_nm,
+                                dy_nm=dy_nm,
+                                method=method,
+                                quality=quality,
+                            )
+                            msg = correction_tracker.add(center_result)
+                            log.info(msg)
+                            self.progress.emit(i, total, msg)
+                        else:
+                            log.warning("Auto-center: get_offset_nm() returned None, skipping correction")
+                    else:
+                        log.warning("Auto-center: quick scan live_data() returned no image, skipping correction")
+
                 for rep_idx, b in enumerate(biases):
                     if self._stop_requested:
                         break
@@ -251,6 +307,10 @@ class FeatureScanWorker(QThread):
                         )
                         continue
                     self.scan_saved.emit(str(saved))
+            if self._enable_centering and correction_tracker._results:
+                summary = correction_tracker.summary()
+                log.info(summary)
+                self.progress.emit(total, total, summary)
         except Exception as exc:  # pragma: no cover - exercised via panel tests
             log.exception("Preview follow-up scan failed")
             self.failed.emit(str(exc))

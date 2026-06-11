@@ -121,6 +121,14 @@ class TemperaturePoller(QObject):
     def start(self) -> None:
         self._timer.start()
 
+    def poll_now(self) -> None:
+        """Trigger an immediate poll outside the normal timer cadence.
+
+        Call this right after connecting the STM so the Temperature tab
+        populates without waiting for the first 30-second tick.
+        """
+        self._poll()
+
     def stop(self) -> None:
         self._timer.stop()
 
@@ -143,13 +151,42 @@ class TemperaturePoller(QObject):
     def _poll(self) -> None:
         if self._stm is None:
             return
+        # Use is_mock to skip the connected check in mock mode (avoids a
+        # COM round-trip that can flip False during a scan on some rigs).
+        is_mock = getattr(self._stm, "is_mock", False)
+        if not is_mock:
+            connected = getattr(self._stm, "connected", True)
+            if not connected:
+                return
         try:
             reading = self._stm.temperature.read()
         except Exception as e:
-            log.debug("temperature poll failed: %s", e)
+            log.warning("temperature poll failed: %s", e)
             return
 
         t = time.time()
+
+        # Log active sensor values at INFO on every poll so the file log
+        # shows that temperature reading is working.
+        active_vals = {
+            f: getattr(reading, f)
+            for f in SENSOR_FIELDS
+            if getattr(reading, f) is not None
+        }
+        if active_vals:
+            parts = "  ".join(
+                f"{SENSOR_LABELS.get(f, f)}={v:.3f} K"
+                for f, v in active_vals.items()
+            )
+            log.info("Temperature: %s", parts)
+        else:
+            # Warn once if all sensors return None (likely wrong COM key names).
+            if not self._buffer:
+                log.warning(
+                    "Temperature poll succeeded but all sensor keys returned empty "
+                    "— check the COM key names in TemperatureMonitor.read()"
+                )
+
         self._check_refill(t, reading)
         self._buffer.append((t, reading))
         self._last_reading = reading

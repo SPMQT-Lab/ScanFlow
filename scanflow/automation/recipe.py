@@ -24,7 +24,6 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional, List, Union
 
-from scanflow.automation.survey import SurveyConfig
 from scanflow.automation.mosaic import MosaicConfig
 
 
@@ -157,25 +156,6 @@ class TipFormStep:
 
 
 @dataclass
-class SurveyStep:
-    """Wide scan + auto feature discovery + per-feature zoom campaign."""
-    config: "SurveyConfig" = field(default_factory=lambda: SurveyConfig())
-    label: str = ""
-    kind: str = "survey"
-
-    def estimate_duration_s(self) -> float:
-        cfg = self.config
-        wide_t = (2.0 * cfg.wide_size_nm[0] / max(cfg.wide_speed_nm_s, 0.01)
-                  * cfg.wide_pixels[1] + 4.0)
-        zoom_t = (2.0 * cfg.min_zoom_nm / max(cfg.zoom_speed_nm_s, 0.01)
-                  * cfg.zoom_pixels[1] + 4.0)
-        n_zooms = cfg.max_features * cfg.zoom_iterations
-        # One pre-wide settle + one settle per zoom iteration
-        settle_t = cfg.settling_s * (1 + n_zooms)
-        return wide_t + n_zooms * zoom_t + settle_t
-
-
-@dataclass
 class MosaicStep:
     """Wide scan + 3×3 zoom tiles + wide scan (a 'before/after' mosaic)."""
     config: "MosaicConfig" = field(default_factory=lambda: MosaicConfig())
@@ -201,7 +181,7 @@ class MosaicStep:
 
 RecipeStep = Union[
     ScanStep, SpectroscopyStep, ApproachStep, WaitStep,
-    TipFormStep, SurveyStep, MosaicStep,
+    TipFormStep, MosaicStep,
 ]
 
 _STEP_CLASSES = {
@@ -210,7 +190,6 @@ _STEP_CLASSES = {
     "approach": ApproachStep,
     "wait": WaitStep,
     "tip_form": TipFormStep,
-    "survey": SurveyStep,
     "mosaic": MosaicStep,
 }
 

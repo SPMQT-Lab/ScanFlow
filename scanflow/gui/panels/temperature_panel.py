@@ -160,6 +160,7 @@ class TemperaturePanel(QWidget):
 
     def _on_sample(self, t: float, reading) -> None:
         self._refresh_plot()
+        self._refresh_values()
 
     def _on_summary(self, stats: dict) -> None:
         msg = format_summary(stats)

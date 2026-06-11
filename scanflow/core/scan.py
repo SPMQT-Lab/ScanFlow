@@ -6,6 +6,7 @@ for bias/setpoint). All keys go through the modern setp/getp API.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -17,6 +18,8 @@ import numpy as np
 if TYPE_CHECKING:
     from .stm_client import STMClient
 
+log = logging.getLogger(__name__)
+
 
 class ScanStatus(IntEnum):
     STOPPED = 0
@@ -26,6 +29,10 @@ class ScanStatus(IntEnum):
     # is_running purposes.
     PAUSED = 1
     SCANNING = 2
+    # CreaTec returns 3 as a brief wrap-up state between SCANNING(2) and
+    # FINISHED(9) — the scan data is complete, the file write is in progress.
+    # Treat as STOPPED so the wait loop exits cleanly.
+    WRAPPING_UP = 3
     # CreaTec returns 9 immediately after a scan completes cleanly. Treated
     # the same as STOPPED — added explicitly so it doesn't spam the log
     # with "Unknown SCANSTATUS 9" warnings on every scan.
@@ -35,10 +42,7 @@ class ScanStatus(IntEnum):
     def _missing_(cls, value):
         """Any unrecognised status value falls back to STOPPED so the
         runner never crashes on a numeric value we haven't catalogued."""
-        import logging as _logging
-        _logging.getLogger(__name__).warning(
-            "Unknown SCANSTATUS %r — treating as STOPPED", value,
-        )
+        log.warning("Unknown SCANSTATUS %r — treating as STOPPED", value)
         return cls.STOPPED
 
 
@@ -131,9 +135,19 @@ class ScanController:
 
     @property
     def pixels(self) -> tuple[int, int]:
-        x = int(self._c.getp("SCAN.NUM.X", "") or 256)
-        y = int(self._c.getp("SCAN.NUM.Y", "") or 256)
-        return (x, y)
+        # Createc stores pixel count as "Num.X" / "Num.Y" in the dat file and
+        # exposes those raw keys via COM for reading. "SCAN.NUM.X" is accepted
+        # for writing (apply()) but returns "" on getp in some Createc versions,
+        # causing silent fallback to 256. Try the raw key first.
+        def _read_px(raw_key: str, structured_key: str) -> int:
+            v = self._c.getp(raw_key, "")
+            if not v:
+                v = self._c.getp(structured_key, "")
+            try:
+                return int(float(v)) if v else 256
+            except (ValueError, TypeError):
+                return 256
+        return (_read_px("Num.X", "SCAN.NUM.X"), _read_px("Num.Y", "SCAN.NUM.Y"))
 
     @pixels.setter
     def pixels(self, value: tuple[int, int]) -> None:
@@ -547,7 +561,24 @@ class ScanController:
 
     def save_dat(self, filepath: str) -> None:
         """Save the most recent scan as a .dat file at the given path."""
-        self._c.setp("STMAFM.FILE.SAVE.DAT", str(filepath))
+        try:
+            self._c.setp("STMAFM.FILE.SAVE.DAT", str(filepath))
+        except Exception as exc:
+            # Createc generates a .dat.jpeg thumbnail after saving the .dat.
+            # On Windows, file indexers (Explorer, antivirus) occasionally hold
+            # an exclusive lock on that thumbnail file, causing a COM error even
+            # though the .dat itself was written successfully.  Treat this as a
+            # non-fatal warning so the sweep can continue.
+            msg = str(exc)
+            if ".jpeg" in msg.lower() and (
+                "cannot create" in msg.lower() or "being used by another" in msg.lower()
+            ):
+                log.warning(
+                    "save_dat: .dat.jpeg thumbnail locked by another process — "
+                    ".dat was saved, thumbnail skipped. (%s)", exc
+                )
+            else:
+                raise
 
     def last_saved_path(self) -> Optional[Path]:
         path = self._c.getp("STMAFM.LASTSAVEDFILE", "") or self._c.raw.savedatfilename

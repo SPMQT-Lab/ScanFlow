@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+import datetime as _dt
 from pathlib import Path
 from typing import Any
 
@@ -511,6 +513,25 @@ class _FeatureScanDialog(QDialog):
         self._bias_seq.textChanged.connect(self._on_seq_changed)
         self._on_seq_changed(self._bias_seq.text())
 
+        # ── Auto-center ───────────────────────────────────────────────────
+        self._center_check = QCheckBox("Auto-center (quick scan before each feature)")
+        self._center_check.setChecked(bool(d.get("enable_centering", False)))
+        self._center_check.setToolTip(
+            "Run a fast low-resolution finder scan, detect the feature position, "
+            "and correct the tip offset before the full-resolution scan."
+        )
+        form.addRow("", self._center_check)
+
+        self._quick_px_spin = QSpinBox()
+        self._quick_px_spin.setRange(32, 128)
+        self._quick_px_spin.setSingleStep(16)
+        self._quick_px_spin.setValue(int(d.get("quick_pixels", 64)))
+        self._quick_px_spin.setToolTip("Resolution of the quick finder scan (same area, same speed).")
+        self._quick_px_spin.setEnabled(self._center_check.isChecked())
+        form.addRow("Quick-scan pixels", self._quick_px_spin)
+
+        self._center_check.toggled.connect(self._quick_px_spin.setEnabled)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -565,6 +586,8 @@ class _FeatureScanDialog(QDialog):
             "repetitions": int(self._repetitions.value()),
             "bias_sequence": bias_sequence,
             "bias_sequence_str": seq_text,
+            "enable_centering": bool(self._center_check.isChecked()),
+            "quick_pixels": int(self._quick_px_spin.value()),
         }
 
 
@@ -822,6 +845,12 @@ class PreviewPanel(QWidget):
         self._scan_info_timer.timeout.connect(self._refresh_scan_info)
         self._scan_info_timer.start()
         self._scan_was_running: bool = False  # tracks transition to log scan-start once
+        self._feat_scan_start_t: float | None = None
+        self._feat_scan_total: int = 0
+        self._feat_scans_saved: int = 0
+        self._eta_timer = QTimer(self)
+        self._eta_timer.setInterval(60_000)
+        self._eta_timer.timeout.connect(self._refresh_eta)
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -862,6 +891,11 @@ class PreviewPanel(QWidget):
         """)
         self._scan_info_label.setVisible(False)
         root.addWidget(self._scan_info_label)
+
+        self._time_label = QLabel("")
+        self._time_label.setStyleSheet("color: #555; font-style: italic; padding: 2px 4px;")
+        self._time_label.setVisible(False)
+        root.addWidget(self._time_label)
 
         self._viewer = _PreviewImageView()
         self._viewer.feature_clicked.connect(self._toggle_feature_selection)
@@ -2221,14 +2255,25 @@ class PreviewPanel(QWidget):
                 (feat_scan_range_m[0] * 1e9, feat_scan_range_m[1] * 1e9)
                 if feat_scan_range_m is not None else None
             ),
+            enable_centering=scan_params.get("enable_centering", False),
+            quick_pixels=scan_params.get("quick_pixels", 64),
         )
+        n_reps = len(scan_params["bias_sequence"]) if scan_params["bias_sequence"] else scan_params["repetitions"]
         self._scan_worker.progress.connect(self._on_scan_progress)
         self._scan_worker.scan_saved.connect(self._on_followup_scan_saved)
         self._scan_worker.failed.connect(self._on_followup_scan_failed)
         self._scan_worker.finished.connect(lambda: self._scan_selected_btn.setEnabled(True))
         self._scan_worker.finished.connect(lambda: self._stop_scan_btn.setEnabled(False))
+        self._scan_worker.finished.connect(self._on_feat_scan_finished)
         self._scan_worker.start()
-        n_reps = len(scan_params["bias_sequence"]) if scan_params["bias_sequence"] else scan_params["repetitions"]
+
+        self._feat_scan_start_t = time.time()
+        self._feat_scan_total = len(selected) * n_reps
+        self._feat_scans_saved = 0
+        self._time_label.setVisible(True)
+        self._time_label.setText("")
+        self._eta_timer.start()
+
         self._show_status(
             f"Scanning {len(selected)} feature(s)"
             + (f" × {n_reps} bias steps" if n_reps > 1 else "") + "…"
@@ -2238,6 +2283,8 @@ class PreviewPanel(QWidget):
         self._show_status(f"{label} ({idx}/{total})")
 
     def _on_followup_scan_saved(self, path: str) -> None:
+        self._feat_scans_saved += 1
+        self._refresh_eta()
         self.scan_completed.emit(path)
         self.handle_scan_completed(path)
         self.log_message.emit(f"Follow-up scan saved: {path}")
@@ -2245,6 +2292,37 @@ class PreviewPanel(QWidget):
     def _on_followup_scan_failed(self, message: str) -> None:
         self.error_message.emit(message)
         self._show_status(f"Follow-up scan failed: {message}")
+
+    def _on_feat_scan_finished(self) -> None:
+        self._eta_timer.stop()
+        self._time_label.setVisible(False)
+        self._feat_scan_start_t = None
+
+    def _refresh_eta(self) -> None:
+        if self._feat_scan_start_t is None or self._feat_scan_total == 0:
+            return
+        elapsed = time.time() - self._feat_scan_start_t
+        saved = self._feat_scans_saved
+        total = self._feat_scan_total
+        if saved > 0:
+            pace_s = elapsed / saved
+            remaining_s = max(0.0, (total - saved) * pace_s)
+        else:
+            remaining_s = 0.0
+            self._time_label.setText(f"0/{total} scans done — estimating…")
+            return
+        if remaining_s < 60:
+            rem_str = "< 1 min"
+        elif remaining_s < 3600:
+            rem_str = f"~{int(remaining_s / 60)}m"
+        else:
+            h = int(remaining_s / 3600)
+            m = int((remaining_s % 3600) / 60)
+            rem_str = f"~{h}h {m:02d}m"
+        eta = _dt.datetime.now() + _dt.timedelta(seconds=remaining_s)
+        self._time_label.setText(
+            f"{saved}/{total} scans done — Remaining: {rem_str}  (ETA {eta.strftime('%H:%M')})"
+        )
 
     # ------------------------------------------------------------------
     # Group scan
