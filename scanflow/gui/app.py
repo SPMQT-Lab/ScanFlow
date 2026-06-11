@@ -15,7 +15,7 @@ from PySide6.QtGui import QIcon
 
 from scanflow.io import Session
 from scanflow.gui.main_window import MainWindow
-from scanflow.gui.theme import STYLESHEET
+from scanflow.gui import theme as _theme
 
 _LOGO = Path(__file__).parents[2] / "Logo.png"
 
@@ -84,7 +84,12 @@ def main() -> None:
     QLocale.setDefault(QLocale(QLocale.Language.English, QLocale.Country.UnitedStates))
     app.setApplicationName("ScanFlow")
     app.setOrganizationName("SPMQT-Lab")
-    app.setStyleSheet(STYLESHEET)
+    # Honor the theme the user last chose (Session.theme); the toolbar
+    # toggle in MainWindow keeps it in sync from then on.
+    app.setStyleSheet(
+        _theme.DARK_STYLESHEET if session.theme == "dark"
+        else _theme.LIGHT_STYLESHEET
+    )
     if _LOGO.exists():
         app.setWindowIcon(QIcon(str(_LOGO)))
     window = MainWindow(session)

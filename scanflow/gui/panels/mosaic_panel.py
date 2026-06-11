@@ -36,6 +36,7 @@ from scanflow.automation import (
     RunnerState,
 )
 from scanflow.automation.recipe import format_duration
+from scanflow.gui.preflight import confirm_recipe_preflight
 
 
 class MosaicPanel(QWidget):
@@ -475,6 +476,10 @@ class MosaicPanel(QWidget):
 
         recipe = MeasurementRecipe(name=cfg.name)
         recipe.add_step(MosaicStep(config=cfg, label=cfg.name))
+
+        mode = "mock" if self._stm.is_mock else "live"
+        if not confirm_recipe_preflight(self, recipe, mode=mode):
+            return
 
         # Snapshot XY before the runner thread starts.
         try:

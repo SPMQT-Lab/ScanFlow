@@ -34,6 +34,7 @@ from scanflow.automation.scan_metrics import (
     DriftTracker, DriftFit,
     FEATURE_SCAN_THRESHOLD_NM_MIN, ATOMIC_SCAN_THRESHOLD_NM_MIN,
 )
+from scanflow.gui.preflight import confirm_recipe_preflight
 from scanflow.gui.widgets.sweep_confirm import SweepConfirmDialog
 
 log = logging.getLogger(__name__)
@@ -550,6 +551,11 @@ class SweepPanel(QWidget):
         # if the user tweaks anything, then returns Accepted/Rejected.
         dlg = SweepConfirmDialog(recipe, parent=self)
         if dlg.exec() != QDialog.Accepted:
+            return
+
+        # Pre-flight AFTER the confirm dialog so user edits are validated too.
+        mode = "mock" if self._stm.is_mock else "live"
+        if not confirm_recipe_preflight(self, recipe, mode=mode):
             return
 
         self._drift_tracker.reset()

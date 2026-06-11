@@ -37,13 +37,19 @@ from scanflow.gui import theme as _theme
 
 _LOGO = Path(__file__).parents[2] / "Logo.png"
 
+# Status-dot colors — bright enough to read on the dark-blue status bar
+# in both themes.
+_STATUS_GREEN = "#4ADE80"
+_STATUS_AMBER = "#F5A800"
+_STATUS_RED = "#F87171"
+
 
 class MainWindow(QMainWindow):
     def __init__(self, session: Session) -> None:
         super().__init__()
         self._session = session
         self._stm = STMClient()
-        self._dark_mode = False
+        self._dark_mode = session.theme == "dark"
 
         self.setWindowTitle("ScanFlow")
         self.resize(900, 720)
@@ -65,25 +71,44 @@ class MainWindow(QMainWindow):
             logo_label.setContentsMargins(4, 0, 12, 0)
             toolbar.addWidget(logo_label)
 
-        connect_action = QAction("Connect STM", self)
-        connect_action.triggered.connect(self._connect_stm)
-        toolbar.addAction(connect_action)
+        self._connect_action = QAction("Connect STM", self)
+        self._connect_action.setShortcut("F5")
+        self._connect_action.setToolTip(
+            "Connect to the Createc STMAFM software running on this PC (F5)"
+        )
+        self._connect_action.triggered.connect(self._connect_stm)
+        toolbar.addAction(self._connect_action)
 
-        mock_action = QAction("Connect Mock", self)
-        mock_action.triggered.connect(self._connect_mock)
-        toolbar.addAction(mock_action)
+        self._mock_action = QAction("Connect Mock", self)
+        self._mock_action.setToolTip(
+            "Offline simulation — try recipes and panels without hardware"
+        )
+        self._mock_action.triggered.connect(self._connect_mock)
+        toolbar.addAction(self._mock_action)
 
-        disconnect_action = QAction("Disconnect", self)
-        disconnect_action.triggered.connect(self._disconnect_stm)
-        toolbar.addAction(disconnect_action)
+        self._disconnect_action = QAction("Disconnect", self)
+        self._disconnect_action.setToolTip("Release the STMAFM connection")
+        self._disconnect_action.triggered.connect(self._disconnect_stm)
+        self._disconnect_action.setEnabled(False)
+        toolbar.addAction(self._disconnect_action)
 
         toolbar.addSeparator()
 
-        self._theme_action = QAction("Night Mode", self)
+        self._theme_action = QAction(
+            "Day Mode" if self._dark_mode else "Night Mode", self
+        )
+        self._theme_action.setShortcut("Ctrl+T")
+        self._theme_action.setToolTip(
+            "Toggle dark theme (Ctrl+T) — remembered for next session"
+        )
         self._theme_action.triggered.connect(self._toggle_theme)
         toolbar.addAction(self._theme_action)
 
         self._preview_action = QAction("Preview", self)
+        self._preview_action.setShortcut("Ctrl+P")
+        self._preview_action.setToolTip(
+            "Open the scan preview / analysis window (Ctrl+P)"
+        )
         self._preview_action.triggered.connect(self._show_preview_window)
         toolbar.addAction(self._preview_action)
 
@@ -140,8 +165,9 @@ class MainWindow(QMainWindow):
         # -- Status bar --
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
-        self._stm_label = QLabel("STM: disconnected")
+        self._stm_label = QLabel()
         self._status_bar.addPermanentWidget(self._stm_label)
+        self._set_stm_status("disconnected", _STATUS_RED)
 
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._refresh_status)
@@ -154,19 +180,21 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------
 
+    def _set_stm_status(self, text: str, color: str) -> None:
+        self._stm_label.setText(f"● STM: {text}")
+        self._stm_label.setStyleSheet(f"color: {color}; font-weight: bold;")
+
     def _connect_stm(self) -> None:
         ok = self._stm.connect()
         if ok:
-            self._stm_label.setText("STM: connected")
+            self._set_stm_status("connected", _STATUS_GREEN)
+            self._disconnect_action.setEnabled(True)
             self._log.append("Connected to STMAFM")
+            self._status_bar.showMessage("Connected to STMAFM", 5000)
             self._sweep.load_from_stm()
             self._temp_poller.poll_now()
-            QMessageBox.information(
-                self, "STM Connected",
-                "Successfully connected to the CreaTec STMAFM software."
-            )
         else:
-            self._stm_label.setText("STM: disconnected")
+            self._set_stm_status("disconnected", _STATUS_RED)
             self._log.append_error("STM connection failed")
             QMessageBox.critical(
                 self, "Connection Failed",
@@ -177,23 +205,28 @@ class MainWindow(QMainWindow):
 
     def _connect_mock(self) -> None:
         if self._stm.connect_mock():
-            self._stm_label.setText("STM: mock")
+            self._set_stm_status("mock", _STATUS_AMBER)
+            self._disconnect_action.setEnabled(True)
             self._log.append("Mock STM connected (offline simulation)")
+            self._status_bar.showMessage("Mock STM connected", 5000)
             self._temp_poller.poll_now()
 
     def _disconnect_stm(self) -> None:
         self._stm.disconnect()
-        self._stm_label.setText("STM: disconnected")
+        self._set_stm_status("disconnected", _STATUS_RED)
+        self._disconnect_action.setEnabled(False)
         self._log.append("STM disconnected")
 
     def _refresh_status(self) -> None:
         if self._stm.is_mock:
-            self._stm_label.setText("STM: mock")
+            self._set_stm_status("mock", _STATUS_AMBER)
             return
         connected = self._stm.connected
         if not connected:
-            self._stm_label.setText("STM: disconnected")
+            self._set_stm_status("disconnected", _STATUS_RED)
+            self._disconnect_action.setEnabled(False)
             return
+        self._disconnect_action.setEnabled(True)
         try:
             running = self._stm.scan.is_running
             if running:
@@ -215,14 +248,14 @@ class MainWindow(QMainWindow):
                     )
                     self._status_detail = f"{pos_str}  |  {size_str}"
                     self._status_detail_t = now
-                self._stm_label.setText(
-                    f"STM: scanning  |  {self._status_detail}"
+                self._set_stm_status(
+                    f"scanning  |  {self._status_detail}", _STATUS_GREEN
                 )
             else:
                 self._status_detail = ""
-                self._stm_label.setText("STM: connected")
+                self._set_stm_status("connected", _STATUS_GREEN)
         except Exception:
-            self._stm_label.setText("STM: connected")
+            self._set_stm_status("connected", _STATUS_GREEN)
 
     def _toggle_theme(self) -> None:
         self._dark_mode = not self._dark_mode
@@ -233,6 +266,13 @@ class MainWindow(QMainWindow):
         else:
             app.setStyleSheet(_theme.LIGHT_STYLESHEET)
             self._theme_action.setText("Night Mode")
+        # Persist immediately so the choice survives even if the app is
+        # killed instead of closed.
+        self._session.theme = "dark" if self._dark_mode else "light"
+        try:
+            self._session.save()
+        except OSError:
+            pass
 
     def _forward_scan_to_preview(self, path: str) -> None:
         """Route completed scans to the preview window if it exists.
