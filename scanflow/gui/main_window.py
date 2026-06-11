@@ -162,6 +162,10 @@ class MainWindow(QMainWindow):
             lambda _: self._atom_tracker.handle_scan_completed()
         )
 
+        self._log_tab_index = self._tabs.indexOf(self._log)
+        self._log.popout_clicked.connect(self._toggle_log_window)
+        self._log.floating_closed.connect(self._dock_log_tab)
+
         # -- Status bar --
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
@@ -316,7 +320,41 @@ class MainWindow(QMainWindow):
         if window is not None:
             window.show_window()
 
+    # ------------------------------------------------------------------
+    # Log pop-out
+    # ------------------------------------------------------------------
+
+    def _log_is_floating(self) -> bool:
+        return self._tabs.indexOf(self._log) == -1
+
+    def _toggle_log_window(self) -> None:
+        if self._log_is_floating():
+            self._dock_log_tab()
+        else:
+            self._float_log_tab()
+
+    def _float_log_tab(self) -> None:
+        self._log_tab_index = self._tabs.indexOf(self._log)
+        self._tabs.removeTab(self._log_tab_index)
+        self._log.set_floating(True)
+        self._log.setParent(None)
+        self._log.setWindowTitle("ScanFlow — Log")
+        if _LOGO.exists():
+            self._log.setWindowIcon(QIcon(str(_LOGO)))
+        self._log.resize(720, 480)
+        self._log.show()
+        self._log.raise_()
+        self._log.activateWindow()
+
+    def _dock_log_tab(self) -> None:
+        self._log.set_floating(False)
+        self._tabs.insertTab(self._log_tab_index, self._log, "Log")
+
     def closeEvent(self, event) -> None:
+        # A floating log window must not outlive (or keep alive) the app.
+        if self._log_is_floating():
+            self._log.set_floating(False)
+            self._log.close()
         # Stop any running automation first so Createc receives scan.stop()
         # before the COM apartment is torn down. Without this, Createc keeps
         # scanning indefinitely after ScanFlow exits.
