@@ -37,6 +37,7 @@ from scanflow.automation import (
 )
 from scanflow.automation.recipe import format_duration
 from scanflow.gui.preflight import confirm_recipe_preflight
+from scanflow.gui.widgets.pixel_combo import PixelComboBox
 
 
 class MosaicPanel(QWidget):
@@ -142,15 +143,11 @@ class MosaicPanel(QWidget):
         g.addWidget(self._wide_y, 0, 3)
 
         g.addWidget(QLabel("Pixels X"), 1, 0)
-        self._wide_pixels_x = QSpinBox()
-        self._wide_pixels_x.setRange(64, 4096)
-        self._wide_pixels_x.setValue(256)
+        self._wide_pixels_x = PixelComboBox(default=256)
         g.addWidget(self._wide_pixels_x, 1, 1)
 
         g.addWidget(QLabel("Pixels Y"), 1, 2)
-        self._wide_pixels_y = QSpinBox()
-        self._wide_pixels_y.setRange(64, 4096)
-        self._wide_pixels_y.setValue(256)
+        self._wide_pixels_y = PixelComboBox(default=256)
         g.addWidget(self._wide_pixels_y, 1, 3)
 
         g.addWidget(QLabel("Speed (nm/s)"), 2, 0)
@@ -190,15 +187,11 @@ class MosaicPanel(QWidget):
 
         # Row 2: tile pixels.
         g.addWidget(QLabel("Tile pixels X"), 2, 0)
-        self._tile_pixels_x = QSpinBox()
-        self._tile_pixels_x.setRange(32, 4096)
-        self._tile_pixels_x.setValue(256)
+        self._tile_pixels_x = PixelComboBox(default=256)
         g.addWidget(self._tile_pixels_x, 2, 1)
 
         g.addWidget(QLabel("Tile pixels Y"), 2, 2)
-        self._tile_pixels_y = QSpinBox()
-        self._tile_pixels_y.setRange(32, 4096)
-        self._tile_pixels_y.setValue(256)
+        self._tile_pixels_y = PixelComboBox(default=256)
         g.addWidget(self._tile_pixels_y, 2, 3)
 
         # Row 3: speed + grid N.

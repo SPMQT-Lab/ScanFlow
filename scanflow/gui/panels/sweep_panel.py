@@ -35,6 +35,7 @@ from scanflow.automation.scan_metrics import (
     FEATURE_SCAN_THRESHOLD_NM_MIN, ATOMIC_SCAN_THRESHOLD_NM_MIN,
 )
 from scanflow.gui.preflight import confirm_recipe_preflight
+from scanflow.gui.widgets.pixel_combo import PixelComboBox
 from scanflow.gui.widgets.sweep_confirm import SweepConfirmDialog
 
 log = logging.getLogger(__name__)
@@ -262,9 +263,7 @@ class SweepPanel(QWidget):
         g.addWidget(self._speed, 1, 1)
 
         g.addWidget(QLabel("Pixels"), 1, 2)
-        self._pixels = QSpinBox()
-        self._pixels.setRange(8, 8192)
-        self._pixels.setValue(256)
+        self._pixels = PixelComboBox(default=256)
         self._pixels.valueChanged.connect(self._refresh_estimate)
         g.addWidget(self._pixels, 1, 3)
         return box
