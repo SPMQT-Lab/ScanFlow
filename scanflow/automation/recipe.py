@@ -264,6 +264,86 @@ class MeasurementRecipe:
     def add_step(self, step: RecipeStep) -> None:
         self.steps.append(step)
 
+    def validate(self, mode: str = "live") -> list[str]:
+        """Pre-flight checks. Returns issue strings prefixed ``ERROR:`` or
+        ``WARNING:``; an empty list means nothing was flagged.
+
+        Errors describe steps the runner would refuse or that would harm
+        the tip; warnings flag risky-but-legal configurations. ``mode``
+        is ``"live"`` or ``"mock"`` — some warnings only matter live.
+        """
+        issues: list[str] = []
+        if not self.steps:
+            issues.append("ERROR: recipe has no steps")
+
+        for i, step in enumerate(self.steps, start=1):
+            kind = getattr(step, "kind", "scan")
+            tag = f"step {i} ({step.label or kind})"
+            if kind == "scan":
+                if not step.const_height and abs(step.bias_V) < MIN_CONST_CURRENT_BIAS_V:
+                    issues.append(
+                        f"ERROR: {tag}: constant-current scan at "
+                        f"|bias|={abs(step.bias_V)*1000:.2f} mV "
+                        f"< {MIN_CONST_CURRENT_BIAS_V*1000:.1f} mV would crash the tip"
+                    )
+                if abs(step.bias_V) > 10.0:
+                    issues.append(f"ERROR: {tag}: |bias| {step.bias_V:.2f} V exceeds ±10 V")
+                if step.setpoint_A <= 0:
+                    issues.append(f"ERROR: {tag}: setpoint must be positive")
+                elif step.setpoint_A > 100e-9:
+                    issues.append(
+                        f"WARNING: {tag}: setpoint {step.setpoint_A*1e9:.1f} nA "
+                        "is unusually high"
+                    )
+                if min(step.size_nm) <= 0 or min(step.pixels) <= 0:
+                    issues.append(f"ERROR: {tag}: scan size and pixels must be positive")
+            elif kind == "mosaic":
+                for b in step.config.effective_bias_sequence():
+                    if abs(b) < MIN_CONST_CURRENT_BIAS_V:
+                        issues.append(
+                            f"WARNING: {tag}: bias sequence contains "
+                            f"{b*1000:.1f} mV — that iteration will be skipped"
+                        )
+            elif kind == "tip_form":
+                issues.append(
+                    f"WARNING: {tag}: tip-form step requires explicit operator "
+                    "approval (approve_next_tip_form) or the run will halt there"
+                )
+                # Createc quirk: the move to the tip-form spot happens at
+                # the step's lateral speed, not the scan speed, and cannot
+                # be interrupted. Flag big mismatches against the scan
+                # speeds present in this recipe.
+                scan_speeds = [
+                    s.speed_nm_s for s in self.steps
+                    if getattr(s, "kind", "") == "scan"
+                ]
+                if scan_speeds:
+                    ratio = step.lateral_speed_nm_s / max(min(scan_speeds), 1e-9)
+                    if ratio > 10.0:
+                        issues.append(
+                            f"WARNING: {tag}: tip-form lateral speed "
+                            f"{step.lateral_speed_nm_s:.1f} nm/s is {ratio:.0f}× "
+                            "the recipe's scan speed — the move to the target "
+                            "will be a fast jump"
+                        )
+                    elif ratio < 0.1:
+                        issues.append(
+                            f"WARNING: {tag}: tip-form lateral speed "
+                            f"{step.lateral_speed_nm_s:.1f} nm/s is far below the "
+                            "recipe's scan speed — slow travel that cannot be "
+                            "interrupted once commanded"
+                        )
+
+        if mode == "live" and not self.safety_enable:
+            issues.append("WARNING: tip-crash safety abort is DISABLED")
+        total_s = self.estimate_duration_s()
+        if total_s > 24 * 3600:
+            issues.append(
+                f"WARNING: estimated total run time {format_duration(total_s)} "
+                "exceeds 24 h"
+            )
+        return issues
+
     def total_steps(self) -> int:
         return len(self.steps) * self.repetitions
 

@@ -20,11 +20,16 @@ from scanflow.core import STMClient
 from scanflow.io import Session
 from scanflow.gui.panels.sweep_panel import SweepPanel
 from scanflow.gui.panels.mosaic_panel import MosaicPanel
-from scanflow.gui.panels.preview_panel import PreviewWindow
+# PreviewWindow is NOT imported here: its module pulls in the ProbeFlow
+# analysis stack, which is an optional install on the lab PC. It is
+# imported lazily in _ensure_preview_window() so the GUI (Sweep, Survey,
+# Mosaic, Log, …) launches without it and the Preview button explains
+# what to install instead of the whole app failing at startup.
 from scanflow.gui.panels.z_stability_panel import ZStabilityPanel
 from scanflow.gui.panels.positioning_diag_panel import PositioningDiagPanel
 from scanflow.gui.panels.temperature_panel import TemperaturePanel
 from scanflow.gui.panels.atom_tracker_panel import AtomTrackerPanel
+from scanflow.gui.panels.tipform_panel import TipFormPanel
 from scanflow.gui.panels.log_panel import LogPanel
 from scanflow.core.z_monitor import ZMonitor
 from scanflow.core.temp_poller import TemperaturePoller
@@ -88,7 +93,8 @@ class MainWindow(QMainWindow):
 
         self._sweep = SweepPanel(self._stm)
         self._mosaic = MosaicPanel(self._stm)
-        self._preview_window = PreviewWindow(self._stm, self)
+        self._preview_window = None  # created on demand — _ensure_preview_window()
+        self._last_scan_path: str | None = None
         self._positioning_diag = PositioningDiagPanel(self._stm)
         # Z-stability monitor runs continuously; it auto-skips polls while
         # disconnected, so it's safe to construct + start before Connect.
@@ -99,6 +105,9 @@ class MainWindow(QMainWindow):
         self._temperature = TemperaturePanel(self._temp_poller)
         self._temp_poller.start()
         self._atom_tracker = AtomTrackerPanel(self._stm)
+        # Tip Form panel: supervisor-sanctioned tab; adds ZERO pollers
+        # (COM only on explicit button clicks) per ROADMAP §2.5/§6.
+        self._tipform = TipFormPanel(self._stm)
         self._log = LogPanel()
 
         self._tabs.addTab(self._sweep, "Sweep")
@@ -107,23 +116,23 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._z_stability, "Z Stability")
         self._tabs.addTab(self._temperature, "Temperature")
         self._tabs.addTab(self._atom_tracker, "Atom Tracker")
+        self._tabs.addTab(self._tipform, "Tip Form")
         self._tabs.addTab(self._log, "Log")
 
         self._sweep.log_message.connect(self._log.append)
         self._sweep.error_message.connect(self._log.append_error)
         self._mosaic.log_message.connect(self._log.append)
         self._mosaic.error_message.connect(self._log.append_error)
-        self._preview_window.log_message.connect(self._log.append)
-        self._preview_window.error_message.connect(self._log.append_error)
         self._positioning_diag.log_message.connect(self._log.append)
         self._z_stability.log_message.connect(self._log.append)
         self._temperature.log_message.connect(self._log.append)
         self._atom_tracker.log_message.connect(self._log.append)
         self._atom_tracker.error_message.connect(self._log.append_error)
+        self._tipform.log_message.connect(self._log.append)
+        self._tipform.error_message.connect(self._log.append_error)
 
-        self._sweep.scan_completed.connect(self._preview_window.handle_scan_completed)
-        self._mosaic.scan_completed.connect(self._preview_window.handle_scan_completed)
-        self._preview_window.scan_completed.connect(self._log.append)
+        self._sweep.scan_completed.connect(self._forward_scan_to_preview)
+        self._mosaic.scan_completed.connect(self._forward_scan_to_preview)
         self._sweep.scan_completed.connect(
             lambda _: self._atom_tracker.handle_scan_completed()
         )
@@ -137,6 +146,11 @@ class MainWindow(QMainWindow):
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._refresh_status)
         self._poll_timer.start(3000)
+        # Cache for the scanning-status detail so the 3 s poll doesn't do
+        # ~10 COM reads while an automation worker is hammering the same
+        # STMAFM server (COM calls are serialised across apartments).
+        self._status_detail = ""
+        self._status_detail_t = 0.0
 
     # ------------------------------------------------------------------
 
@@ -183,20 +197,29 @@ class MainWindow(QMainWindow):
         try:
             running = self._stm.scan.is_running
             if running:
-                offset = self._stm.scan.get_offset_nm()
-                params = self._stm.scan.read()
-                pos_str = (
-                    f"X={offset[0]:+.2f} Y={offset[1]:+.2f} nm"
-                    if offset else "pos:n/a"
-                )
-                size_str = (
-                    f"{params.size_nm[0]:.1f}×{params.size_nm[1]:.1f} nm"
-                    if params.size_nm else ""
-                )
+                # Refresh the detail (offset + frame size, ~10 getp calls)
+                # at most every 15 s; in between reuse the cached string so
+                # the GUI poll stays lightweight during automation.
+                import time as _time
+                now = _time.monotonic()
+                if not self._status_detail or now - self._status_detail_t > 15.0:
+                    offset = self._stm.scan.get_offset_nm()
+                    params = self._stm.scan.read()
+                    pos_str = (
+                        f"X={offset[0]:+.2f} Y={offset[1]:+.2f} nm"
+                        if offset else "pos:n/a"
+                    )
+                    size_str = (
+                        f"{params.size_nm[0]:.1f}×{params.size_nm[1]:.1f} nm"
+                        if params.size_nm else ""
+                    )
+                    self._status_detail = f"{pos_str}  |  {size_str}"
+                    self._status_detail_t = now
                 self._stm_label.setText(
-                    f"STM: scanning  |  {pos_str}  |  {size_str}"
+                    f"STM: scanning  |  {self._status_detail}"
                 )
             else:
+                self._status_detail = ""
                 self._stm_label.setText("STM: connected")
         except Exception:
             self._stm_label.setText("STM: connected")
@@ -211,8 +234,47 @@ class MainWindow(QMainWindow):
             app.setStyleSheet(_theme.LIGHT_STYLESHEET)
             self._theme_action.setText("Night Mode")
 
+    def _forward_scan_to_preview(self, path: str) -> None:
+        """Route completed scans to the preview window if it exists.
+
+        The newest path is remembered either way, so a preview window
+        opened later starts on the latest scan instead of empty.
+        """
+        self._last_scan_path = path
+        if self._preview_window is not None:
+            self._preview_window.handle_scan_completed(path)
+
+    def _ensure_preview_window(self):
+        """Create the PreviewWindow on first use; None if deps are missing."""
+        if self._preview_window is not None:
+            return self._preview_window
+        try:
+            from scanflow.gui.panels.preview_panel import PreviewWindow
+        except ImportError as exc:
+            self._log.append_error(f"Preview unavailable: {exc}")
+            QMessageBox.warning(
+                self, "Preview unavailable",
+                "The Preview tools need ScanFlow's analysis dependencies "
+                "and the ProbeFlow package.\n\n"
+                "Install with:\n"
+                "    pip install -e \".[analysis]\"\n"
+                "and make sure 'probeflow' is importable on this PC.\n\n"
+                f"Import error: {exc}",
+            )
+            return None
+        window = PreviewWindow(self._stm, self)
+        window.log_message.connect(self._log.append)
+        window.error_message.connect(self._log.append_error)
+        window.scan_completed.connect(self._log.append)
+        self._preview_window = window
+        if self._last_scan_path:
+            window.handle_scan_completed(self._last_scan_path)
+        return window
+
     def _show_preview_window(self) -> None:
-        self._preview_window.show_window()
+        window = self._ensure_preview_window()
+        if window is not None:
+            window.show_window()
 
     def closeEvent(self, event) -> None:
         # Stop any running automation first so Createc receives scan.stop()

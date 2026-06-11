@@ -40,6 +40,11 @@ class SafetyConfig:
     max_current_A: float = 1e-9         # 1 nA — tip-crash indicator
     enable_current_check: bool = True
     retract_on_violation_nm: float = 10.0  # Z-limit retract distance
+    # Consecutive failed current readings tolerated before the monitor
+    # fails CLOSED. A run whose readback is broken cannot be protected,
+    # so it must not be allowed to continue blindly.
+    warn_read_failures: int = 5
+    max_read_failures: int = 20
 
 
 @dataclass
@@ -47,6 +52,8 @@ class SafetyStatus:
     ok: bool
     reason: str = ""
     measured_current_A: Optional[float] = None
+    # True when this check could not obtain a current reading at all.
+    read_failed: bool = False
 
 
 class SafetyViolation(RuntimeError):
@@ -60,8 +67,23 @@ class SafetyViolation(RuntimeError):
 class SafetyMonitor:
     """Reads live current and reports threshold violations."""
 
+    # The live-scan fallback read pulls a FULL current frame over COM —
+    # expensive and executed on STMAFM's GUI thread. When the ADC path is
+    # broken and every poll hits the fallback, cache its result briefly so
+    # a 0.5 s safety poll doesn't become a 2 Hz full-frame transfer. The
+    # frame only fills in as the scan progresses, so a reading this stale
+    # still reflects the same data the fallback would re-derive.
+    FALLBACK_CACHE_S = 1.5
+
     def __init__(self, config: Optional[SafetyConfig] = None) -> None:
         self.config = config or SafetyConfig()
+        self._consecutive_read_failures = 0
+        self._fallback_cached_at = 0.0
+        self._fallback_cached_value: Optional[float] = None
+
+    @property
+    def consecutive_read_failures(self) -> int:
+        return self._consecutive_read_failures
 
     # ------------------------------------------------------------------
     # Current measurement
@@ -76,23 +98,42 @@ class SafetyMonitor:
           2. Fallback: peek at the latest live scan-data current channel
              and return the peak |I| in the partial frame.
         """
-        # Method 1: instantaneous voltage from ADC0 / preamp
+        # Method 1: instantaneous voltage from ADC0 / preamp.
+        # A NaN/Inf ADC reading must NOT be returned: NaN passes every
+        # `abs(I) > threshold` comparison as False, which would silently
+        # disable tip-crash protection while looking like a good reading.
         try:
             v = float(stm.raw.getadcvalf(0, 0))
             preamp_exp = int(stm.getp("SCAN.PREAMPGAIN.EXPONENT", 9) or 9)
-            return v / (10.0 ** preamp_exp)
+            current = v / (10.0 ** preamp_exp)
+            if np.isfinite(current):
+                return current
+            log.debug("ADC current reading non-finite (%r) — falling back", v)
         except Exception:
             pass
-        # Method 2: max from live scan data
+        # Method 2: max from live scan data — full-frame COM transfer, so
+        # serve repeat calls from a short-lived cache (see FALLBACK_CACHE_S).
+        import time as _time
+        now = _time.monotonic()
+        if now - self._fallback_cached_at < self.FALLBACK_CACHE_S:
+            return self._fallback_cached_value
+        value: Optional[float] = None
         try:
             arr = stm.scan.live_data(channel=2, unit=3)  # CURRENT_FWD, AMPERE
-            if arr is None:
-                return None
-            arr = np.asarray(arr)
-            # Ignore the leading rows in case partial-scan blanks are nonzero
-            return float(np.max(np.abs(arr)))
+            if arr is not None:
+                arr = np.asarray(arr, dtype=float)
+                finite = arr[np.isfinite(arr)]
+                # NaN rows happen on real rigs (partial frames, DSP hiccups);
+                # ignore them rather than letting one NaN poison the max.
+                if finite.size:
+                    value = float(np.max(np.abs(finite)))
         except Exception:
-            return None
+            value = None
+        if value is not None and not np.isfinite(value):
+            value = None
+        self._fallback_cached_at = now
+        self._fallback_cached_value = value
+        return value
 
     # ------------------------------------------------------------------
     # Check
@@ -103,8 +144,31 @@ class SafetyMonitor:
         if not cfg.enable_current_check:
             return SafetyStatus(ok=True)
         I = self.measure_current_A(stm)
+        # Belt and braces: a non-finite reading is a FAILED reading. It
+        # must count toward the fail-closed escalation, never reset it.
+        if I is not None and not np.isfinite(I):
+            I = None
         if I is None:
-            return SafetyStatus(ok=True)
+            # Fail CLOSED on persistent readback failure: a monitor that
+            # cannot read the current cannot protect the tip, so it must
+            # not keep reporting "ok" forever.
+            self._consecutive_read_failures += 1
+            n = self._consecutive_read_failures
+            if n >= cfg.max_read_failures:
+                return SafetyStatus(
+                    ok=False,
+                    reason=(
+                        f"current readback unavailable for {n} consecutive "
+                        "checks — tip-crash protection cannot be guaranteed"
+                    ),
+                    read_failed=True,
+                )
+            return SafetyStatus(
+                ok=True,
+                reason=f"current readback failed ({n} consecutive)",
+                read_failed=True,
+            )
+        self._consecutive_read_failures = 0
         if abs(I) > cfg.max_current_A:
             return SafetyStatus(
                 ok=False,

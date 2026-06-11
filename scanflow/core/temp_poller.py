@@ -108,7 +108,9 @@ class TemperaturePoller(QObject):
         self._last_reading: Optional[TemperatureReading] = None
         self._last_summary_t: Optional[float] = None
         # Refill event log: list of (t, sensor_field, delta_K)
-        self._refill_events: list[Tuple[float, str, float]] = []
+        # Bounded: refills are rare physical events, but a stuck sensor
+        # oscillating across the threshold must not grow this forever.
+        self._refill_events: deque[Tuple[float, str, float]] = deque(maxlen=500)
 
         self._timer = QTimer(self)
         self._timer.setInterval(int(self._poll_s * 1000))

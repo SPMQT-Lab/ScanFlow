@@ -157,3 +157,60 @@ def test_empty_bias_sweep_falls_back_to_single_bias():
     cfg_empty = MosaicConfig(bias_V=0.3, iterations_per_tile=2, bias_sweep=[])
     cfg_none = MosaicConfig(bias_V=0.3, iterations_per_tile=2)
     assert cfg_empty.effective_bias_sequence() == cfg_none.effective_bias_sequence()
+
+
+# ---------------------------------------------------------------------------
+# Absolute tile targets (regression for the bottom-row clamp bug)
+# ---------------------------------------------------------------------------
+
+def test_tile_targets_exactly_tile_default_3x3():
+    """Default 90 nm / 3×3: tile top edges must be at row·tile_h, never clamped.
+
+    Regression: the old runner clamp used ±wide/2 (centre convention) on a
+    top-edge Y, silently shifting every bottom-row tile up by half a tile.
+    """
+    from scanflow.automation.mosaic import tile_targets_nm
+    cfg = MosaicConfig()  # wide 90×90, grid 3, auto tile = 30
+    home = (12.5, -7.0)   # arbitrary wide offset (X centre, Y top edge)
+    targets = list(tile_targets_nm(cfg, *home))
+    assert len(targets) == 9
+
+    tile_w, tile_h = cfg.resolved_tile_size_nm()
+    for idx, x, y, clamped in targets:
+        assert clamped is False, f"tile {idx} clamped in an exactly tiling grid"
+        row = (idx - 1) // cfg.grid_n
+        col = (idx - 1) % cfg.grid_n
+        # Y (top edge): row * tile height below the wide top edge
+        assert y == pytest.approx(home[1] + row * tile_h), f"tile {idx} Y"
+        # X (centre): column centres at -30, 0, +30 from the wide centre
+        expected_dx = (col - 1) * tile_w
+        assert x == pytest.approx(home[0] + expected_dx), f"tile {idx} X"
+
+    # Bottom row explicitly: spans [60, 90] below the wide top edge
+    _, _, y7, _ = targets[6]
+    assert y7 - home[1] == pytest.approx(60.0)
+
+
+def test_tile_targets_5x5_bottom_rows_not_clamped():
+    from scanflow.automation.mosaic import tile_targets_nm
+    cfg = MosaicConfig(wide_size_nm=(100.0, 100.0), grid_n=5,
+                       tile_size_nm=(0.0, 0.0))
+    targets = list(tile_targets_nm(cfg, 0.0, 0.0))
+    assert len(targets) == 25
+    assert all(not clamped for _, _, _, clamped in targets)
+    # Last row's top edge: 4 * 20 = 80 nm below the wide top edge
+    for idx, _x, y, _c in targets[20:]:
+        assert y == pytest.approx(80.0), f"tile {idx}"
+
+
+def test_tile_targets_flag_clamp_for_oversized_tiles():
+    """User-forced tile larger than wide/grid must clamp and say so."""
+    from scanflow.automation.mosaic import tile_targets_nm
+    cfg = MosaicConfig(wide_size_nm=(90.0, 90.0), grid_n=3,
+                       tile_size_nm=(40.0, 40.0))  # 3×40 > 90 → overlap forced
+    targets = list(tile_targets_nm(cfg, 0.0, 0.0))
+    # Bottom row would start at 60 with only 90−40=50 available → clamped
+    assert any(clamped for _, _, _, clamped in targets)
+    for _idx, _x, y, _c in targets:
+        assert y >= 0.0
+        assert y + 40.0 <= 90.0 + 1e-9

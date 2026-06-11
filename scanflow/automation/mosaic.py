@@ -1,16 +1,18 @@
 """Mosaic campaign data model.
 
-A mosaic = one wide overview + a 3×3 grid of zoom tiles + one wide
+A mosaic = one wide overview + an N×N grid of zoom tiles + one wide
 overview at the end. Each zoom tile is acquired ``iterations_per_tile``
 times (closed-loop positioning sets the tile centre once; iterations
 are for repeat / averaging, not re-centring), so you keep the best
 (or average) scan after the fact.
 
-Grid layout (top row first, then middle, then bottom; columns L→R):
+Grid layout (top row first, then middle, then bottom; columns L→R),
+expressed in the Createc offset convention (X = frame centre, Y = frame
+TOP EDGE, increasing downward):
 
-    1 2 3      ← top    row (Y = wide_centre.Y − wide_size_nm/3)  ← tiles 1..3
-    4 5 6      ← middle row (Y = wide_centre.Y)
-    7 8 9      ← bottom row (Y = wide_centre.Y + wide_size_nm/3)
+    1 2 3      ← top    row (tile top edge at wide top edge + 0·tile_h)
+    4 5 6      ← middle row (tile top edge at wide top edge + 1·tile_h)
+    7 8 9      ← bottom row (tile top edge at wide top edge + 2·tile_h)
 
 The top row is scanned immediately after the wide overview while drift
 is minimal. Top tiles sit right at the upper boundary of the wide field;
@@ -21,7 +23,9 @@ accumulates. Middle and bottom rows follow in order.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import Iterator, List, Tuple
+
+from scanflow.core.scan_geometry import clamp_frame_to_wide_bounds
 
 
 @dataclass
@@ -116,3 +120,51 @@ def tile_centers_in_wide_pixels(cfg: MosaicConfig):
             cy = (row + 0.5) * wpy / n
             yield idx, float(cx), float(cy)
             idx += 1
+
+
+def tile_targets_nm(
+    cfg: MosaicConfig,
+    home_x_nm: float,
+    home_y_nm: float,
+) -> Iterator[Tuple[int, float, float, bool]]:
+    """Yield ``(tile_idx, target_x_nm, target_y_nm, clamped)`` per tile.
+
+    ``home_x_nm`` / ``home_y_nm`` is the wide frame's SCAN.OFFSET readback
+    (X = frame centre, Y = frame TOP EDGE — see scan_geometry). Targets
+    follow the same convention: write them to SCAN.OFFSET.{X,Y}.NM.
+
+    Each target is clamped through
+    :func:`scanflow.core.scan_geometry.clamp_frame_to_wide_bounds` so the
+    tile frame stays inside the wide field on both axes. ``clamped`` is
+    True when the requested target had to be moved — for an exactly
+    tiling grid (auto tile size) it is always False; if it fires, the
+    config requests tiles outside the wide frame and the caller should
+    warn loudly.
+    """
+    tile_w, tile_h = cfg.resolved_tile_size_nm()
+    wpx, wpy = cfg.wide_pixels
+    nm_per_px_x = cfg.wide_size_nm[0] / max(wpx, 1)
+    nm_per_px_y = cfg.wide_size_nm[1] / max(wpy, 1)
+
+    for idx, cx_px, cy_px in tile_centers_in_wide_pixels(cfg):
+        # X: centre convention — straight pixel-from-centre conversion.
+        dx_nm = (cx_px - wpx / 2.0) * nm_per_px_x
+        # Y: top-edge convention — subtract half a tile (in pixels) from
+        # the tile-centre row to get the tile's top-edge row, so
+        # dy = row * tile_h (0 for the top row).
+        dy_nm = (cy_px - wpy / (2.0 * max(cfg.grid_n, 1))) * nm_per_px_y
+        target_x = home_x_nm + dx_nm
+        target_y = home_y_nm + dy_nm
+        clamped_x, clamped_y = clamp_frame_to_wide_bounds(
+            target_x, target_y,
+            home_x_nm=home_x_nm,
+            home_y_nm=home_y_nm,
+            scan_range_x_nm=cfg.wide_size_nm[0],
+            scan_range_y_nm=cfg.wide_size_nm[1],
+            frame_width_nm=tile_w,
+            frame_height_nm=tile_h,
+        )
+        # Tolerance guards against float noise at exact-tiling boundaries.
+        was_clamped = (abs(clamped_x - target_x) > 1e-9
+                       or abs(clamped_y - target_y) > 1e-9)
+        yield idx, float(clamped_x), float(clamped_y), was_clamped

@@ -92,6 +92,32 @@ class ScanParams:
     memo: str = ""
 
 
+def _safe_float(raw, default: float = 0.0) -> float:
+    """Parse a getp() result that may be '', None, garbage, or NaN.
+
+    STMAFM occasionally returns empty strings for valid keys while busy
+    (saving, mid-stop); a bare ``float(...)`` here used to crash whatever
+    automation step happened to read parameters at that moment. A wrong
+    default is recoverable and visible in logs; a crashed overnight run
+    is not.
+    """
+    try:
+        if raw in (None, ""):
+            return float(default)
+        value = float(raw)
+    except (TypeError, ValueError):
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "unparseable instrument value %r — using %s", raw, default)
+        return float(default)
+    if value != value or value in (float("inf"), float("-inf")):  # NaN/Inf
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "non-finite instrument value %r — using %s", raw, default)
+        return float(default)
+    return value
+
+
 class ScanController:
     def __init__(self, client: "STMClient") -> None:
         self._c = client
@@ -116,8 +142,8 @@ class ScanController:
 
     @property
     def size_nm(self) -> tuple[float, float]:
-        x = float(self._c.getp("SCAN.IMAGESIZE.NM.X", ""))
-        y = float(self._c.getp("SCAN.IMAGESIZE.NM.Y", ""))
+        x = _safe_float(self._c.getp("SCAN.IMAGESIZE.NM.X", ""), 0.0)
+        y = _safe_float(self._c.getp("SCAN.IMAGESIZE.NM.Y", ""), 0.0)
         return (x, y)
 
     @size_nm.setter
@@ -127,7 +153,7 @@ class ScanController:
 
     @property
     def speed_nm_s(self) -> float:
-        return float(self._c.getp("SCAN.SPEED.NM/SEC", ""))
+        return _safe_float(self._c.getp("SCAN.SPEED.NM/SEC", ""), 0.0)
 
     @speed_nm_s.setter
     def speed_nm_s(self, value: float) -> None:
@@ -156,7 +182,7 @@ class ScanController:
 
     @property
     def rotation_deg(self) -> float:
-        return float(self._c.getp("SCAN.ROTATION.DEG", "") or 0.0)
+        return _safe_float(self._c.getp("SCAN.ROTATION.DEG", ""), 0.0)
 
     @rotation_deg.setter
     def rotation_deg(self, value: float) -> None:
@@ -522,8 +548,8 @@ class ScanController:
     def read(self) -> ScanParams:
         """Read the current scan parameters from the instrument."""
         return ScanParams(
-            bias_V=float(self._c.getp("SCAN.BIASVOLTAGE.VOLT", "")),
-            setpoint_A=float(self._c.getp("SCAN.SETPOINT.AMPERE", "") or 0.0),
+            bias_V=_safe_float(self._c.getp("SCAN.BIASVOLTAGE.VOLT", ""), 0.0),
+            setpoint_A=_safe_float(self._c.getp("SCAN.SETPOINT.AMPERE", ""), 0.0),
             size_nm=self.size_nm,
             speed_nm_s=self.speed_nm_s,
             pixels=self.pixels,

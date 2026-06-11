@@ -15,6 +15,17 @@ centre**).
 
 Use these helpers instead of writing the arithmetic inline; the wrong
 sign or a missing ``/2`` is easy to miss in a worker.
+
+FIXME(B2-frame-resize): UNRESOLVED — what does STMAFM preserve when the
+frame SIZE changes? These helpers (and the mosaic + preview workers that
+use them) assume SCAN.OFFSET.Y.NM is the TOP EDGE of the *current* frame
+and that the top edge is what a resize preserves. The survey zoom path
+(automation/runner.py, _do_feature_zoom) implicitly assumes a resize
+preserves the frame CENTRE instead. At most one is right; whichever is
+wrong mis-positions its zoom scans by half a frame in Y. See the full
+FIXME in _do_feature_zoom for the one-experiment resolution procedure,
+and REVIEW.md finding B2 (2026-06-10). Reviewers: do not approve changes
+to frame-offset code that don't state which convention they assume.
 """
 
 from __future__ import annotations

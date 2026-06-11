@@ -260,15 +260,6 @@ class STMClient:
 
     def _require(self) -> None:
         if self._stm is None:
-            # Distinguish between "never connected" and "worker thread that
-            # forgot to call bind_thread()": the GUI thread's proxy is set
-            # in connect(), so if some other thread sees stm=None we can
-            # offer a more actionable error message.
-            if not self._is_mock and any(
-                getattr(self._local, k, None) is not None
-                for k in ()  # threading.local exposes nothing across threads
-            ):
-                pass  # unreachable — kept as documentation of intent
             current = threading.current_thread().name
             raise STMNotConnectedError(
                 f"STM not connected on thread '{current}' — "

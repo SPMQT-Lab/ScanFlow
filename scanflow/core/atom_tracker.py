@@ -9,9 +9,16 @@ From the four off-centre readings it computes the gradient of the Z
 signal, which points toward the adsorbate. Applying a proportional gain
 gives the XY correction to apply to the scan offset.
 
-All movement uses ``stm.scan.set_offset_nm`` (which calls Createc's
-SETXYOFF.VOLT command and physically moves the tip) followed by a brief
-settle delay before reading ``getdacvalfb()``.
+All movement goes through :class:`scanflow.core.motion.TipMotionManager`
+— the shared policy gate for automated XY motion (scan-idle check,
+current safety check, single-move limit, readback verification) — and
+each probe is followed by a brief settle delay before reading
+``getdacvalfb()``.
+
+Failure behaviour: if anything goes wrong mid-sequence the worker
+attempts to return the tip to the reference position before releasing
+its COM proxy (both in a ``finally`` block), so the tip is never left
+parked at a probe offset.
 
 Thread safety: the worker runs in a QThread; all log signals are emitted
 from the worker thread and connected to the GUI log via Qt queued
@@ -21,12 +28,14 @@ connections.
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import numpy as np
 from PySide6.QtCore import QThread, Signal
+
+from .motion import MotionConfig, MotionResult, TipMotionManager
+from .safety import SafetyMonitor
 
 log = logging.getLogger(__name__)
 
@@ -164,11 +173,62 @@ class _FivePointWorker(QThread):
     def run(self) -> None:
         stm = self._stm
         try:
-            stm.bind_thread()
+            if not stm.bind_thread():
+                self.error_message.emit("AtomTracker: bind_thread failed")
+                return
         except Exception as e:
             self.error_message.emit(f"AtomTracker: bind_thread failed: {e}")
             return
 
+        # All physical moves go through the shared motion policy gate:
+        # scan-idle check, current safety check, move limit, readback.
+        motion = TipMotionManager(
+            stm,
+            safety=SafetyMonitor(),
+            config=MotionConfig(default_settle_s=self._settle),
+        )
+        # True once the tip may be away from the reference; drives the
+        # return-to-reference recovery in the finally block.
+        self._away_from_ref = False
+        self._tip_at_known_position = False
+        try:
+            self._run_sequence(stm, motion)
+            self._tip_at_known_position = True
+        except Exception as e:
+            self.error_message.emit(f"AtomTracker: {e}")
+        finally:
+            try:
+                if self._away_from_ref and not self._tip_at_known_position:
+                    self._recover_to_reference(motion)
+            finally:
+                stm.unbind_thread()
+
+    def _move(self, motion: TipMotionManager, x_nm: float, y_nm: float,
+              reason: str) -> None:
+        """One policy-gated absolute move; raises on refusal/failure."""
+        result: MotionResult = motion.move_absolute_nm(
+            x_nm, y_nm, reason=reason, settle_s=self._settle,
+        )
+        if not result.ok:
+            detail = "; ".join(result.warnings) or "motion refused"
+            raise RuntimeError(f"{reason} failed: {detail}")
+
+    def _recover_to_reference(self, motion: TipMotionManager) -> None:
+        """Best-effort return to the reference after a failed sequence."""
+        try:
+            self._move(motion, self._ref_x, self._ref_y,
+                       "atom-tracker recovery return-to-reference")
+            self.log_message.emit(
+                "AtomTracker: tip returned to reference after failure"
+            )
+        except Exception as e:
+            self.error_message.emit(
+                f"AtomTracker: could NOT return tip to reference "
+                f"({self._ref_x:.3f}, {self._ref_y:.3f}) nm after failure: {e} "
+                "— verify the tip position before continuing."
+            )
+
+    def _run_sequence(self, stm, motion: TipMotionManager) -> None:
         self.log_message.emit(
             f"AtomTracker: 5-point probe at ({self._ref_x:.3f}, {self._ref_y:.3f}) nm  "
             f"δ={self._delta:.2f} nm  settle={self._settle:.2f} s"
@@ -180,27 +240,21 @@ class _FivePointWorker(QThread):
         for i, (dx_f, dy_f) in enumerate(_PROBE_SEQ):
             probe_x = self._ref_x + dx_f * self._delta
             probe_y = self._ref_y + dy_f * self._delta
-            try:
-                stm.scan.set_offset_nm(probe_x, probe_y, settle_s=self._settle)
-                time.sleep(self._settle)
-                z_raw = float(stm.raw.getdacvalfb())
-                z_readings.append(z_raw)
-                self.log_message.emit(
-                    f"  {probe_labels[i]:12s}  pos=({probe_x:.3f}, {probe_y:.3f}) nm  "
-                    f"Z={z_raw:.1f} DAC"
-                )
-            except Exception as e:
-                self.error_message.emit(f"AtomTracker: probe {probe_labels[i]} failed: {e}")
-                stm.unbind_thread()
-                return
+            if dx_f or dy_f:
+                self._away_from_ref = True
+            self._move(motion, probe_x, probe_y,
+                       f"atom-tracker probe {probe_labels[i]}")
+            z_raw = float(stm.raw.getdacvalfb())
+            z_readings.append(z_raw)
+            self.log_message.emit(
+                f"  {probe_labels[i]:12s}  pos=({probe_x:.3f}, {probe_y:.3f}) nm  "
+                f"Z={z_raw:.1f} DAC"
+            )
 
         # Move tip back to reference
-        try:
-            stm.scan.set_offset_nm(self._ref_x, self._ref_y, settle_s=self._settle)
-        except Exception as e:
-            self.error_message.emit(f"AtomTracker: return-to-ref failed: {e}")
-            stm.unbind_thread()
-            return
+        self._move(motion, self._ref_x, self._ref_y,
+                   "atom-tracker return-to-reference")
+        self._away_from_ref = False
 
         z0, zpx, zmx, zpy, zmy = z_readings
         gradient_x = zpx - zmx
@@ -229,7 +283,6 @@ class _FivePointWorker(QThread):
                 f"({result.skip_reason})"
             )
             self.result_ready.emit(result)
-            stm.unbind_thread()
             return
 
         # Correction: move toward higher Z (gradient direction)
@@ -244,17 +297,16 @@ class _FivePointWorker(QThread):
         if self._apply:
             new_x = self._ref_x + dx
             new_y = self._ref_y + dy
-            try:
-                stm.scan.set_offset_nm(new_x, new_y, settle_s=self._settle)
-                self.log_message.emit(
-                    f"AtomTracker: correction applied  "
-                    f"Δx={dx:+.3f} nm  Δy={dy:+.3f} nm  "
-                    f"→ new ref ({new_x:.3f}, {new_y:.3f}) nm"
-                )
-            except Exception as e:
-                self.error_message.emit(f"AtomTracker: apply correction failed: {e}")
-                stm.unbind_thread()
-                return
+            self._away_from_ref = True
+            self._move(motion, new_x, new_y, "atom-tracker apply correction")
+            # The corrected position is the new intended location — the
+            # finally-block recovery must not drag the tip back from it.
+            self._away_from_ref = False
+            self.log_message.emit(
+                f"AtomTracker: correction applied  "
+                f"Δx={dx:+.3f} nm  Δy={dy:+.3f} nm  "
+                f"→ new ref ({new_x:.3f}, {new_y:.3f}) nm"
+            )
         else:
             self.log_message.emit(
                 f"AtomTracker: correction NOT applied (dry-run)  "
@@ -272,4 +324,3 @@ class _FivePointWorker(QThread):
             skip_reason="",
         )
         self.result_ready.emit(result)
-        stm.unbind_thread()

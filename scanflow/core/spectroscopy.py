@@ -3,6 +3,15 @@
 Vertical manipulation (VERTMAN) is CreaTec's term for point spectroscopy:
 the tip is held at a position, the bias is swept, and selected channels
 (current, lock-in X/Y, etc.) are recorded as a function of bias.
+
+PLACEHOLDER(spectroscopy): this module is deliberately minimal and is NOT
+under active development — see ROADMAP.md §5. Recipes can run basic
+single/multi-point I/V steps and that is the supported scope for now.
+When spectroscopy work resumes: controller additions go here, execution
+belongs in a dedicated spectroscopy executor (after the Phase 3 executor
+extraction), and the missing safety polling during spectra (REVIEW.md
+finding H1, spectroscopy part) must be addressed in the same change.
+Mark related edits with PLACEHOLDER(spectroscopy) so they are findable.
 """
 
 from __future__ import annotations
