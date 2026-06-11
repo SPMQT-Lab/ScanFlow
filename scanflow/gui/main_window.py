@@ -17,6 +17,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QIcon, QPixmap
 
 from scanflow.core import STMClient
+from scanflow.core import activity
 from scanflow.io import Session
 from scanflow.gui.panels.sweep_panel import SweepPanel
 from scanflow.gui.panels.mosaic_panel import MosaicPanel
@@ -222,6 +223,12 @@ class MainWindow(QMainWindow):
         self._log.append("STM disconnected")
 
     def _refresh_status(self) -> None:
+        # While a runner is active, make NO COM calls from this timer:
+        # they serialise onto the STMAFM GUI thread and lag the Createc
+        # display (H7). The run panels show live progress already.
+        if activity.is_active():
+            self._set_stm_status("automation running", _STATUS_GREEN)
+            return
         if self._stm.is_mock:
             self._set_stm_status("mock", _STATUS_AMBER)
             return

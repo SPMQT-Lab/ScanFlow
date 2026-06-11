@@ -18,6 +18,8 @@ from typing import Optional, Tuple
 import numpy as np
 from PySide6.QtCore import QObject, QTimer, Signal
 
+from scanflow.core import activity
+
 from .temperature import TemperatureMonitor, TemperatureReading
 
 log = logging.getLogger(__name__)
@@ -114,7 +116,8 @@ class TemperaturePoller(QObject):
 
         self._timer = QTimer(self)
         self._timer.setInterval(int(self._poll_s * 1000))
-        self._timer.timeout.connect(self._poll)
+        self._automation_skips = 0
+        self._timer.timeout.connect(self._timer_poll)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -149,6 +152,19 @@ class TemperaturePoller(QObject):
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _timer_poll(self) -> None:
+        # Thin to every 4th tick (~2 min at the default 30 s cadence)
+        # while automation runs — temperature.read() is several COM calls
+        # serialised onto the STMAFM GUI thread (H7). poll_now() bypasses
+        # the thinning for explicit user-triggered reads.
+        if activity.is_active():
+            self._automation_skips += 1
+            if self._automation_skips % 4:
+                return
+        else:
+            self._automation_skips = 0
+        self._poll()
 
     def _poll(self) -> None:
         if self._stm is None:

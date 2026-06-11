@@ -20,6 +20,8 @@ from typing import Optional, Tuple
 import numpy as np
 from PySide6.QtCore import QObject, QTimer, Signal
 
+from scanflow.core import activity
+
 log = logging.getLogger(__name__)
 
 
@@ -113,6 +115,11 @@ class ZMonitor(QObject):
 
     def _poll(self) -> None:
         if self._stm is None:
+            return
+        # Stand down while automation runs: getdacvalfb() at 1 Hz is
+        # serialised onto the STMAFM GUI thread and lags the Createc
+        # display (H7). Per-scan Z stability comes from the runner then.
+        if activity.is_active():
             return
         try:
             raw = float(self._stm.raw.getdacvalfb())

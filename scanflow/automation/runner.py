@@ -27,6 +27,7 @@ from scanflow.automation.recipe import (
     TipFormStep, MosaicStep, MIN_CONST_CURRENT_BIAS_V,
 )
 from scanflow.automation.mosaic import MosaicConfig, tile_targets_nm
+from scanflow.core import activity
 from scanflow.automation.scan_metrics import compute_z_stability, format_z_stability
 from scanflow.io.acquisition_log import AcquisitionLog, default_acquisition_log_path
 from scanflow.io.sidecar import (
@@ -269,6 +270,10 @@ class AutomationRunner(QThread):
             ),
         )
         self._set_state(RunnerState.RUNNING)
+        # Tell background pollers (Z monitor, status bar, temperature) to
+        # stand down: every COM call they make is serialised onto the
+        # STMAFM GUI thread and lags the Createc display during runs (H7).
+        activity.begin()
         try:
             self._execute()
         except SafetyViolation as e:
@@ -293,6 +298,7 @@ class AutomationRunner(QThread):
             self._set_state(RunnerState.ERROR)
             return
         finally:
+            activity.end()
             self._active_run_generation = 0
             self._stm.unbind_thread()
         self._set_state(RunnerState.FINISHED)
