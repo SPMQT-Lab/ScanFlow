@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .json_util import json_safe as _json_safe
+
+log = logging.getLogger(__name__)
 
 
 def _utc_now() -> str:
@@ -26,6 +29,7 @@ class AcquisitionLog:
         self.path = Path(path).resolve() if path else None
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_failures = 0
 
     def emit(self, event_type: str, **payload: Any) -> None:
         if self.path is None:
@@ -35,8 +39,25 @@ class AcquisitionLog:
             "event_type": str(event_type),
             **{str(k): _json_safe(v) for k, v in payload.items()},
         }
-        with self.path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(event, sort_keys=True, default=str) + "\n")
+        # Best-effort: the log often lives on a network share that can drop
+        # out mid-run.  Losing telemetry events must never abort the routine.
+        try:
+            with self.path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(event, sort_keys=True, default=str) + "\n")
+        except OSError as exc:
+            self._write_failures += 1
+            if self._write_failures == 1 or self._write_failures % 100 == 0:
+                log.warning(
+                    "acquisition log write failed (%d events lost so far): %s",
+                    self._write_failures, exc,
+                )
+            return
+        if self._write_failures:
+            log.info(
+                "acquisition log writable again after %d lost events",
+                self._write_failures,
+            )
+            self._write_failures = 0
 
 
 def default_acquisition_log_path(save_folder: str | Path | None) -> Path | None:
