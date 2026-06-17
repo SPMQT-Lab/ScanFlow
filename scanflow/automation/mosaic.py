@@ -54,10 +54,11 @@ class MosaicConfig:
     setpoint_A: float = 50e-12
     settling_s: float = 5.0
 
-    # Bias sweep — one value per tile iteration.
-    # Empty list → all iterations use bias_V.
-    # Non-empty → overrides iterations_per_tile; len(bias_sweep) iterations
-    # are run per tile, each at the corresponding bias.
+    # Bias sweep — the voltage(s) applied WITHIN each tile iteration.
+    # Empty list → each iteration uses the single bias_V.
+    # Non-empty → each iteration is scanned once per value in the list, so a
+    # tile runs iterations_per_tile × len(bias_sweep) images in total
+    # (e.g. iterations_per_tile=3, bias_sweep=[-0.5, 0.5] → 6 images/tile).
     bias_sweep: List[float] = field(default_factory=list)
 
     # Output ---------------------------------------------------------
@@ -77,18 +78,25 @@ class MosaicConfig:
         return self.grid_n * self.grid_n
 
     def effective_bias_sequence(self) -> List[float]:
-        """Bias value for each tile iteration.
+        """Flat list of bias values to scan per tile, in acquisition order.
 
-        Returns ``bias_sweep`` when set, otherwise ``[bias_V] × iterations_per_tile``.
-        Unsafe values (|bias| < 5 mV) are left in the sequence — the runner
-        logs a warning and skips that iteration.
+        With a sweep, each iteration runs the whole ``bias_sweep`` list, so
+        the sequence is ``bias_sweep`` repeated ``iterations_per_tile`` times
+        (multiple voltages per iteration). Without a sweep it is
+        ``[bias_V] × iterations_per_tile``. Unsafe values (|bias| < 5 mV) are
+        left in — the runner logs a warning and skips that image.
         """
+        reps = max(1, self.iterations_per_tile)
         if self.bias_sweep:
-            return list(self.bias_sweep)
-        return [self.bias_V] * max(1, self.iterations_per_tile)
+            return list(self.bias_sweep) * reps
+        return [self.bias_V] * reps
+
+    def biases_per_iteration(self) -> int:
+        """How many voltages are scanned within a single tile iteration."""
+        return len(self.bias_sweep) if self.bias_sweep else 1
 
     def effective_iterations(self) -> int:
-        """Number of iterations per tile (respects bias_sweep override)."""
+        """Total images scanned per tile (iterations × voltages-per-iteration)."""
         return len(self.effective_bias_sequence())
 
 

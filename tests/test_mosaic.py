@@ -121,16 +121,26 @@ def test_effective_bias_sequence_no_sweep():
     assert seq == [0.2, 0.2, 0.2, 0.2]
 
 
-def test_effective_bias_sequence_with_sweep():
-    """With a sweep, returns the sweep list exactly."""
+def test_effective_bias_sequence_with_sweep_single_iteration():
+    """With a sweep and one iteration, returns the voltage list once."""
     sweep = [-0.5, -0.1, 0.1, 0.5]
-    cfg = MosaicConfig(bias_V=0.1, iterations_per_tile=99, bias_sweep=sweep)
+    cfg = MosaicConfig(bias_V=0.1, iterations_per_tile=1, bias_sweep=sweep)
     assert cfg.effective_bias_sequence() == sweep
+
+
+def test_effective_bias_sequence_voltages_per_iteration():
+    """Each iteration scans every voltage: list is repeated per iteration."""
+    sweep = [-0.5, 0.5]
+    cfg = MosaicConfig(bias_V=0.1, iterations_per_tile=3, bias_sweep=sweep)
+    assert cfg.effective_bias_sequence() == [-0.5, 0.5, -0.5, 0.5, -0.5, 0.5]
+    assert cfg.biases_per_iteration() == 2
+    assert cfg.effective_iterations() == 6
 
 
 def test_effective_iterations_no_sweep():
     cfg = MosaicConfig(iterations_per_tile=3)
     assert cfg.effective_iterations() == 3
+    assert cfg.biases_per_iteration() == 1
 
 
 def test_effective_iterations_with_sweep():
@@ -138,18 +148,18 @@ def test_effective_iterations_with_sweep():
     assert cfg.effective_iterations() == 4
 
 
-def test_bias_sweep_overrides_iterations_per_tile_in_estimate():
-    """estimate_duration_s must use sweep length, not iterations_per_tile."""
+def test_multi_voltage_estimate_scales_with_iterations():
+    """estimate_duration_s must count iterations × voltages images."""
     from scanflow.automation import MosaicStep
-    # 2 sweep values → 2 iters per tile
-    cfg_sweep = MosaicConfig(iterations_per_tile=10,
+    # 2 voltages × 3 iterations = 6 images/tile
+    cfg_multi = MosaicConfig(iterations_per_tile=3,
                              bias_sweep=[-0.1, 0.1], grid_n=3)
-    # 2 manual iters, no sweep
-    cfg_plain = MosaicConfig(iterations_per_tile=2, grid_n=3)
-    t_sweep = MosaicStep(config=cfg_sweep).estimate_duration_s()
+    # 6 plain iterations, no sweep → also 6 images/tile
+    cfg_plain = MosaicConfig(iterations_per_tile=6, grid_n=3)
+    t_multi = MosaicStep(config=cfg_multi).estimate_duration_s()
     t_plain = MosaicStep(config=cfg_plain).estimate_duration_s()
-    assert t_sweep == pytest.approx(t_plain, rel=1e-6), \
-        "sweep with 2 values should match plain 2-iter estimate"
+    assert t_multi == pytest.approx(t_plain, rel=1e-6), \
+        "2 voltages × 3 iters should match plain 6-iter estimate"
 
 
 def test_empty_bias_sweep_falls_back_to_single_bias():

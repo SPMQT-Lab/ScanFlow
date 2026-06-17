@@ -674,6 +674,26 @@ def estimate_scan_timeout_s(params: "ScanParams") -> float:
     return max(120.0, estimate_scan_duration_s(params) + 90.0)
 
 
+def speed_for_target_duration_s(
+    size_nm: float,
+    pixels_y: int,
+    target_s: float,
+    *,
+    min_speed_nm_s: float = 0.5,
+    max_speed_nm_s: float = 1000.0,
+) -> float:
+    """Scan speed (nm/s) that makes one full image take ``target_s`` seconds.
+
+    Inverts :func:`estimate_scan_duration_s` (duration = 2·size·pixels_y /
+    speed). Used to keep small feature scans at a fixed wall-clock time so
+    per-image drift stays bounded, instead of inheriting the wide scan's
+    fast speed and finishing in seconds. Result is clamped to a sane range.
+    """
+    target_s = max(1.0, float(target_s))
+    speed = 2.0 * float(size_nm) * int(pixels_y) / target_s
+    return max(min_speed_nm_s, min(max_speed_nm_s, speed))
+
+
 def format_duration(seconds: float) -> str:
     """Human-readable mm:ss formatting (or 'Ns' under one minute)."""
     s = int(round(seconds))

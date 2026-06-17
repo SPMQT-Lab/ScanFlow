@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import numpy as np
 from PySide6.QtCore import QThread, Signal
 
 from scanflow.contracts import (
@@ -40,6 +41,7 @@ from scanflow.core.scan import (
     estimate_scan_duration_s as _estimate_scan_duration,
     estimate_scan_timeout_s as _estimate_scan_timeout,
     format_duration as _format_duration,
+    speed_for_target_duration_s as _speed_for_target_duration,
 )
 from scanflow.core.scan_geometry import feature_target_xy_nm
 from scanflow.automation.proposals import validate_proposed_action
@@ -87,6 +89,8 @@ class FeatureScanWorker(QThread):
         scan_range_nm: tuple[float, float] | None = None,
         enable_centering: bool = False,
         quick_pixels: int = 64,
+        pixels: int | None = None,            # None → inherit current STM pixels
+        target_duration_s: float | None = None,  # None → inherit current speed
     ) -> None:
         super().__init__()
         self._stm = stm
@@ -102,6 +106,10 @@ class FeatureScanWorker(QThread):
         self._scan_range_nm = scan_range_nm
         self._enable_centering = bool(enable_centering)
         self._quick_pixels = max(16, int(quick_pixels))
+        self._pixels = int(pixels) if pixels is not None else None
+        self._target_duration_s = (
+            float(target_duration_s) if target_duration_s is not None else None
+        )
 
     def stop(self) -> None:
         self._stop_requested = True
@@ -318,12 +326,28 @@ class FeatureScanWorker(QThread):
                         if self._size_nm is not None
                         else current.size_nm
                     )
+                    # Resolution: explicit override, else inherit from the rig.
+                    scan_pixels = (
+                        (self._pixels, self._pixels)
+                        if self._pixels is not None
+                        else current.pixels
+                    )
+                    # Speed: when a target duration is requested, slow the scan
+                    # so a small feature image still takes ~target_duration_s
+                    # (keeps per-image drift bounded) instead of inheriting the
+                    # wide scan's fast speed and finishing in seconds.
+                    if self._target_duration_s is not None:
+                        scan_speed = _speed_for_target_duration(
+                            scan_size[0], scan_pixels[1], self._target_duration_s
+                        )
+                    else:
+                        scan_speed = current.speed_nm_s
                     params = ScanParams(
                         bias_V=b,
                         setpoint_A=setpoint_A,
                         size_nm=scan_size,
-                        speed_nm_s=current.speed_nm_s,
-                        pixels=current.pixels,
+                        speed_nm_s=scan_speed,
+                        pixels=scan_pixels,
                         rotation_deg=current.rotation_deg,
                         const_height=current.const_height,
                         channels=current.channels,

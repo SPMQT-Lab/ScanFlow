@@ -995,6 +995,7 @@ class AutomationRunner(QThread):
             # so a bias sweep is supported (each iter at a different voltage).
             # apply() preserves the XY offset set by set_offset_nm() above.
             bias_seq = cfg.effective_bias_sequence()
+            bpi = cfg.biases_per_iteration()  # voltages scanned per iteration
             zoom_nm_per_px_x = tile_size_nm[0] / max(cfg.tile_pixels[0], 1)
             zoom_nm_per_px_y = tile_size_nm[1] / max(cfg.tile_pixels[1], 1)
 
@@ -1041,12 +1042,14 @@ class AutomationRunner(QThread):
                     if self._stop_requested:
                         break
 
-                # Filenames: include the bias tag when a sweep is active so
-                # each image is self-documenting (e.g. tile_02_iter3_+100mV.dat).
+                # Filenames: real iteration number (several voltages may share
+                # one iteration) plus a bias tag so each image is unique and
+                # self-documenting (e.g. tile_02_iter3_+100mV.dat).
+                iter_no = it // bpi + 1
                 bias_tag = (f"_{iter_bias_V * 1000:+.0f}mV"
                             if cfg.bias_sweep else "")
-                dat_name = f"tile_{tile_idx:02d}_iter{it + 1}{bias_tag}.dat"
-                png_name = f"tile_{tile_idx:02d}_iter{it + 1}{bias_tag}.png"
+                dat_name = f"tile_{tile_idx:02d}_iter{iter_no}{bias_tag}.dat"
+                png_name = f"tile_{tile_idx:02d}_iter{iter_no}{bias_tag}.png"
 
                 self._log_offset(f"tile {tile_idx:02d} iter{it + 1} before scan")
                 path = self._scan_and_save_to(output, dat_name)

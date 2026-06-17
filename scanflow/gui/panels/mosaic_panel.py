@@ -109,6 +109,7 @@ class MosaicPanel(QWidget):
         self._sweep_check.toggled.connect(self._on_sweep_toggled)
         self._sweep_edit.textChanged.connect(self._refresh_sweep_info)
         self._sweep_edit.textChanged.connect(self._refresh_estimate)
+        self._iters.valueChanged.connect(self._refresh_sweep_info)
 
         # All spinboxes that affect the time estimate.
         for w in (self._wide_x, self._wide_y,
@@ -213,16 +214,16 @@ class MosaicPanel(QWidget):
         )
         g.addWidget(self._grid_n, 3, 3)
 
-        # Row 4: iterations (hidden when bias sweep is active).
+        # Row 4: iterations.
         self._iters_label = QLabel("Iterations per tile")
         g.addWidget(self._iters_label, 4, 2)
         self._iters = QSpinBox()
         self._iters.setRange(1, 20)
         self._iters.setValue(3)
         self._iters.setToolTip(
-            "Scans per tile (for repeat / averaging). "
-            "Ignored when Bias sweep is active — iteration count "
-            "comes from the number of sweep values."
+            "How many times each tile is re-imaged (repeat / averaging). "
+            "With multiple voltages enabled, every iteration scans all "
+            "the listed voltages, so total images = iterations × voltages."
         )
         g.addWidget(self._iters, 4, 3)
 
@@ -257,23 +258,25 @@ class MosaicPanel(QWidget):
         g.addWidget(self._settle, 1, 1)
 
         # Row 2: bias sweep toggle.
-        self._sweep_check = QCheckBox("Bias sweep per tile iteration")
+        self._sweep_check = QCheckBox("Multiple voltages per iteration")
         self._sweep_check.setToolTip(
-            "Each iteration of every tile is acquired at a different bias.\n"
-            "Enter the bias values (V) as a comma-separated list.\n"
-            "The number of values determines iterations per tile.\n"
+            "Scan each tile at several biases within every iteration.\n"
+            "Enter the bias values (V) as a comma-separated list; each\n"
+            "iteration acquires one image per value. Total images per tile\n"
+            "= iterations × number of voltages.\n"
             "'Bias (V)' above is used for the wide overview scans."
         )
         g.addWidget(self._sweep_check, 2, 0, 1, 4)
 
         # Row 3: sweep values (shown only when sweep is ON).
-        self._sweep_values_label = QLabel("Sweep values (V):")
+        self._sweep_values_label = QLabel("Voltages (V):")
         g.addWidget(self._sweep_values_label, 3, 0)
         self._sweep_edit = QLineEdit()
         self._sweep_edit.setPlaceholderText("e.g. -0.5, -0.1, 0.1, 0.5")
         self._sweep_edit.setToolTip(
-            "Comma-separated bias values in volts, one per tile iteration.\n"
-            "Example: -0.5, -0.1, 0.1, 0.5  →  4 iterations per tile."
+            "Comma-separated bias values in volts, scanned within each\n"
+            "iteration. Example: -0.5, -0.1, 0.1, 0.5  →  4 images per\n"
+            "iteration (× iterations per tile)."
         )
         g.addWidget(self._sweep_edit, 3, 1, 1, 2)
         self._sweep_info = QLabel("")
@@ -302,10 +305,19 @@ class MosaicPanel(QWidget):
         self._start_btn.clicked.connect(self._start_run)
         g.addWidget(self._start_btn, 0, 0)
 
+        self._pause_btn = QPushButton("Pause")
+        self._pause_btn.setEnabled(False)
+        self._pause_btn.setToolTip(
+            "Pause after the current scan finishes; click again to resume. "
+            "The tip holds position — no motion happens while paused."
+        )
+        self._pause_btn.clicked.connect(self._pause_run)
+        g.addWidget(self._pause_btn, 0, 1)
+
         self._stop_btn = QPushButton("Stop")
         self._stop_btn.setEnabled(False)
         self._stop_btn.clicked.connect(self._stop_run)
-        g.addWidget(self._stop_btn, 0, 1)
+        g.addWidget(self._stop_btn, 0, 2)
 
         self._force_quit_btn = QPushButton("Force Quit")
         self._force_quit_btn.setEnabled(False)
@@ -314,7 +326,7 @@ class MosaicPanel(QWidget):
             "the STM may be left mid-scan."
         )
         self._force_quit_btn.clicked.connect(self._force_quit_run)
-        g.addWidget(self._force_quit_btn, 0, 2)
+        g.addWidget(self._force_quit_btn, 0, 3)
         return box
 
     # ------------------------------------------------------------------
@@ -338,12 +350,13 @@ class MosaicPanel(QWidget):
         self._tile_y.setEnabled(not auto)
 
     def _on_sweep_toggled(self, checked: bool) -> None:
-        """Show/hide sweep widgets; update bias label; hide iterations."""
+        """Show/hide sweep widgets; update bias label.
+
+        Iterations stays visible: with a sweep, each iteration scans every
+        voltage in the list, so the tile runs iterations × voltages images.
+        """
         for w in (self._sweep_values_label, self._sweep_edit, self._sweep_info):
             w.setVisible(checked)
-        # Hide manual iteration count when the sweep drives it.
-        self._iters_label.setVisible(not checked)
-        self._iters.setVisible(not checked)
         # Clarify that the bias field controls only the wide scans.
         self._bias_label.setText(
             "Wide scan bias (V)" if checked else "Bias (V)"
@@ -362,7 +375,10 @@ class MosaicPanel(QWidget):
                 self._sweep_info.setText("(empty)")
                 self._sweep_info.setStyleSheet("color: gray; font-style: italic;")
             else:
-                self._sweep_info.setText(f"→ {n} iter{'s' if n != 1 else ''}/tile")
+                iters = self._iters.value()
+                self._sweep_info.setText(
+                    f"→ {n} V/iter × {iters} = {n * iters} img/tile"
+                )
                 self._sweep_info.setStyleSheet("color: green; font-weight: bold;")
         except ValueError:
             self._sweep_info.setText("⚠ invalid")
@@ -389,7 +405,7 @@ class MosaicPanel(QWidget):
         n_scans = 2 + n_tiles * n_iters
         self._count_label.setText(
             f"Scans: <b>{n_scans}</b>  "
-            f"(2 wide + {n_tiles} tiles × {n_iters} iter)"
+            f"(2 wide + {n_tiles} tiles × {n_iters} img)"
         )
         self._estimate_label.setText(
             f"Estimated total time: <b>{format_duration(total)}</b>"
@@ -443,9 +459,12 @@ class MosaicPanel(QWidget):
         # Bias description for the confirmation dialog.
         if cfg.bias_sweep:
             shown = cfg.bias_sweep[:6]
-            bias_str = "Bias sweep: " + ", ".join(
-                f"{b * 1000:.1f} mV" for b in shown
-            ) + (" …" if len(cfg.bias_sweep) > 6 else "")
+            bias_str = (
+                f"Voltages/iteration ({cfg.biases_per_iteration()}): "
+                + ", ".join(f"{b * 1000:.1f} mV" for b in shown)
+                + (" …" if len(cfg.bias_sweep) > 6 else "")
+                + f"  × {cfg.iterations_per_tile} iter"
+            )
         else:
             bias_str = f"Bias {cfg.bias_V:.3f} V"
 
@@ -455,7 +474,7 @@ class MosaicPanel(QWidget):
             f"Wide: {cfg.wide_size_nm[0]:.0f} × {cfg.wide_size_nm[1]:.0f} nm "
             f"@ {cfg.wide_speed_nm_s:.0f} nm/s<br>"
             f"Grid: {cfg.grid_n}×{cfg.grid_n} = {n_tiles} tiles, "
-            f"{n_iters} iterations each "
+            f"{n_iters} images each "
             f"= {n_tiles * n_iters} small scans<br>"
             f"Tile size: {cfg.resolved_tile_size_nm()[0]:.2f} × "
             f"{cfg.resolved_tile_size_nm()[1]:.2f} nm<br>"
@@ -520,11 +539,27 @@ class MosaicPanel(QWidget):
         self._eta_timer.start()
         self._progress.setMaximum(n_tiles + 2)
         self._start_btn.setEnabled(False)
+        self._pause_btn.setEnabled(True)
+        self._pause_btn.setText("Pause")
         self._stop_btn.setEnabled(True)
         self._force_quit_btn.setEnabled(True)
 
     def _on_scan_completed(self, path: str) -> None:
         self.scan_completed.emit(path)
+
+    def _pause_run(self) -> None:
+        """Toggle pause/resume. The runner halts at the next scan-poll and
+        holds the tip in place until resumed (no motion while paused)."""
+        if not self._runner:
+            return
+        if self._runner._state == RunnerState.PAUSED:
+            self._runner.resume()
+            self._pause_btn.setText("Pause")
+            self.log_message.emit("Mosaic resumed")
+        else:
+            self._runner.pause()
+            self._pause_btn.setText("Resume")
+            self.log_message.emit("Mosaic pause requested — will hold after current scan")
 
     def _stop_run(self) -> None:
         if not self._runner:
@@ -574,6 +609,8 @@ class MosaicPanel(QWidget):
             self._time_label.setText("")
             self._run_start_t = None
             self._start_btn.setEnabled(True)
+            self._pause_btn.setEnabled(False)
+            self._pause_btn.setText("Pause")
             self._stop_btn.setEnabled(False)
             self._force_quit_btn.setEnabled(False)
             self._stop_btn.setText("Stop")

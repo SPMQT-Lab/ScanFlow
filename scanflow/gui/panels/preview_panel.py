@@ -472,6 +472,34 @@ class _FeatureScanDialog(QDialog):
         self._size.setToolTip("Square scan frame side length for each follow-up feature scan.")
         form.addRow("Scan size", self._size)
 
+        self._pixels = QComboBox()
+        for _label, _val in [("128 × 128", 128), ("256 × 256", 256), ("512 × 512", 512)]:
+            self._pixels.addItem(_label, _val)
+        _default_px = int(d.get("pixels", 256))
+        for _i in range(self._pixels.count()):
+            if self._pixels.itemData(_i) == _default_px:
+                self._pixels.setCurrentIndex(_i)
+                break
+        self._pixels.setToolTip("Pixel resolution of each feature scan (no longer inherited from the wide scan).")
+        form.addRow("Resolution", self._pixels)
+
+        # Target wall-clock time per feature image. The worker computes the
+        # scan speed from size + resolution to hit this, so small features
+        # are always imaged in a fixed ~5 min instead of a few fast seconds.
+        self._time_preset = QComboBox()
+        for _label, _minutes in [("5 min", 5.0), ("10 min", 10.0),
+                                 ("15 min", 15.0), ("Inherit rig speed", None)]:
+            self._time_preset.addItem(_label, _minutes)
+        _default_min = d.get("target_minutes", 5.0)
+        _idx = next((i for i in range(self._time_preset.count())
+                     if self._time_preset.itemData(i) == _default_min), 0)
+        self._time_preset.setCurrentIndex(_idx)
+        self._time_preset.setToolTip(
+            "Per-image scan time. Sets the scan speed so each feature takes\n"
+            "this long — keeps drift per image bounded. Default 5 min."
+        )
+        form.addRow("Target scan time", self._time_preset)
+
         # ── Electrical parameters ─────────────────────────────────────────
         self._bias = QDoubleSpinBox()
         self._bias.setRange(-10.0, 10.0)
@@ -581,6 +609,8 @@ class _FeatureScanDialog(QDialog):
             bias_sequence = [float(x.strip()) for x in seq_text.split(",") if x.strip()]
         return {
             "size_nm": float(self._size.value()),
+            "pixels": int(self._pixels.currentData() or 256),
+            "target_minutes": self._time_preset.currentData(),
             "bias_V": float(self._bias.value()),
             "setpoint_nA": float(self._setpoint.value()),
             "repetitions": int(self._repetitions.value()),
@@ -2257,6 +2287,11 @@ class PreviewPanel(QWidget):
             ),
             enable_centering=scan_params.get("enable_centering", False),
             quick_pixels=scan_params.get("quick_pixels", 64),
+            pixels=scan_params.get("pixels", 256),
+            target_duration_s=(
+                scan_params["target_minutes"] * 60.0
+                if scan_params.get("target_minutes") is not None else None
+            ),
         )
         n_reps = len(scan_params["bias_sequence"]) if scan_params["bias_sequence"] else scan_params["repetitions"]
         self._scan_worker.progress.connect(self._on_scan_progress)
