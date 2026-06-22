@@ -38,6 +38,20 @@ class TemperatureMonitor:
         self._working_keys: dict[str, str] = {}   # field → key that actually works
         self._diagnosed = False
 
+    def _poke_refresh(self) -> None:
+        """Force Createc to refresh its temperature readout before we read it.
+
+        On STMAFM 4.3+ the ``T_*[K]`` parameters are stale (often empty)
+        until a parameter write nudges the server to re-poll the ADCs.
+        py-createc does the same dummy ``MEMO_STMAFM`` write before every
+        temperature read. Best-effort: a failure here just means the read
+        falls back to whatever value is cached.
+        """
+        try:
+            self._c.setp("MEMO_STMAFM", "")
+        except Exception:
+            pass
+
     def _try_float(self, *keys: str) -> Optional[float]:
         """Try each key in order, return the first that yields a non-empty float."""
         for key in keys:
@@ -68,6 +82,9 @@ class TemperatureMonitor:
         return None
 
     def read(self) -> TemperatureReading:
+        # Nudge Createc to refresh the readout, otherwise the T_*[K] keys
+        # come back empty and every sensor reads as "no data".
+        self._poke_refresh()
         reading = TemperatureReading(
             # T-STM: has a trailing colon that some Createc versions reject; try both
             stm=self._try_float_tracked("stm", "T-STM:", "T-STM", "T_STM"),

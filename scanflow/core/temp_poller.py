@@ -32,8 +32,8 @@ SENSOR_LABELS: dict[str, str] = {
     "one_K":   "1K head",
     "adc2_K":  "ADC2",
     "adc3_K":  "ADC3",
-    "aux6_K":  "AUX6",
-    "aux7_K":  "AUX7",
+    "aux6_K":  "STM (AUX6)",   # T_AUXADC6[K] = STM temperature (per py-createc)
+    "aux7_K":  "LHe (AUX7)",   # T_AUXADC7[K] = LHe bath temperature
 }
 
 SENSOR_COLORS: dict[str, str] = {
