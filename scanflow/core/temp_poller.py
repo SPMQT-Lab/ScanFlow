@@ -1,10 +1,8 @@
 """Background temperature poller — reads all cryostat sensors on a QTimer.
 
 Modelled after ZMonitor: a QObject with a QTimer that polls every
-``poll_interval_s``, keeps a rolling history buffer, emits per-sensor
-summaries at ``summary_interval_s``, and fires ``refill_detected`` when
-any sensor drops more than ``refill_threshold_K`` in a single poll
-(almost always an LN2 refill event).
+``poll_interval_s``, keeps a rolling history buffer, and emits per-sensor
+summaries at ``summary_interval_s``.
 """
 
 from __future__ import annotations
@@ -81,14 +79,10 @@ class TemperaturePoller(QObject):
         Emitted every ``summary_interval_s``. Each entry is keyed by
         window name ("1h", "3h") then by sensor field name, with sub-keys
         ``min_K``, ``max_K``, ``delta_K``, ``latest_K``, ``n``.
-    refill_detected(sensor_field, delta_K)
-        Emitted when a sensor drops more than ``refill_threshold_K`` in
-        one poll interval — almost certainly a LN2 refill.
     """
 
     sample_added    = Signal(float, object)   # (t_epoch, TemperatureReading)
     summary         = Signal(dict)
-    refill_detected = Signal(str, float)      # (sensor_field, delta_K)
 
     def __init__(
         self,
@@ -96,7 +90,6 @@ class TemperaturePoller(QObject):
         *,
         poll_interval_s: float = 30.0,
         summary_interval_s: float = 3600.0,
-        refill_threshold_K: float = 2.0,
         max_history_s: float = 12 * 3600.0,
         parent=None,
     ) -> None:
@@ -104,15 +97,10 @@ class TemperaturePoller(QObject):
         self._stm = stm
         self._poll_s = float(poll_interval_s)
         self._summary_s = float(summary_interval_s)
-        self._refill_K = float(refill_threshold_K)
         max_samples = int(max_history_s / max(poll_interval_s, 1.0)) + 100
         self._buffer: deque[Tuple[float, TemperatureReading]] = deque(maxlen=max_samples)
         self._last_reading: Optional[TemperatureReading] = None
         self._last_summary_t: Optional[float] = None
-        # Refill event log: list of (t, sensor_field, delta_K)
-        # Bounded: refills are rare physical events, but a stuck sensor
-        # oscillating across the threshold must not grow this forever.
-        self._refill_events: deque[Tuple[float, str, float]] = deque(maxlen=500)
 
         self._timer = QTimer(self)
         self._timer.setInterval(int(self._poll_s * 1000))
@@ -141,7 +129,6 @@ class TemperaturePoller(QObject):
         self._buffer.clear()
         self._last_reading = None
         self._last_summary_t = None
-        self._refill_events.clear()
 
     def set_stm(self, stm) -> None:
         self._stm = stm
@@ -205,7 +192,6 @@ class TemperaturePoller(QObject):
                     "— check the COM key names in TemperatureMonitor.read()"
                 )
 
-        self._check_refill(t, reading)
         self._buffer.append((t, reading))
         self._last_reading = reading
         self.sample_added.emit(t, reading)
@@ -216,20 +202,6 @@ class TemperaturePoller(QObject):
             stats = self._compute_summary()
             self.summary.emit(stats)
             self._last_summary_t = t
-
-    def _check_refill(self, t: float, new: TemperatureReading) -> None:
-        if self._last_reading is None:
-            return
-        for field in SENSOR_FIELDS:
-            prev = getattr(self._last_reading, field)
-            curr = getattr(new, field)
-            if prev is None or curr is None:
-                continue
-            delta = curr - prev
-            if delta < -abs(self._refill_K):
-                log.info("Refill detected on %s: ΔT = %.3f K", field, delta)
-                self._refill_events.append((t, field, delta))
-                self.refill_detected.emit(field, delta)
 
     def _compute_summary(self) -> dict:
         result: dict[str, dict] = {}
@@ -286,7 +258,3 @@ class TemperaturePoller(QObject):
                 if getattr(r, field) is not None:
                     seen.add(field)
         return [f for f in SENSOR_FIELDS if f in seen]
-
-    def refill_events(self) -> list[Tuple[float, str, float]]:
-        """Return list of (t_epoch, sensor_field, delta_K) for all refill events."""
-        return list(self._refill_events)

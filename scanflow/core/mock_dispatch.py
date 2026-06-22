@@ -110,9 +110,8 @@ _DEFAULTS: Dict[str, Any] = {
     "AFM.SRS_GAIN": 100.0,
     "AFM.PLL_AMPLITUDE.NM": 0.2,
     "AFM.RESULTS.FCENTER.HZ": 24500.0,
-    "T_ADC2[K]": 4.5,
-    "T_ADC3[K]": 77.0,
-    "T-STM:": 4.5,
+    "T_AUXADC6[K]": 4.5,    # STM stage temperature
+    "T_AUXADC7[K]": 4.2,    # LHe bath temperature
     "Block_DSTime_Change": False,
 }
 

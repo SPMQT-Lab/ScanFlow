@@ -63,9 +63,9 @@ def test_read_values_via_getparam():
 
 def test_falls_back_to_getp_when_no_raw():
     """Mock / no raw COM: must still read via getp + poke via setp."""
-    c = _Client(raw=None, getp_values={"T-STM:": "4.5"})
+    c = _Client(raw=None, getp_values={"T_AUXADC6[K]": "4.5"})
     reading = TemperatureMonitor(c).read()
-    assert reading.stm == 4.5
+    assert reading.aux6_K == 4.5
     assert ("setp", "MEMO_STMAFM", "") in c.calls
 
 

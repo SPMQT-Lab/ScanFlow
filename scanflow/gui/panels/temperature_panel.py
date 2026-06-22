@@ -1,7 +1,7 @@
 """Temperature monitor tab — live plot of all cryostat sensors.
 
-Shows one pyqtgraph curve per active sensor, marks LN2 refill events
-as vertical lines, and emits hourly ΔT summaries to the Log panel.
+Shows one pyqtgraph curve per active sensor and emits hourly ΔT
+summaries to the Log panel.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import pyqtgraph as pg
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
-    QDoubleSpinBox, QGroupBox, QGridLayout, QFileDialog, QFrame,
+    QGroupBox, QGridLayout, QFileDialog, QFrame,
 )
 
 from scanflow.core.temp_poller import (
@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 
 
 class TemperaturePanel(QWidget):
-    """Live temperature plot + per-sensor readouts + refill event markers."""
+    """Live temperature plot + per-sensor readouts."""
 
     log_message = Signal(str)
 
@@ -36,13 +36,11 @@ class TemperaturePanel(QWidget):
         self._poller = poller
         self._window_s: float | None = 3600.0   # default: 1 hour
         self._curves: dict[str, pg.PlotDataItem] = {}
-        self._refill_lines: list[pg.InfiniteLine] = []
         self._stat_labels: dict[tuple, QLabel] = {}
         self._build_ui()
 
         poller.sample_added.connect(self._on_sample)
         poller.summary.connect(self._on_summary)
-        poller.refill_detected.connect(self._on_refill)
 
         self._stats_timer = QTimer(self)
         self._stats_timer.setInterval(5000)   # refresh value table every 5 s
@@ -64,21 +62,6 @@ class TemperaturePanel(QWidget):
         self._window_combo.addItems(["1 hour", "3 hours", "6 hours", "All history"])
         self._window_combo.currentIndexChanged.connect(self._on_window_change)
         ctrl.addWidget(self._window_combo)
-
-        ctrl.addSpacing(20)
-        ctrl.addWidget(QLabel("Refill threshold (K):"))
-        self._refill_spin = QDoubleSpinBox()
-        self._refill_spin.setRange(0.5, 20.0)
-        self._refill_spin.setDecimals(1)
-        self._refill_spin.setSingleStep(0.5)
-        self._refill_spin.setValue(self._poller._refill_K)
-        self._refill_spin.setToolTip(
-            "Temperature drop in a single poll that triggers a REFILL event."
-        )
-        self._refill_spin.valueChanged.connect(
-            lambda v: setattr(self._poller, "_refill_K", float(v))
-        )
-        ctrl.addWidget(self._refill_spin)
 
         ctrl.addStretch(1)
 
@@ -167,26 +150,6 @@ class TemperaturePanel(QWidget):
         self.log_message.emit(msg)
         self._refresh_values()
 
-    def _on_refill(self, sensor: str, delta_K: float) -> None:
-        label = SENSOR_LABELS.get(sensor, sensor)
-        self.log_message.emit(
-            f"⚠ LN2 REFILL detected on {label}: ΔT = {delta_K:.2f} K  "
-            f"(scan paused automatically if running)"
-        )
-        # Mark refill on plot as a vertical line
-        if self._poller._buffer:
-            t_event = self._poller._buffer[-1][0]
-            t0 = self._poller._buffer[0][0]
-            t_min = (t_event - t0) / 60.0
-            line = pg.InfiniteLine(
-                pos=t_min, angle=90,
-                pen=pg.mkPen("#e63946", width=2, style=Qt.DashLine),
-                label=f"REFILL\n{label}",
-                labelOpts={"color": "#e63946", "position": 0.05},
-            )
-            self._plot.addItem(line)
-            self._refill_lines.append(line)
-
     # ------------------------------------------------------------------
     # Plot refresh
     # ------------------------------------------------------------------
@@ -245,9 +208,6 @@ class TemperaturePanel(QWidget):
 
     def _clear_history(self) -> None:
         self._poller.clear()
-        for line in self._refill_lines:
-            self._plot.removeItem(line)
-        self._refill_lines.clear()
         for curve in self._curves.values():
             curve.setData([], [])
             curve.setVisible(False)

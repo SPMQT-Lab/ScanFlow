@@ -114,16 +114,11 @@ class TemperatureMonitor:
         # Nudge Createc to refresh the readout, otherwise the T_*[K] keys
         # come back empty and every sensor reads as "no data".
         self._poke_refresh()
+        # This rig only wires the two AUXADC channels (STM = AUXADC6,
+        # LHe = AUXADC7). Once getparam is used, the other speculative keys
+        # (T-STM:, OneK_*, T_ADC2/3) resolve to unwired-channel garbage, so
+        # they are not probed — only the two real sensors are read.
         reading = TemperatureReading(
-            # T-STM: has a trailing colon that some Createc versions reject; try both
-            stm=self._try_float_tracked("stm", "T-STM:", "T-STM", "T_STM"),
-            # OneK channels: no special characters, but may simply not be wired
-            cryo_4K=self._try_float_tracked("cryo_4K", "OneK_4K_Cryo"),
-            cryo_1K=self._try_float_tracked("cryo_1K", "OneK_1K_Cryo"),
-            one_K=self._try_float_tracked("one_K", "OneK_STM"),
-            # ADC keys: [K] brackets may not be accepted by COM getp; try stripped fallback
-            adc2_K=self._try_float_tracked("adc2_K", "T_ADC2[K]", "T_ADC2"),
-            adc3_K=self._try_float_tracked("adc3_K", "T_ADC3[K]", "T_ADC3"),
             aux6_K=self._try_float_tracked("aux6_K", "T_AUXADC6[K]", "T_AUXADC6"),
             aux7_K=self._try_float_tracked("aux7_K", "T_AUXADC7[K]", "T_AUXADC7"),
         )
