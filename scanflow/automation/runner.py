@@ -28,7 +28,9 @@ from scanflow.automation.recipe import (
 )
 from scanflow.automation.mosaic import MosaicConfig, tile_targets_nm
 from scanflow.core import activity
-from scanflow.automation.scan_metrics import compute_z_stability, format_z_stability
+from scanflow.automation.scan_metrics import (
+    compute_z_stability, format_z_stability, is_z_frozen,
+)
 from scanflow.io.acquisition_log import AcquisitionLog, default_acquisition_log_path
 from scanflow.io.sidecar import (
     SessionManifestWriter, new_session_id, scanflow_sidecar_path,
@@ -419,6 +421,27 @@ class AutomationRunner(QThread):
     def _apply_scan_params(self, params: ScanParams) -> None:
         self._active_scan_params = params
         self._stm.scan.apply(params)
+        self._arm_tunnel_floor(params.setpoint_A)
+
+    def _arm_tunnel_floor(self, setpoint_A: Optional[float]) -> None:
+        """Set the 'tunneling lost' current floor for the upcoming scan.
+
+        Floor = max(absolute floor, fraction × setpoint). Re-armed per scan
+        and the sustained-low-current timer is reset so a low reading during
+        the previous settle/motion never carries over.
+        """
+        r = self._recipe
+        cfg = self._safety.config
+        if (getattr(r, "stop_on_tunnel_lost", True)
+                and setpoint_A and setpoint_A > 0):
+            cfg.min_tunnel_current_A = max(
+                getattr(r, "tunnel_lost_floor_A", 3e-12),
+                getattr(r, "tunnel_lost_fraction", 0.15) * float(setpoint_A),
+            )
+            cfg.tunnel_lost_grace_s = getattr(r, "tunnel_lost_grace_s", 8.0)
+        else:
+            cfg.min_tunnel_current_A = None
+        self._safety.reset_tunnel_timer()
 
     def _routine_name(self) -> str:
         kinds = {getattr(step, "kind", "scan") for step in self._recipe.steps}
@@ -816,8 +839,28 @@ class AutomationRunner(QThread):
             self._last_z_stability = metrics
             self._acq_log.emit("z_stability", metrics=metrics)
             self.z_stability.emit(metrics)
+            self._check_z_frozen(metrics)
         except Exception:
             log.debug("compute_z_stability failed", exc_info=True)
+
+    def _check_z_frozen(self, metrics) -> None:
+        """Stop the run if a completed scan shows a frozen Z signal.
+
+        Exactly-zero Z variation on a valid image means the feedback loop or
+        the Z readback is stuck (real data always has some residual), so the
+        scan is blind — halt rather than keep imaging garbage. Disable with
+        ``recipe.stop_on_frozen_z = False``.
+        """
+        if not getattr(self._recipe, "stop_on_frozen_z", True):
+            return
+        if is_z_frozen(metrics):
+            msg = ("Z signal frozen — 0 pm drift on a valid scan; feedback or "
+                   "Z readback appears stuck. Stopping scanning.")
+            log.error(msg)
+            self._acq_log.emit("z_frozen_abort", metrics=metrics)
+            self.info_message.emit("⚠ " + msg)
+            self.error.emit(msg)
+            self._stop_requested = True
 
     def _do_mosaic_step(self, step: MosaicStep, label: str) -> None:
         """Wide overview → N×N zoom tiles (M iterations each) → wide overview.
@@ -1031,6 +1074,7 @@ class AutomationRunner(QThread):
                           f"{iter_bias_V * 1000:.1f} mV"),
                 )
                 self._stm.scan.apply(iter_params)
+                self._arm_tunnel_floor(cfg.setpoint_A)
                 self._log_offset(f"tile {tile_idx:02d} iter{it + 1} after apply")
 
                 if cfg.settling_s > 0:
@@ -1069,6 +1113,7 @@ class AutomationRunner(QThread):
                     self._last_z_stability = stability
                     self._acq_log.emit("z_stability", metrics=stability)
                     self.z_stability.emit(stability)
+                    self._check_z_frozen(stability)
                 except Exception:
                     pass
 
@@ -1195,6 +1240,7 @@ class AutomationRunner(QThread):
             if img is not None:
                 self._last_z_stability = compute_z_stability(img)
                 quality = {"z_stability": self._last_z_stability}
+                self._check_z_frozen(self._last_z_stability)
         except Exception:
             quality = None
         self._record_scan_artifacts(target, role=role, quality=quality)
@@ -1392,6 +1438,20 @@ class AutomationRunner(QThread):
             self._acq_log.emit("safety_reading", current_A=current, ok=status.ok)
             self.safety_reading.emit(current)
         if not status.ok:
+            if status.kind == "tunnel_lost":
+                # Tip fell out of tunneling — stop gracefully WITHOUT a
+                # retract (it is already away from the surface). Let the
+                # current scan finish unwinding via the normal stop path.
+                self._acq_log.emit(
+                    "tunnel_lost_abort",
+                    reason=status.reason,
+                    current_A=status.measured_current_A,
+                )
+                log.error(status.reason)
+                self.info_message.emit("⚠ " + status.reason)
+                self.error.emit(status.reason)
+                self._stop_requested = True
+                return
             self._acq_log.emit(
                 "safety_abort",
                 reason=status.reason,

@@ -91,6 +91,21 @@ def format_z_stability(metrics: Dict[str, float]) -> str:
     )
 
 
+def is_z_frozen(metrics: Dict[str, float]) -> bool:
+    """True when a VALID scan shows exactly zero Z variation (frozen Z).
+
+    A live feedback loop always leaves some per-line residual (tip noise +
+    surface corrugation), so an exactly-flat Z channel on real scan data
+    means the Z readback or feedback loop is stuck — a malfunction worth
+    stopping for. A missing/invalid image (rating ``"n/a"``) is NOT frozen,
+    just absent, so it never trips this.
+    """
+    if not metrics or metrics.get("rating") in (None, "n/a"):
+        return False
+    return (float(metrics.get("rms_pm", 0.0)) == 0.0
+            and float(metrics.get("max_pm", 0.0)) == 0.0)
+
+
 def _empty() -> Dict[str, float]:
     return {"rms_pm": 0.0, "max_pm": 0.0, "jumps": 0, "rating": "n/a"}
 

@@ -335,6 +335,16 @@ class SweepPanel(QWidget):
         self._safety_chk.setChecked(True)
         g.addWidget(self._safety_chk, 0, 0, 1, 2)
 
+        self._tunnel_chk = QCheckBox("Stop if tip loses tunneling")
+        self._tunnel_chk.setChecked(True)
+        self._tunnel_chk.setToolTip(
+            "Halt scanning when the tip falls out of tunneling range so the "
+            "software isn't left 'scanning' nothing. Two detectors: live "
+            "current collapse to ~0 during a scan, and a frozen (0 pm) Z "
+            "signal on the completed image."
+        )
+        g.addWidget(self._tunnel_chk, 3, 0, 1, 4)
+
         g.addWidget(QLabel("|I| threshold (nA)"), 0, 2)
         self._safety_nA = QDoubleSpinBox()
         self._safety_nA.setRange(0.001, 1000.0)
@@ -475,6 +485,8 @@ class SweepPanel(QWidget):
         recipe.save_folder = self._save_folder.text()
         recipe.safety_enable = self._safety_chk.isChecked()
         recipe.safety_max_current_A = self._safety_nA.value() * 1e-9
+        recipe.stop_on_tunnel_lost = self._tunnel_chk.isChecked()
+        recipe.stop_on_frozen_z = self._tunnel_chk.isChecked()
         return recipe
 
     def _refresh_estimate(self) -> None:

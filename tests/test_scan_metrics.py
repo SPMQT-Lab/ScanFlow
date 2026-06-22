@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from scanflow.automation.scan_metrics import compute_z_stability, format_z_stability
+from scanflow.automation.scan_metrics import (
+    compute_z_stability, format_z_stability, is_z_frozen,
+)
 
 
 def _smooth_topo(size: int = 64, slope_nm: float = 0.5) -> np.ndarray:
@@ -51,3 +53,24 @@ def test_format_is_readable():
     assert "Z stability" in msg
     assert "pm RMS" in msg
     assert "excellent" in msg
+
+
+def test_frozen_z_detected_on_flat_image():
+    """A perfectly flat Z channel (stuck feedback/readback) → frozen."""
+    flat = np.zeros((64, 64))
+    m = compute_z_stability(flat)
+    assert m["rms_pm"] == 0.0 and m["rating"] != "n/a"
+    assert is_z_frozen(m)
+
+
+def test_real_scan_not_frozen():
+    rng = np.random.default_rng(0)
+    arr = _smooth_topo() + rng.normal(scale=0.020, size=(64, 64))
+    assert not is_z_frozen(compute_z_stability(arr))
+
+
+def test_missing_image_not_frozen():
+    """An absent/invalid image (rating 'n/a') must NOT trip the frozen check."""
+    assert not is_z_frozen(compute_z_stability(np.array([])))
+    assert not is_z_frozen(compute_z_stability(None))
+    assert not is_z_frozen({})

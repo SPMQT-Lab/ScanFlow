@@ -259,6 +259,21 @@ class MeasurementRecipe:
     safety_retract_nm: float = 10.0
     safety_poll_interval_s: float = 0.5
 
+    # Frozen-Z safety: stop scanning when a completed scan shows exactly
+    # zero Z variation (a stuck feedback loop / Z readback looks perfectly
+    # flat — real data always has some residual).
+    stop_on_frozen_z: bool = True
+
+    # Tunneling-loss safety: stop scanning when the tip falls out of
+    # tunneling range mid-scan (current collapses to ~0 and the software
+    # would otherwise keep "scanning" nothing). The live floor is
+    # max(tunnel_lost_floor_A, tunnel_lost_fraction × setpoint), and it must
+    # stay below that for tunnel_lost_grace_s before halting.
+    stop_on_tunnel_lost: bool = True
+    tunnel_lost_fraction: float = 0.15
+    tunnel_lost_floor_A: float = 3e-12
+    tunnel_lost_grace_s: float = 8.0
+
     # ------------------------------------------------------------------
 
     def add_step(self, step: RecipeStep) -> None:

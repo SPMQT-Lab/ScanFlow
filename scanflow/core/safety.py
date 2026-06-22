@@ -45,6 +45,13 @@ class SafetyConfig:
     # so it must not be allowed to continue blindly.
     warn_read_failures: int = 5
     max_read_failures: int = 20
+    # Tunneling-loss detection. If |I| stays below ``min_tunnel_current_A``
+    # for ``tunnel_lost_grace_s`` seconds, the tip is no longer in tunneling
+    # range (it lost the surface) and the scan is producing nothing — report
+    # not-ok so the runner can halt. None disables the check. Unlike a crash
+    # this does NOT retract: the tip is already away from the surface.
+    min_tunnel_current_A: Optional[float] = None
+    tunnel_lost_grace_s: float = 8.0
 
 
 @dataclass
@@ -54,6 +61,9 @@ class SafetyStatus:
     measured_current_A: Optional[float] = None
     # True when this check could not obtain a current reading at all.
     read_failed: bool = False
+    # "ok" | "crash" | "tunnel_lost" — lets the runner react differently
+    # (crash retracts the tip; tunnel_lost just stops the scan).
+    kind: str = "ok"
 
 
 class SafetyViolation(RuntimeError):
@@ -80,10 +90,15 @@ class SafetyMonitor:
         self._consecutive_read_failures = 0
         self._fallback_cached_at = 0.0
         self._fallback_cached_value: Optional[float] = None
+        self._low_current_since: Optional[float] = None
 
     @property
     def consecutive_read_failures(self) -> int:
         return self._consecutive_read_failures
+
+    def reset_tunnel_timer(self) -> None:
+        """Clear the sustained-low-current timer (call when a scan starts)."""
+        self._low_current_since = None
 
     # ------------------------------------------------------------------
     # Current measurement
@@ -172,12 +187,35 @@ class SafetyMonitor:
         if abs(I) > cfg.max_current_A:
             return SafetyStatus(
                 ok=False,
+                kind="crash",
                 reason=(
                     f"Tip-crash threshold exceeded: "
                     f"|I| = {I*1e9:.3f} nA > {cfg.max_current_A*1e9:.3f} nA"
                 ),
                 measured_current_A=I,
             )
+        # Tunneling-loss: sustained near-zero current means the tip lost the
+        # surface and the scan is acquiring nothing.
+        floor = cfg.min_tunnel_current_A
+        if floor is not None and floor > 0:
+            import time as _time
+            now = _time.monotonic()
+            if abs(I) < floor:
+                if self._low_current_since is None:
+                    self._low_current_since = now
+                elif now - self._low_current_since >= cfg.tunnel_lost_grace_s:
+                    return SafetyStatus(
+                        ok=False,
+                        kind="tunnel_lost",
+                        reason=(
+                            f"Tunneling lost: |I| = {abs(I)*1e12:.1f} pA below "
+                            f"{floor*1e12:.1f} pA for ≥{cfg.tunnel_lost_grace_s:.0f}s "
+                            "— tip no longer in tunneling range"
+                        ),
+                        measured_current_A=I,
+                    )
+            else:
+                self._low_current_since = None
         return SafetyStatus(ok=True, measured_current_A=I)
 
     # ------------------------------------------------------------------
