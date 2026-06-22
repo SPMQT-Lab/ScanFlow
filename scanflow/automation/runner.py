@@ -1087,8 +1087,6 @@ class AutomationRunner(QThread):
             self.mosaic_tile_done.emit(tile_idx)
 
         # ── 3. Wide overview (after) ──────────────────────────────────
-        # Re-apply wide params; the XY offset is wherever the last tile
-        # left it — that's fine, we just snap back to the wide frame.
         wide_after_params = ScanParams(
             bias_V=cfg.bias_V,
             setpoint_A=cfg.setpoint_A,
@@ -1097,6 +1095,14 @@ class AutomationRunner(QThread):
             speed_nm_s=cfg.wide_speed_nm_s,
             memo=f"{cfg.name} wide after",
         )
+        # Resize to the wide frame BEFORE repositioning. wide_centre was
+        # recorded with the wide frame active (after the wide_before apply),
+        # so the offset must also be RE-SET with the wide frame active to
+        # land on the same physical region. Moving while the small tile
+        # frame is still loaded and only then resizing shifts wide_after by
+        # the frame-size delta — the off-by-one-tile −Y wide_after seen on
+        # 2026-06-20 (Createc shifts SCAN.OFFSET on IMAGESIZE change; B2).
+        self._apply_scan_params(wide_after_params)
         # Return to the wide centre via absolute motion, so
         # wide_after is anchored at the same XY as wide_before.
         self._log_offset(f"{cfg.name}: before return-to-centre")
@@ -1119,7 +1125,6 @@ class AutomationRunner(QThread):
             log.warning("return-to-centre failed: %s", e)
         self._log_offset(f"{cfg.name}: after return-to-centre")
 
-        self._apply_scan_params(wide_after_params)
         if cfg.settling_s > 0:
             self._sleep_with_progress(cfg.settling_s, f"{cfg.name}: wide-after settle")
         if not self._stop_requested:
