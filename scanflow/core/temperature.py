@@ -35,50 +35,79 @@ class TemperatureMonitor:
 
     def __init__(self, client: "STMClient") -> None:
         self._c = client
-        self._working_keys: dict[str, str] = {}   # field → key that actually works
+        # field → (method, key) that actually returns a value on this rig.
+        self._working: dict[str, tuple[str, str]] = {}
         self._diagnosed = False
+
+    def _raw(self):
+        """The underlying COM object, or None (mock / not connected)."""
+        try:
+            return self._c.raw
+        except Exception:
+            return None
 
     def _poke_refresh(self) -> None:
         """Force Createc to refresh its temperature readout before we read it.
 
-        On STMAFM 4.3+ the ``T_*[K]`` parameters are stale (often empty)
+        On STMAFM 4.3+ the ``T_*[K]`` parameters stay stale (usually empty)
         until a parameter write nudges the server to re-poll the ADCs.
-        py-createc does the same dummy ``MEMO_STMAFM`` write before every
-        temperature read. Best-effort: a failure here just means the read
-        falls back to whatever value is cached.
+        py-createc does a dummy ``setparam('MEMO_STMAFM', '')`` before every
+        temperature read; ScanFlow's own ``setp`` is a different COM method
+        that does NOT trigger the refresh, which is why the tab stayed at
+        "no data" even after the first poke attempt. Try the real
+        ``setparam`` first, then fall back to ``setp``. Best-effort.
         """
+        raw = self._raw()
+        if raw is not None:
+            try:
+                raw.setparam("MEMO_STMAFM", "")
+                return
+            except Exception:
+                pass
         try:
             self._c.setp("MEMO_STMAFM", "")
         except Exception:
             pass
 
-    def _try_float(self, *keys: str) -> Optional[float]:
-        """Try each key in order, return the first that yields a non-empty float."""
-        for key in keys:
+    def _read_via(self, method: str, key: str):
+        """Read one parameter using a specific COM method ('getparam'/'getp')."""
+        if method == "getparam":
+            raw = self._raw()
+            if raw is None:
+                return None
+            return raw.getparam(key)        # py-createc's method (1 arg)
+        return self._c.getp(key, "")        # ScanFlow's method (key, default)
+
+    def _try_float_tracked(self, field: str, *keys: str) -> Optional[float]:
+        """Resolve a sensor by probing both COM read methods and all candidate
+        keys, remembering the (method, key) combo that first returns a value.
+
+        ScanFlow reads scan params fine via ``getp``, but on some rigs the
+        ``T_*[K]`` temperature params are only exposed through ``getparam``
+        (py-createc's method). Probing both makes the readout work without
+        having to know which the rig wants."""
+        if field in self._working:
+            method, key = self._working[field]
             try:
-                v = self._c.getp(key, "")
+                v = self._read_via(method, key)
                 if v is not None and v != "":
                     return float(v)
             except Exception:
                 pass
-        return None
-
-    def _try_float_tracked(self, field: str, *keys: str) -> Optional[float]:
-        """Like _try_float but remembers which key worked and logs it once."""
-        if field in self._working_keys:
-            # fast path: use the key we already know works
-            return self._try_float(self._working_keys[field])
-        for key in keys:
-            try:
-                v = self._c.getp(key, "")
-                if v is not None and v != "":
-                    val = float(v)
-                    if not self._diagnosed:
-                        log.info("Temperature key resolved: %s → %r", field, key)
-                    self._working_keys[field] = key
-                    return val
-            except Exception:
-                pass
+            return None
+        for method in ("getparam", "getp"):
+            for key in keys:
+                try:
+                    v = self._read_via(method, key)
+                    if v is not None and v != "":
+                        val = float(v)
+                        if not self._diagnosed:
+                            log.info("Temperature resolved: %s → %s(%r)",
+                                     field, method, key)
+                        self._working[field] = (method, key)
+                        return val
+                except Exception:
+                    pass
         return None
 
     def read(self) -> TemperatureReading:
@@ -99,14 +128,18 @@ class TemperatureMonitor:
             aux7_K=self._try_float_tracked("aux7_K", "T_AUXADC7[K]", "T_AUXADC7"),
         )
         if not self._diagnosed:
-            working = [f for f in self._working_keys]
-            if working:
-                log.info("Temperature keys resolved on first read: %s", working)
+            if self._working:
+                log.info("Temperature resolved on first read: %s",
+                         {f: m for f, (m, _k) in self._working.items()})
             else:
+                raw = self._raw()
+                has_getparam = raw is not None and hasattr(raw, "getparam")
                 log.warning(
-                    "Temperature read: no keys returned a value. "
-                    "Checked: T-STM:/T-STM, OneK_*, T_ADC2/3[K], T_AUXADC6/7[K]. "
-                    "Verify key names in Createc parameter list."
+                    "Temperature read: no keys returned a value via getparam "
+                    "or getp. raw COM present=%s, getparam attr=%s. Checked: "
+                    "T-STM:/T-STM, OneK_*, T_ADC2/3[K], T_AUXADC6/7[K]. "
+                    "Verify the key names in the Createc parameter list.",
+                    raw is not None, has_getparam,
                 )
             self._diagnosed = True
         return reading
