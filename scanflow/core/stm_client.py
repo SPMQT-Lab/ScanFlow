@@ -260,7 +260,12 @@ class STMClient:
 
     def _require(self) -> None:
         if self._stm is None:
-            raise STMNotConnectedError("STM not connected — call connect() first")
+            current = threading.current_thread().name
+            raise STMNotConnectedError(
+                f"STM not connected on thread '{current}' — "
+                "call STMClient.connect() (GUI thread) or "
+                "STMClient.bind_thread() (worker thread) before setp/getp"
+            )
 
     # ------------------------------------------------------------------
     # Low-level wrappers around setp/getp

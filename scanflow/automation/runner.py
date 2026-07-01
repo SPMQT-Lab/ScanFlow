@@ -1,12 +1,13 @@
 """Automation runner: executes a MeasurementRecipe against a live STM.
 
 Runs in a QThread so the GUI stays responsive. Emits Qt signals for progress,
-drift results, new scan files, and errors.
+new scan files, and errors.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from enum import Enum, auto
 from pathlib import Path
@@ -23,13 +24,13 @@ from scanflow.core import (
 )
 from scanflow.automation.recipe import (
     MeasurementRecipe, ScanStep, SpectroscopyStep, ApproachStep, WaitStep,
-    TipFormStep, SurveyStep, MosaicStep, MIN_CONST_CURRENT_BIAS_V,
+    TipFormStep, MosaicStep, MIN_CONST_CURRENT_BIAS_V,
 )
-from scanflow.automation.survey import SurveyConfig, FeatureRecord, SurveyManifest
-from scanflow.automation.mosaic import MosaicConfig, tile_centers_in_wide_pixels
-from scanflow.automation.feature_discovery import discover_features, FeatureCandidate
-from scanflow.automation.scan_metrics import compute_z_stability, format_z_stability
-from scanflow.drift import DriftDetector, DriftResult
+from scanflow.automation.mosaic import MosaicConfig, tile_targets_nm
+from scanflow.core import activity
+from scanflow.automation.scan_metrics import (
+    compute_z_stability, format_z_stability, is_z_frozen,
+)
 from scanflow.io.acquisition_log import AcquisitionLog, default_acquisition_log_path
 from scanflow.io.sidecar import (
     SessionManifestWriter, new_session_id, scanflow_sidecar_path,
@@ -49,34 +50,31 @@ class RunnerState(Enum):
 
 
 class AutomationRunner(QThread):
-    """Executes a recipe step-by-step with optional drift correction.
+    """Executes a recipe step-by-step.
 
     Signals
     -------
     progress(current_step, total_steps, label)
     scan_completed(dat_file_path)
-    drift_measured(DriftResult)
-    drift_corrected(dx_pixels, dy_pixels)
     state_changed(RunnerState)
     error(message)
     """
 
     progress = Signal(int, int, str)
     scan_completed = Signal(str)
-    drift_measured = Signal(object)
-    drift_corrected = Signal(float, float)
     state_changed = Signal(object)
     error = Signal(str)
-    live_frame = Signal(object)         # numpy 2-D array, emitted ~2 Hz during scan
+    # Live-frame delivery is OPT-IN and conflated. Every DATA.SCAN pull is a
+    # full-frame COM transfer executed on STMAFM's GUI thread (the documented
+    # cause of controller-window lag during automation), so the runner only
+    # pulls frames when a consumer called enable_live_frames(). Delivery is
+    # latest-frame-wins: the payload stays in a slot read via
+    # take_live_frame(); this signal is just a wake-up and at most ONE
+    # notification is queued no matter how far the GUI falls behind.
+    live_frame_ready = Signal()
     settling = Signal(int, str)         # remaining seconds, label
     safety_violation = Signal(str, float)  # message, |I| in amperes
     safety_reading = Signal(float)      # latest |I| reading in amperes
-    # Survey campaign signals
-    survey_discovered = Signal(int)                       # number of features found
-    survey_feature_started = Signal(int, int, float, float, float)
-    # (idx, total, char_dim_nm, dx_tip_nm, dy_tip_nm)
-    survey_feature_done = Signal(object)                  # FeatureRecord
-    survey_finished = Signal(str)                         # manifest path
     z_stability = Signal(object)                          # dict from compute_z_stability
     # Mosaic campaign signals
     mosaic_tile_started = Signal(int, int)                # (tile_idx, total)
@@ -87,18 +85,23 @@ class AutomationRunner(QThread):
     # wants to see in the GUI without pulling the file.
     info_message = Signal(str)
 
-    def __init__(self, stm: STMClient, recipe: MeasurementRecipe, parent=None) -> None:
+    def __init__(
+        self,
+        stm: STMClient,
+        recipe: MeasurementRecipe,
+        *,
+        start_from_step: int = 0,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self._stm = stm
         self._recipe = recipe
+        self._start_from_step = max(0, int(start_from_step))
         self._state = RunnerState.IDLE
         self._stop_requested = False
         self._stop_count = 0
         self._emergency_stop_requested = False
         self._pause_requested = False
-        self._detector: Optional[DriftDetector] = None
-        self._reference_array: Optional[np.ndarray] = None
-        self._reference_timestamp: Optional[float] = None
         self._safety = SafetyMonitor(SafetyConfig(
             max_current_A=recipe.safety_max_current_A,
             enable_current_check=recipe.safety_enable,
@@ -113,13 +116,19 @@ class AutomationRunner(QThread):
         self._current_step_kind: str = ""
         self._current_label: str = ""
         self._last_motion_result: Optional[MotionResult] = None
-        self._last_drift_result: Optional[DriftResult] = None
         self._last_z_stability: dict | None = None
         self._max_observed_current_A: Optional[float] = None
         self._run_generation = 0
         self._active_run_generation = 0
         self._tip_form_approval_pending = False
         self._tip_form_approval_run_generation: int | None = None
+        # Live-frame conflation state (see live_frame_ready). None interval
+        # means disabled — no DATA.SCAN pulls during the scan-wait loop.
+        self._live_frame_interval_s: float | None = None
+        self._frame_lock = threading.Lock()
+        self._latest_frame = None
+        self._frame_pending = False
+        self._last_frame_pull = 0.0
 
     # ------------------------------------------------------------------
     # Public controls
@@ -176,6 +185,47 @@ class AutomationRunner(QThread):
     def resume(self) -> None:
         self._pause_requested = False
 
+    # ------------------------------------------------------------------
+    # Live frames (opt-in, conflated)
+    # ------------------------------------------------------------------
+
+    def enable_live_frames(self, interval_s: float = 2.0) -> None:
+        """Ask the runner to pull live scan frames during scans.
+
+        Off by default: each pull is a full-frame DATA.SCAN transfer
+        marshalled on STMAFM's GUI thread, so only enable this when a
+        panel actually displays the frames. ``interval_s`` is a floor —
+        frames are never pulled more often than this, independent of the
+        (faster, cheap) safety poll. Connect to ``live_frame_ready`` and
+        fetch with :meth:`take_live_frame`.
+        """
+        self._live_frame_interval_s = max(0.1, float(interval_s))
+
+    def disable_live_frames(self) -> None:
+        self._live_frame_interval_s = None
+
+    def take_live_frame(self):
+        """Return the newest pulled frame (or None) and clear the slot.
+
+        Call from the slot connected to ``live_frame_ready``. Frames that
+        arrive while a notification is still queued replace the slot
+        contents — the consumer always sees the latest data and the Qt
+        event queue never accumulates frame payloads.
+        """
+        with self._frame_lock:
+            frame, self._latest_frame = self._latest_frame, None
+            self._frame_pending = False
+        return frame
+
+    def _publish_live_frame(self, frame) -> None:
+        """Worker-thread side of the conflation: store, notify at most once."""
+        with self._frame_lock:
+            self._latest_frame = frame
+            if self._frame_pending:
+                return  # notification already queued; it will see this frame
+            self._frame_pending = True
+        self.live_frame_ready.emit()
+
     def approve_next_tip_form(self) -> None:
         """Arm one supervised tip-forming pulse for the current or next run."""
         target_generation = (
@@ -195,7 +245,16 @@ class AutomationRunner(QThread):
     # ------------------------------------------------------------------
 
     def run(self) -> None:
+        # Reset ALL control flags: a runner that was stopped (or
+        # emergency-stopped) on a previous run must not start its next
+        # run with stale escalation state — one stale flag here means the
+        # first Stop click escalates straight to emergency retract, or
+        # the run aborts itself on the first poll.
         self._stop_requested = False
+        self._emergency_stop_requested = False
+        self._pause_requested = False
+        self._stop_count = 0
+        self._last_frame_pull = 0.0
         self._run_generation += 1
         self._active_run_generation = self._run_generation
         # COM proxies are apartment-bound — re-dispatch them on this worker
@@ -208,11 +267,15 @@ class AutomationRunner(QThread):
             config=MotionConfig(
                 max_single_move_nm=500.0,
                 readback_tolerance_nm=2.0,
-                default_settle_s=max(0.0, float(self._recipe.drift_reposition_delay_s)),
+                default_settle_s=0.0,
                 max_retries=1,
             ),
         )
         self._set_state(RunnerState.RUNNING)
+        # Tell background pollers (Z monitor, status bar, temperature) to
+        # stand down: every COM call they make is serialised onto the
+        # STMAFM GUI thread and lags the Createc display during runs (H7).
+        activity.begin()
         try:
             self._execute()
         except SafetyViolation as e:
@@ -237,6 +300,7 @@ class AutomationRunner(QThread):
             self._set_state(RunnerState.ERROR)
             return
         finally:
+            activity.end()
             self._active_run_generation = 0
             self._stm.unbind_thread()
         self._set_state(RunnerState.FINISHED)
@@ -253,52 +317,58 @@ class AutomationRunner(QThread):
             except Exception:
                 pass
 
-        if recipe.drift_correction:
-            self._detector = DriftDetector(
-                continuous=True,
-                method=getattr(recipe, "drift_method", "hybrid"),
-            )
-
-        if recipe.drift_correction and recipe.drift_template:
-            self._reference_array = self._load_channel(
-                Path(recipe.drift_template), recipe.drift_channel
-            )
-            self._reference_timestamp = time.time()
-
         for _rep in range(recipe.repetitions):
             for step in recipe.steps:
                 if self._stop_requested:
                     return
                 self._wait_if_paused()
                 step_idx += 1
+                if step_idx <= self._start_from_step:
+                    continue   # skip steps completed before a resume
                 label = step.label or f"step {step_idx}/{total}"
                 self._current_step_index = step_idx
                 self._current_step_kind = getattr(step, "kind", "scan")
                 self._current_label = label
                 self._last_motion_result = None
-                self._last_drift_result = None
                 self._last_z_stability = None
                 self.progress.emit(step_idx, total, label)
                 log.info("Starting %s", label)
 
                 kind = self._current_step_kind
-                if kind == "scan":
-                    self._do_scan_step(step, recipe, label)
-                elif kind == "spectroscopy":
-                    self._do_spec_step(step, label)
-                elif kind == "approach":
-                    self._do_approach_step(step, label)
-                elif kind == "wait":
-                    self._sleep_with_progress(
-                        step.seconds, label or "Wait")
-                elif kind == "tip_form":
-                    self._do_tip_form_step(step, label)
-                elif kind == "survey":
-                    self._do_survey_step(step, label)
-                elif kind == "mosaic":
-                    self._do_mosaic_step(step, label)
-                else:
-                    log.warning("Unknown step kind: %s — skipping", kind)
+                try:
+                    if kind == "scan":
+                        self._do_scan_step(step, recipe, label)
+                    elif kind == "spectroscopy":
+                        self._do_spec_step(step, label)
+                    elif kind == "approach":
+                        self._do_approach_step(step, label)
+                    elif kind == "wait":
+                        self._sleep_with_progress(
+                            step.seconds, label or "Wait")
+                    elif kind == "tip_form":
+                        self._do_tip_form_step(step, label)
+                    elif kind == "mosaic":
+                        self._do_mosaic_step(step, label)
+                    else:
+                        log.warning("Unknown step kind: %s — skipping", kind)
+                except (SafetyViolation, STMNotConnectedError):
+                    # Always fatal regardless of stop_on_error — safety
+                    # aborts and lost connections end the run.
+                    raise
+                except Exception as e:
+                    if recipe.stop_on_error:
+                        raise
+                    log.exception("Step failed (stop_on_error=False): %s", label)
+                    self._acq_log.emit(
+                        "routine_error",
+                        step_kind=kind,
+                        label=label,
+                        reason=str(e),
+                        continued=True,
+                    )
+                    self.error.emit(
+                        f"{label} failed: {e} — continuing (stop_on_error is off)"
+                    )
 
                 if recipe.inter_step_delay_s > 0:
                     self._sleep_with_progress(
@@ -351,11 +421,30 @@ class AutomationRunner(QThread):
     def _apply_scan_params(self, params: ScanParams) -> None:
         self._active_scan_params = params
         self._stm.scan.apply(params)
+        self._arm_tunnel_floor(params.setpoint_A)
+
+    def _arm_tunnel_floor(self, setpoint_A: Optional[float]) -> None:
+        """Set the 'tunneling lost' current floor for the upcoming scan.
+
+        Floor = max(absolute floor, fraction × setpoint). Re-armed per scan
+        and the sustained-low-current timer is reset so a low reading during
+        the previous settle/motion never carries over.
+        """
+        r = self._recipe
+        cfg = self._safety.config
+        if (getattr(r, "stop_on_tunnel_lost", True)
+                and setpoint_A and setpoint_A > 0):
+            cfg.min_tunnel_current_A = max(
+                getattr(r, "tunnel_lost_floor_A", 3e-12),
+                getattr(r, "tunnel_lost_fraction", 0.15) * float(setpoint_A),
+            )
+            cfg.tunnel_lost_grace_s = getattr(r, "tunnel_lost_grace_s", 8.0)
+        else:
+            cfg.min_tunnel_current_A = None
+        self._safety.reset_tunnel_timer()
 
     def _routine_name(self) -> str:
         kinds = {getattr(step, "kind", "scan") for step in self._recipe.steps}
-        if kinds == {"survey"}:
-            return "survey"
         if kinds == {"mosaic"}:
             return "mosaic"
         name = self._recipe.name.lower()
@@ -396,7 +485,6 @@ class AutomationRunner(QThread):
         role: str,
         scan_params: Optional[ScanParams] = None,
         motion: Optional[MotionResult] = None,
-        drift: Optional[DriftResult] = None,
         quality: Optional[dict] = None,
     ) -> None:
         params = scan_params or self._active_scan_params
@@ -423,7 +511,6 @@ class AutomationRunner(QThread):
             scan_parameters=params,
             position_nm=position,
             motion=motion or self._last_motion_result,
-            drift=drift or self._last_drift_result,
             quality=quality or ({"z_stability": self._last_z_stability}
                                 if self._last_z_stability is not None else {}),
             safety=safety,
@@ -490,30 +577,12 @@ class AutomationRunner(QThread):
             if self._stop_requested:
                 return
 
-        if recipe.drift_correction and self._reference_array is not None:
-            self._do_alignment_scan(recipe, data_params=params)
-            if self._stop_requested:
-                return
-
         dat_path = self._scan_and_save(recipe)
         if dat_path:
             log.info("Saved: %s", dat_path)
             self.scan_completed.emit(str(dat_path))
-            # Z-stability snapshot: emit before reference handling so the GUI
-            # sees one line per data scan regardless of drift state.
             self._emit_z_stability()
             self._record_scan_artifacts(dat_path, role="data", scan_params=params)
-            if self._reference_array is None and recipe.drift_correction:
-                # live_data() is always available immediately after a scan —
-                # no createc file library dependency. Fall back to disk only
-                # if the DSP buffer is empty for some reason.
-                self._reference_array = self._stm.scan.live_data()
-                if self._reference_array is None:
-                    self._reference_array = self._load_channel(
-                        dat_path, recipe.drift_channel)
-                self._reference_timestamp = time.time()
-                if self._reference_array is not None:
-                    log.info("Drift reference captured — correction active from next scan")
 
     def _do_spec_step(self, step: SpectroscopyStep, label: str) -> None:
         table = IVTable(
@@ -609,6 +678,31 @@ class AutomationRunner(QThread):
         if not self._capture_tip_form_snapshot("pre", label):
             return
 
+        # Pre-flight motion assessment (Createc quirk: the tip travels to
+        # the target at TIP-FORM.LATSPEED, not the scan speed, and the
+        # command cannot be interrupted once issued). Warn loudly but do
+        # not abort — the operator armed this step knowingly and the GUI
+        # showed the same warnings before arming.
+        try:
+            from scanflow.core import assess_tip_form_motion
+            assessment = assess_tip_form_motion(
+                step.lateral_speed_nm_s,
+                scan_speed_nm_s=self._stm.scan.speed_nm_s or 50.0,
+                frame_size_nm=self._stm.scan.size_nm,
+            )
+            self._acq_log.emit(
+                "tip_form_motion_assessment",
+                label=label,
+                speed_ratio=assessment.speed_ratio,
+                worst_travel_s=assessment.worst_travel_s,
+                warnings=assessment.warnings,
+            )
+            for warning in assessment.warnings:
+                log.warning("TipFormStep '%s': %s", label, warning)
+                self.info_message.emit(f"⚠ tip form: {warning}")
+        except Exception:
+            log.debug("tip-form motion assessment failed", exc_info=True)
+
         params = TipFormParams(
             voltage_V=step.voltage_V,
             z_approach_nm=step.z_approach_nm,
@@ -637,278 +731,6 @@ class AutomationRunner(QThread):
             voltage_V=step.voltage_V,
             pulse_length_s=step.pulse_length_s,
         )
-
-    def _do_survey_step(self, step: SurveyStep, label: str) -> None:
-        """Wide scan → feature discovery → per-feature zoom campaign.
-
-        Saves each scan plus a quick PNG preview, writes ``survey.json`` after
-        every feature so a partial / interrupted run still leaves usable data.
-        """
-        from datetime import datetime
-        cfg = step.config
-
-        output: Optional[Path] = None
-        if cfg.output_folder:
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output = Path(cfg.output_folder) / f"survey_{stamp}"
-            output.mkdir(parents=True, exist_ok=True)
-
-        manifest = SurveyManifest(
-            name=cfg.name,
-            timestamp=datetime.now().isoformat(timespec="seconds"),
-            wide_size_nm=cfg.wide_size_nm,
-            wide_pixels=cfg.wide_pixels,
-        )
-
-        # --- 1. Wide scan -------------------------------------------------
-        self.progress.emit(0, 1, f"{cfg.name}: wide scan")
-        wide_params = ScanParams(
-            bias_V=cfg.bias_V,
-            setpoint_A=cfg.setpoint_A,
-            size_nm=cfg.wide_size_nm,
-            pixels=cfg.wide_pixels,
-            speed_nm_s=cfg.wide_speed_nm_s,
-            memo=f"{cfg.name} overview",
-        )
-        self._apply_scan_params(wide_params)
-        if cfg.settling_s > 0:
-            self._sleep_with_progress(cfg.settling_s, f"{cfg.name}: wide settle")
-            if self._stop_requested:
-                return
-        wide_path = self._scan_and_save_to(output, "wide.dat")
-        if wide_path:
-            manifest.wide_scan_path = str(wide_path)
-            self.scan_completed.emit(str(wide_path))
-
-        wide_image = self._stm.scan.live_data()
-        if wide_image is None:
-            self.error.emit("Survey: no wide-scan image available — aborting")
-            return
-
-        if output is not None:
-            preview = _save_image_preview(wide_image, output / "wide.png")
-            if preview:
-                manifest.wide_preview_path = str(preview)
-
-        # --- 2. Discover features ----------------------------------------
-        nm_per_px = cfg.wide_size_nm[0] / max(cfg.wide_pixels[0], 1)
-        candidates = discover_features(
-            wide_image, nm_per_px,
-            min_feature_nm=cfg.min_feature_nm,
-            max_feature_nm=cfg.max_feature_nm,
-            size_multiplier=cfg.size_multiplier,
-            min_zoom_nm=cfg.min_zoom_nm,
-            max_zoom_nm=cfg.max_zoom_nm,
-            merge_distance_nm=cfg.merge_distance_nm,
-            edge_margin_px=cfg.edge_margin_px,
-            max_features=cfg.max_features,
-        )
-        self.survey_discovered.emit(len(candidates))
-        log.info("Survey: discovered %d feature(s)", len(candidates))
-
-        # Re-render the wide preview with numbered bounding boxes overlaid
-        if output is not None and candidates:
-            _save_overview_preview(wide_image, candidates, output / "wide_annotated.png")
-
-        # --- 3. Per-feature zoom loop ------------------------------------
-        # Track the cumulative wide-pixel target so we can move by the
-        # *delta* between consecutive features. We always restore the wide
-        # frame params before moving, so the nm-per-pixel scale is the wide
-        # image's scale.
-        self._last_wide_px = (cfg.wide_pixels[0] / 2.0, cfg.wide_pixels[1] / 2.0)
-
-        for idx, cand in enumerate(candidates, start=1):
-            if self._stop_requested:
-                break
-            self._wait_if_paused()
-            record = self._do_feature_zoom(
-                idx, len(candidates), cand, cfg, output, nm_per_px, wide_params
-            )
-            if record is not None:
-                manifest.features.append(record)
-                self.survey_feature_done.emit(record)
-            if output is not None:
-                manifest.save(output / "survey.json")
-
-        # --- 4. Finalise -------------------------------------------------
-        if output is not None:
-            manifest_path = output / "survey.json"
-            manifest.save(manifest_path)
-            self.survey_finished.emit(str(manifest_path))
-            log.info("Survey manifest written: %s", manifest_path)
-
-    def _do_feature_zoom(
-        self,
-        idx: int,
-        total: int,
-        cand: FeatureCandidate,
-        cfg: SurveyConfig,
-        output: Optional[Path],
-        wide_nm_per_px: float,
-        wide_params: "ScanParams",
-    ) -> Optional[FeatureRecord]:
-        """Center the scan window on ``cand``, run ``zoom_iterations`` scans,
-        and report residual centering between iterations.
-
-        Positioning: moves the XY offset by the wide-frame pixel delta from the
-        previous feature's wide-pixel position. The wide frame params are
-        re-applied first so the motion layer uses the wide nm-per-pixel
-        scale, not the previous feature's zoom scale.
-        """
-        wide_cx = cfg.wide_pixels[0] / 2.0
-        wide_cy = cfg.wide_pixels[1] / 2.0
-        dx_nm_log = (cand.cx_px - wide_cx) * wide_nm_per_px
-        dy_nm_log = (cand.cy_px - wide_cy) * wide_nm_per_px
-
-        self.survey_feature_started.emit(
-            idx, total, cand.char_dim_nm, dx_nm_log, dy_nm_log,
-        )
-
-        # 1. Restore wide-frame params (preserves XY offset, sets nm-per-pixel
-        # scale so the next move is interpreted in wide-image pixels).
-        try:
-            self._apply_scan_params(wide_params)
-        except Exception as e:
-            log.warning("could not re-apply wide params before move: %s", e)
-
-        # 2. Shift the offset by (target - previous) in wide-pixel units.
-        prev_x, prev_y = getattr(self, "_last_wide_px",
-                                 (wide_cx, wide_cy))
-        dx_px = float(cand.cx_px - prev_x)
-        dy_px = float(cand.cy_px - prev_y)
-        motion = self._motion_manager().move_relative_pixels(
-            dx_px,
-            dy_px,
-            frame_size_nm=cfg.wide_size_nm,
-            frame_pixels=cfg.wide_pixels,
-            reason=f"survey feature {idx:02d} centre",
-            settle_s=cfg.settling_s,
-        )
-        self._record_motion_result(motion)
-        if motion.ok:
-            self._last_wide_px = (float(cand.cx_px), float(cand.cy_px))
-            log.info("Feature %d move: Δpx=(%+0.2f, %+0.2f) → Δnm=(%+0.2f, %+0.2f)",
-                     idx, dx_px, dy_px,
-                     dx_px * wide_nm_per_px, dy_px * wide_nm_per_px)
-        else:
-            msg = f"Survey feature {idx:02d} positioning failed: {'; '.join(motion.warnings)}"
-            log.warning(msg)
-            self.error.emit(msg)
-            self._stop_requested = True
-            return None
-
-        # 3. Apply zoom params (the XY offset stays where we just placed it).
-        zoom_params = ScanParams(
-            bias_V=cfg.bias_V,
-            setpoint_A=cfg.setpoint_A,
-            size_nm=cand.zoom_nm,
-            pixels=cfg.zoom_pixels,
-            speed_nm_s=cfg.zoom_speed_nm_s,
-            memo=f"{cfg.name} f{idx:02d}",
-        )
-        self._apply_scan_params(zoom_params)
-
-        record = FeatureRecord(
-            index=idx,
-            centroid_pixels=(cand.cx_px, cand.cy_px),
-            centroid_nm_offset=(dx_nm_log, dy_nm_log),
-            char_dim_nm=cand.char_dim_nm,
-            zoom_size_nm=cand.zoom_nm,
-            bias_V=cfg.bias_V,
-            setpoint_A=cfg.setpoint_A,
-        )
-
-        zoom_nm_per_px = cand.zoom_nm[0] / max(cfg.zoom_pixels[0], 1)
-        zoom_cx = cfg.zoom_pixels[0] / 2.0
-        zoom_cy = cfg.zoom_pixels[1] / 2.0
-
-        for it in range(cfg.zoom_iterations):
-            if self._stop_requested:
-                break
-            dat_name = f"feature_{idx:02d}_iter{it+1}.dat"
-            png_name = f"feature_{idx:02d}_iter{it+1}.png"
-
-            # Pre-scan settle — lets the piezo / feedback / tip stabilise so
-            # the first scanline doesn't carry residual drift from the
-            # apply()/move commands above.
-            if cfg.settling_s > 0:
-                self._sleep_with_progress(
-                    cfg.settling_s,
-                    f"f{idx:02d} iter{it+1} settle",
-                )
-                if self._stop_requested:
-                    break
-
-            path = self._scan_and_save_to(output, dat_name)
-            if path is not None:
-                record.scan_paths.append(str(path))
-                self.scan_completed.emit(str(path))
-
-            img = self._stm.scan.live_data()
-            if img is None:
-                record.drift_log_angstrom.append((0.0, 0.0))
-                continue
-
-            # Z-stability for this iteration's data scan
-            stability = compute_z_stability(img)
-            self._last_z_stability = stability
-            self._acq_log.emit("z_stability", metrics=stability)
-            self.z_stability.emit(stability)
-            record.z_stability_per_iter.append(stability)
-
-            if output is not None:
-                preview = _save_image_preview(img, output / png_name)
-                if preview:
-                    record.preview_paths.append(str(preview))
-
-            # Re-detect dominant feature inside the zoom and measure its offset
-            # from the frame centre. Loose filters because the feature should
-            # fill a large fraction of the frame.
-            inner = discover_features(
-                img, zoom_nm_per_px,
-                min_feature_nm=cfg.min_feature_nm * 0.5,
-                max_feature_nm=cfg.max_feature_nm * 2.0,
-                size_multiplier=1.0,
-                min_zoom_nm=0.1,
-                max_zoom_nm=cand.zoom_nm[0],
-                merge_distance_nm=cfg.merge_distance_nm,
-                edge_margin_px=2,
-                max_features=1,
-            )
-            if not inner:
-                record.drift_log_angstrom.append((0.0, 0.0))
-                continue
-
-            ck = inner[0]
-            dx_px = ck.cx_px - zoom_cx
-            dy_px = ck.cy_px - zoom_cy
-            dx_a = dx_px * zoom_nm_per_px * 10.0  # nm → Å
-            dy_a = dy_px * zoom_nm_per_px * 10.0
-            record.drift_log_angstrom.append((float(dx_a), float(dy_a)))
-            record.final_residual_angstrom = (float(dx_a), float(dy_a))
-
-            # Re-centre for the next iteration (skip on the last one)
-            if it < cfg.zoom_iterations - 1 and (abs(dx_px) + abs(dy_px) > 0.5):
-                motion = self._motion_manager().move_relative_pixels(
-                    -float(dx_px),
-                    -float(dy_px),
-                    frame_size_nm=cand.zoom_nm,
-                    frame_pixels=cfg.zoom_pixels,
-                    reason=f"survey feature {idx:02d} iter {it + 1} recenter",
-                    settle_s=cfg.settling_s,
-                )
-                self._record_motion_result(motion)
-                if not motion.ok:
-                    msg = (
-                        f"Survey feature {idx:02d} recenter failed: "
-                        f"{'; '.join(motion.warnings)}"
-                    )
-                    log.warning(msg)
-                    self.error.emit(msg)
-                    self._stop_requested = True
-                    break
-
-        return record
 
     def _log_offset(self, label: str) -> Optional[tuple[float, float]]:
         """Read SCAN.OFFSET.{X,Y}.NM, log it at INFO, return the (x,y) tuple.
@@ -950,6 +772,60 @@ class AutomationRunner(QThread):
                 label, expected_dx_nm, expected_dy_nm, actual_dx, actual_dy,
             )
 
+
+    def _measure_and_log_drift(
+        self,
+        tag: str,
+        before_img,
+        after_img,
+        size_nm: tuple[float, float],
+        pixels: tuple[int, int],
+    ) -> None:
+        """Measure apparent drift between two same-frame images and LOG it.
+
+        Observation only — never moves anything. Both registered
+        estimators run so real campaigns accumulate side-by-side method
+        comparisons (the evidence base for picking the lab's drift
+        strategy, ROADMAP §4). Frames must be the same size/position, so
+        this is independent of the B2 frame-resize question. Refusals are
+        logged too: "estimator declined" is data. Failures never abort a
+        run.
+        """
+        if before_img is None or after_img is None:
+            return
+        try:
+            from scanflow.drift import estimate_with_all
+            nm_per_px = float(size_nm[0]) / max(int(pixels[0]), 1)
+            estimates = estimate_with_all(before_img, after_img, nm_per_px)
+        except Exception:
+            log.debug("drift measurement failed for %s", tag, exc_info=True)
+            return
+        for e in estimates:
+            self._acq_log.emit(
+                "drift_measurement",
+                tag=tag,
+                method=e.method,
+                method_version=e.method_version,
+                ok=e.ok,
+                dx_nm=e.dx_nm,
+                dy_nm=e.dy_nm,
+                dx_px=e.dx_px,
+                dy_px=e.dy_px,
+                confidence=e.confidence,
+                reason=e.reason,
+                details=e.details,
+            )
+        ok_parts = [
+            f"{e.method}: ({e.dx_nm:+.3f}, {e.dy_nm:+.3f}) nm "
+            f"conf={e.confidence:.2f}"
+            for e in estimates if e.ok
+        ]
+        if ok_parts:
+            self.info_message.emit(f"drift {tag}: " + "  |  ".join(ok_parts))
+        else:
+            reasons = "; ".join(e.reason for e in estimates)
+            self.info_message.emit(f"drift {tag}: no estimate ({reasons})")
+
     def _emit_z_stability(self) -> None:
         """Pull the just-completed scan's topography and emit a stability metric."""
         try:
@@ -963,21 +839,42 @@ class AutomationRunner(QThread):
             self._last_z_stability = metrics
             self._acq_log.emit("z_stability", metrics=metrics)
             self.z_stability.emit(metrics)
+            self._check_z_frozen(metrics)
         except Exception:
             log.debug("compute_z_stability failed", exc_info=True)
 
-    def _do_mosaic_step(self, step: MosaicStep, label: str) -> None:
-        """Wide overview → 3×3 zoom tiles (N iterations each) → wide overview.
+    def _check_z_frozen(self, metrics) -> None:
+        """Stop the run if a completed scan shows a frozen Z signal.
 
-        Each tile is centered by nudging the XY offset in *wide-frame* pixels
-        — same trick as the Survey path. Drift correction between tile
-        iterations uses cross-correlation against iteration 1.
+        Exactly-zero Z variation on a valid image means the feedback loop or
+        the Z readback is stuck (real data always has some residual), so the
+        scan is blind — halt rather than keep imaging garbage. Disable with
+        ``recipe.stop_on_frozen_z = False``.
+        """
+        if not getattr(self._recipe, "stop_on_frozen_z", True):
+            return
+        if is_z_frozen(metrics):
+            msg = ("Z signal frozen — 0 pm drift on a valid scan; feedback or "
+                   "Z readback appears stuck. Stopping scanning.")
+            log.error(msg)
+            self._acq_log.emit("z_frozen_abort", metrics=metrics)
+            self.info_message.emit("⚠ " + msg)
+            self.error.emit(msg)
+            self._stop_requested = True
+
+    def _do_mosaic_step(self, step: MosaicStep, label: str) -> None:
+        """Wide overview → N×N zoom tiles (M iterations each) → wide overview.
+
+        Each tile target is an absolute XY computed from the wide frame's
+        offset readback (see mosaic.tile_targets_nm) and reached through
+        TipMotionManager. Iterations per tile are repeats (optionally a
+        bias sweep), not re-centring passes.
         """
         from datetime import datetime
         cfg = step.config
         tile_size_nm = cfg.resolved_tile_size_nm()
         n_tiles = cfg.total_tiles()
-        n_iter = max(1, cfg.iterations_per_tile)
+        n_iter = cfg.effective_iterations()
 
         output: Optional[Path] = None
         if cfg.output_folder:
@@ -1031,20 +928,17 @@ class AutomationRunner(QThread):
             f"Y={wide_centre[1]:+.3f} nm"
         )
 
-        # Derive the piezo V/nm calibration from the current offset.
-        # The motion layer needs this to convert nm → volts for the
-        # underlying Createc offset call. Empirically ~0.1 V/nm on this
-        # rig. If both X and Y are near zero we can't derive — abort
-        # rather than position the tip with a bad calibration.
-        # Calibration policy: prefer the delta-probe method unconditionally.
-        # The "from current" path is unreliable when either axis has a
-        # small starting offset (≲ a few nm) because Createc rounds the
-        # .VOLT readback to two decimal places, contaminating the V/nm
-        # ratio. A known +0.1 V probe move (≈1 nm) gives ~20× the signal
-        # and a calibration accurate to well under 1%.
+        # Derive the piezo V/nm calibration. The motion layer needs this
+        # to convert nm → volts for the underlying Createc offset call
+        # (empirically ~0.1 V/nm on this rig). Policy "current_then_delta":
+        # try the cheap from-current ratio first; when the starting offset
+        # is too small to trust (Createc rounds .VOLT readback to two
+        # decimals), fall back to the delta probe — a known +0.1 V move
+        # (≈1 nm) plus restore, which calibrates to well under 1%. If
+        # neither works, abort rather than position the tip blind.
         self.info_message.emit(
-            "Calibration: deriving V/nm by delta probe "
-            "(±0.1 V move + restore — tip returns to start)"
+            "Calibration: deriving V/nm (from current offset, falling back "
+            "to a ±0.1 V delta probe — tip returns to start)"
         )
         try:
             cal = self._motion_manager().calibrate_xy("current_then_delta")
@@ -1064,17 +958,15 @@ class AutomationRunner(QThread):
             f"{cal.volts_per_nm_y:.5f} V/nm (Y)"
         )
 
-        # Tile pixel-offsets → nm offsets in the wide frame
-        wide_nm_per_px_x = cfg.wide_size_nm[0] / max(cfg.wide_pixels[0], 1)
-        wide_nm_per_px_y = cfg.wide_size_nm[1] / max(cfg.wide_pixels[1], 1)
-        max_excursion_x = cfg.wide_size_nm[0] / 2.0
-        max_excursion_y = cfg.wide_size_nm[1] / 2.0
-
         # ── 2. Tile loop ─────────────────────────────────────────────
         # Absolute positioning: for each tile, compute the target XY in
         # nm and move through TipMotionManager. No accumulation, no scale
-        # ambiguity.
-        for tile_idx, target_x_px, target_y_px in tile_centers_in_wide_pixels(cfg):
+        # ambiguity. The pixel→nm conversion and the keep-inside-wide-frame
+        # clamp live in mosaic.tile_targets_nm / scan_geometry — the clamp
+        # honours both Createc conventions (X = frame centre, Y = top edge).
+        for tile_idx, target_x_nm, target_y_nm, was_clamped in tile_targets_nm(
+            cfg, wide_centre[0], wide_centre[1],
+        ):
             if self._stop_requested:
                 break
             self._wait_if_paused()
@@ -1082,20 +974,23 @@ class AutomationRunner(QThread):
             self.progress.emit(tile_idx, n_tiles + 2,
                                f"{cfg.name}: tile {tile_idx}/{n_tiles}")
 
-            # Pixel-from-wide-centre → nm-from-wide-centre → absolute nm.
-            dx_nm = (target_x_px - cfg.wide_pixels[0] / 2.0) * wide_nm_per_px_x
-            dy_nm = (target_y_px - cfg.wide_pixels[1] / 2.0) * wide_nm_per_px_y
-            # Safety clamp: never request a tile centre more than half a
-            # wide-field away — anything outside is a math typo.
-            dx_nm = max(-max_excursion_x, min(max_excursion_x, dx_nm))
-            dy_nm = max(-max_excursion_y, min(max_excursion_y, dy_nm))
-            target_nm = (wide_centre[0] + dx_nm, wide_centre[1] + dy_nm)
+            target_nm = (target_x_nm, target_y_nm)
+            if was_clamped:
+                msg = (
+                    f"tile {tile_idx:02d}: requested frame extends outside the "
+                    f"wide field — clamped to X={target_nm[0]:+.3f} nm, "
+                    f"Y={target_nm[1]:+.3f} nm. Check tile_size_nm/grid_n; "
+                    "tiles will overlap or leave gaps."
+                )
+                log.warning(msg)
+                self.info_message.emit("⚠ " + msg)
 
             try:
                 self.info_message.emit(
                     f"tile {tile_idx:02d}/{n_tiles}: target "
                     f"X={target_nm[0]:+.3f} nm  Y={target_nm[1]:+.3f} nm  "
-                    f"(Δ centre: {dx_nm:+.2f}, {dy_nm:+.2f})"
+                    f"(Δ from wide home: {target_nm[0] - wide_centre[0]:+.2f}, "
+                    f"{target_nm[1] - wide_centre[1]:+.2f})"
                 )
                 motion = self._motion_manager().move_absolute_nm(
                     target_nm[0],
@@ -1115,8 +1010,9 @@ class AutomationRunner(QThread):
                     return
                 log.info(
                     "tile %02d: move_absolute_nm(%.3f, %.3f) "
-                    "[Δ from centre: %+.3f, %+.3f nm]",
-                    tile_idx, target_nm[0], target_nm[1], dx_nm, dy_nm,
+                    "[Δ from wide home: %+.3f, %+.3f nm]",
+                    tile_idx, target_nm[0], target_nm[1],
+                    target_nm[0] - wide_centre[0], target_nm[1] - wide_centre[1],
                 )
                 actual = self._log_offset(f"tile {tile_idx:02d} after positioning")
                 if actual is not None:
@@ -1138,44 +1034,72 @@ class AutomationRunner(QThread):
                 log.warning("tile %02d positioning failed: %s", tile_idx, e)
                 self.info_message.emit(f"⚠ tile {tile_idx:02d} positioning failed: {e}")
 
-            # 2c. Apply tile params (offset preserved).
-            tile_params = ScanParams(
-                bias_V=cfg.bias_V,
-                setpoint_A=cfg.setpoint_A,
-                size_nm=tile_size_nm,
-                pixels=cfg.tile_pixels,
-                speed_nm_s=cfg.tile_speed_nm_s,
-                memo=f"{cfg.name} tile {tile_idx:02d}",
-            )
-            self._apply_scan_params(tile_params)
-            self._log_offset(f"tile {tile_idx:02d} after apply(tile_params)")
-
-            # 2d. Iterations with drift correction against iter 1.
-            tile_ref: Optional[np.ndarray] = None
+            # 2c–d. Per-iteration loop.  Each iteration applies its own bias
+            # so a bias sweep is supported (each iter at a different voltage).
+            # apply() preserves the XY offset set by set_offset_nm() above.
+            bias_seq = cfg.effective_bias_sequence()
+            bpi = cfg.biases_per_iteration()  # voltages scanned per iteration
             zoom_nm_per_px_x = tile_size_nm[0] / max(cfg.tile_pixels[0], 1)
             zoom_nm_per_px_y = tile_size_nm[1] / max(cfg.tile_pixels[1], 1)
-            for it in range(n_iter):
+
+            # Drift measurement baseline: iteration 1's image. Later
+            # iterations of the SAME tile frame are compared against it
+            # (observation only — no correction is applied). In bias-sweep
+            # mode contrast changes between iterations and estimators may
+            # refuse; the logged refusal is itself useful data.
+            tile_iter1_img = None
+
+            for it, iter_bias_V in enumerate(bias_seq):
                 if self._stop_requested:
                     break
+
+                # Safety guard: never scan constant-current at ~0 V.
+                if abs(iter_bias_V) < MIN_CONST_CURRENT_BIAS_V:
+                    msg = (f"tile {tile_idx:02d} iter{it + 1}: "
+                           f"|bias|={abs(iter_bias_V) * 1000:.2f} mV "
+                           f"< {MIN_CONST_CURRENT_BIAS_V * 1000:.2f} mV — "
+                           "skipping (constant-current scan at 0 V would crash the tip)")
+                    log.warning(msg)
+                    self.info_message.emit("⚠ " + msg)
+                    continue
+
+                # Apply scan params for this iteration (bias may differ).
+                iter_params = ScanParams(
+                    bias_V=iter_bias_V,
+                    setpoint_A=cfg.setpoint_A,
+                    size_nm=tile_size_nm,
+                    pixels=cfg.tile_pixels,
+                    speed_nm_s=cfg.tile_speed_nm_s,
+                    memo=(f"{cfg.name} tile {tile_idx:02d} iter{it + 1} "
+                          f"{iter_bias_V * 1000:.1f} mV"),
+                )
+                self._stm.scan.apply(iter_params)
+                self._arm_tunnel_floor(cfg.setpoint_A)
+                self._log_offset(f"tile {tile_idx:02d} iter{it + 1} after apply")
+
                 if cfg.settling_s > 0:
                     self._sleep_with_progress(
                         cfg.settling_s,
-                        f"tile {tile_idx:02d} iter{it + 1} settle",
+                        f"tile {tile_idx:02d} iter{it + 1} "
+                        f"{iter_bias_V * 1000:.1f} mV settle",
                     )
                     if self._stop_requested:
                         break
 
-                self._log_offset(
-                    f"tile {tile_idx:02d} iter{it + 1} before scan"
-                )
-                dat_name = f"tile_{tile_idx:02d}_iter{it + 1}.dat"
-                png_name = f"tile_{tile_idx:02d}_iter{it + 1}.png"
+                # Filenames: real iteration number (several voltages may share
+                # one iteration) plus a bias tag so each image is unique and
+                # self-documenting (e.g. tile_02_iter3_+100mV.dat).
+                iter_no = it // bpi + 1
+                bias_tag = (f"_{iter_bias_V * 1000:+.0f}mV"
+                            if cfg.bias_sweep else "")
+                dat_name = f"tile_{tile_idx:02d}_iter{iter_no}{bias_tag}.dat"
+                png_name = f"tile_{tile_idx:02d}_iter{iter_no}{bias_tag}.png"
+
+                self._log_offset(f"tile {tile_idx:02d} iter{it + 1} before scan")
                 path = self._scan_and_save_to(output, dat_name)
                 if path is not None:
                     self.scan_completed.emit(str(path))
-                self._log_offset(
-                    f"tile {tile_idx:02d} iter{it + 1} after scan"
-                )
+                self._log_offset(f"tile {tile_idx:02d} iter{it + 1} after scan")
 
                 img = self._stm.scan.live_data()
                 if img is None:
@@ -1189,72 +1113,25 @@ class AutomationRunner(QThread):
                     self._last_z_stability = stability
                     self._acq_log.emit("z_stability", metrics=stability)
                     self.z_stability.emit(stability)
+                    self._check_z_frozen(stability)
                 except Exception:
                     pass
 
-                # Drift correction: first iteration becomes the reference;
-                # subsequent iterations cross-correlate against it and
-                # move through TipMotionManager using the calibration already
-                # derived for this mosaic.
-                if it == 0:
-                    tile_ref = img
-                elif tile_ref is not None:
-                    try:
-                        detector = DriftDetector(
-                            continuous=False,
-                            method=getattr(self._recipe, "drift_method", "hybrid"),
-                        )
-                        result = detector.measure(reference=tile_ref, current=img)
-                        self._last_drift_result = result
-                        self._acq_log.emit("drift_result", result=result)
-                        if (abs(result.dx_pixels) + abs(result.dy_pixels)) > 0.5:
-                            # Pixel shift → nm shift in the tile frame
-                            shift_x_nm = result.dx_pixels * zoom_nm_per_px_x
-                            shift_y_nm = result.dy_pixels * zoom_nm_per_px_y
+                # Inter-iteration drift measurement (same frame, no motion)
+                if tile_iter1_img is None:
+                    tile_iter1_img = img
+                else:
+                    self._measure_and_log_drift(
+                        f"tile{tile_idx:02d}_iter{it + 1}_vs_iter1",
+                        tile_iter1_img, img,
+                        tile_size_nm, cfg.tile_pixels,
+                    )
 
-                            before = self._log_offset(
-                                f"tile {tile_idx:02d} iter{it + 1} drift "
-                                f"({result.dx_pixels:+.2f}, {result.dy_pixels:+.2f}) px "
-                                f"→ ({shift_x_nm:+.3f}, {shift_y_nm:+.3f}) nm"
-                            )
-                            if before is not None:
-                                motion = self._motion_manager().move_relative_nm(
-                                    shift_x_nm,
-                                    shift_y_nm,
-                                    reason=(
-                                        f"mosaic tile {tile_idx:02d} "
-                                        f"iter {it + 1} drift"
-                                    ),
-                                    settle_s=cfg.settling_s,
-                                )
-                                self._record_motion_result(motion)
-                                if motion.ok:
-                                    self.info_message.emit(
-                                        f"tile {tile_idx:02d} iter{it + 1}: drift "
-                                        f"corrected by ({shift_x_nm:+.3f}, "
-                                        f"{shift_y_nm:+.3f}) nm "
-                                        f"[from {result.dx_pixels:+.2f}, "
-                                        f"{result.dy_pixels:+.2f} px shift]"
-                                    )
-                                else:
-                                    msg = (
-                                        f"tile {tile_idx:02d} iter{it + 1}: "
-                                        f"drift correction failed — "
-                                        f"{'; '.join(motion.warnings)}"
-                                    )
-                                    log.warning(msg)
-                                    self.error.emit(msg)
-                                    self._stop_requested = True
-                                    break
-                            self.drift_measured.emit(result)
-                    except Exception as e:
-                        log.debug("tile drift step failed: %s", e)
+
 
             self.mosaic_tile_done.emit(tile_idx)
 
         # ── 3. Wide overview (after) ──────────────────────────────────
-        # Re-apply wide params; the XY offset is wherever the last tile
-        # left it — that's fine, we just snap back to the wide frame.
         wide_after_params = ScanParams(
             bias_V=cfg.bias_V,
             setpoint_A=cfg.setpoint_A,
@@ -1263,6 +1140,14 @@ class AutomationRunner(QThread):
             speed_nm_s=cfg.wide_speed_nm_s,
             memo=f"{cfg.name} wide after",
         )
+        # Resize to the wide frame BEFORE repositioning. wide_centre was
+        # recorded with the wide frame active (after the wide_before apply),
+        # so the offset must also be RE-SET with the wide frame active to
+        # land on the same physical region. Moving while the small tile
+        # frame is still loaded and only then resizing shifts wide_after by
+        # the frame-size delta — the off-by-one-tile −Y wide_after seen on
+        # 2026-06-20 (Createc shifts SCAN.OFFSET on IMAGESIZE change; B2).
+        self._apply_scan_params(wide_after_params)
         # Return to the wide centre via absolute motion, so
         # wide_after is anchored at the same XY as wide_before.
         self._log_offset(f"{cfg.name}: before return-to-centre")
@@ -1285,7 +1170,6 @@ class AutomationRunner(QThread):
             log.warning("return-to-centre failed: %s", e)
         self._log_offset(f"{cfg.name}: after return-to-centre")
 
-        self._apply_scan_params(wide_after_params)
         if cfg.settling_s > 0:
             self._sleep_with_progress(cfg.settling_s, f"{cfg.name}: wide-after settle")
         if not self._stop_requested:
@@ -1299,37 +1183,16 @@ class AutomationRunner(QThread):
                 _save_image_preview(wide_after_img, output / "wide_after.png")
             self._log_offset(f"{cfg.name}: wide_after scan complete")
 
-            # Total mosaic drift: cross-correlate wide_before vs wide_after.
-            # Both anchored at wide_centre, so any pixel shift is sample
-            # drift over the whole mosaic duration. Useful diagnostic for
-            # overnight runs and rig stability.
-            if wide_before_img is not None and wide_after_img is not None:
-                try:
-                    detector = DriftDetector(
-                        continuous=False,
-                        method=getattr(self._recipe, "drift_method", "hybrid"),
-                    )
-                    drift = detector.measure(
-                        reference=wide_before_img, current=wide_after_img,
-                    )
-                    self._last_drift_result = drift
-                    self._acq_log.emit("drift_result", result=drift, role="mosaic_total")
-                    drift_x_nm = drift.dx_pixels * wide_nm_per_px_x
-                    drift_y_nm = drift.dy_pixels * wide_nm_per_px_y
-                    drift_total = (drift_x_nm ** 2 + drift_y_nm ** 2) ** 0.5
-                    log.info(
-                        "Mosaic total drift (wide_before → wide_after): "
-                        "Δx=%+.3f nm, Δy=%+.3f nm, |Δ|=%.3f nm  "
-                        "(confidence %.2f, method=%s)",
-                        drift_x_nm, drift_y_nm, drift_total,
-                        drift.confidence, drift.method,
-                    )
-                    self.info_message.emit(
-                        f"Total mosaic drift: Δx={drift_x_nm:+.3f} nm, "
-                        f"Δy={drift_y_nm:+.3f} nm, |Δ|={drift_total:.3f} nm"
-                    )
-                except Exception as e:
-                    log.warning("Mosaic total drift measurement failed: %s", e)
+            # Campaign-duration drift: the after-overview was taken at the
+            # same anchored XY and frame size as the before-overview, so
+            # their apparent shift is the net drift over the whole mosaic.
+            self._measure_and_log_drift(
+                "wide_after_vs_wide_before",
+                wide_before_img, wide_after_img,
+                cfg.wide_size_nm, cfg.wide_pixels,
+            )
+
+
 
         if output is not None:
             self.mosaic_finished.emit(str(output))
@@ -1377,6 +1240,7 @@ class AutomationRunner(QThread):
             if img is not None:
                 self._last_z_stability = compute_z_stability(img)
                 quality = {"z_stability": self._last_z_stability}
+                self._check_z_frozen(self._last_z_stability)
         except Exception:
             quality = None
         self._record_scan_artifacts(target, role=role, quality=quality)
@@ -1393,17 +1257,42 @@ class AutomationRunner(QThread):
         )
         self._stm.coarse.configure_approach(cfg)
         self._stm.coarse.start_approach()
-        if not self._stm.coarse.wait_for_approach(timeout_s=step.timeout_s):
+        # Poll instead of coarse.wait_for_approach(): the runner must stay
+        # responsive to Stop during an approach that can take many minutes.
+        # No current-threshold check here — the whole point of an approach
+        # is for the current to rise to the setpoint, so the tip-crash
+        # threshold would false-trigger.
+        deadline = time.time() + float(step.timeout_s)
+        finished = False
+        while time.time() < deadline:
+            if self._stop_requested:
+                self._stm.coarse.stop_approach()
+                log.info("Approach stopped by user request: %s", label)
+                return
+            if self._stm.coarse.approach_finished:
+                finished = True
+                break
+            time.sleep(1.0)
+        if not finished:
+            self._stm.coarse.stop_approach()
             self.error.emit(f"Approach timed out: {label}")
         log.info("Approach step finished: %s", label)
 
-    def _sleep_with_progress(self, seconds: float, label: str) -> None:
-        """Sleep emitting per-second updates so the GUI can show a countdown."""
+    def _sleep_with_progress(self, seconds: float, label: str,
+                             check_safety: bool = True) -> None:
+        """Sleep emitting per-second updates so the GUI can show a countdown.
+
+        Polls the safety monitor once per second — a tip contact during a
+        long wait or settle must abort the run just like one during a scan.
+        Raises SafetyViolation accordingly.
+        """
         end = time.time() + seconds
         while True:
             remaining = end - time.time()
             if remaining <= 0 or self._stop_requested:
                 break
+            if check_safety:
+                self._check_safety()
             self.settling.emit(max(0, int(remaining)), label)
             time.sleep(min(1.0, remaining))
 
@@ -1438,12 +1327,17 @@ class AutomationRunner(QThread):
         return path
 
     def _wait_for_scan_with_live_emit(self, poll_interval_s: Optional[float] = None) -> bool:
-        """Wait for the active scan to finish, emitting live frames as it runs.
+        """Wait for the active scan to finish, polling safety as it runs.
 
         Uses the event bridge as a wake-up signal when available; otherwise
-        falls back to fixed-interval polling. Emits ``live_frame`` at most
-        once per ``poll_interval_s``. Checks the safety monitor every
-        iteration and raises ``SafetyViolation`` if the threshold is hit.
+        falls back to fixed-interval polling. The safety check runs every
+        iteration (cheap: one ADC read + one getp) and raises
+        ``SafetyViolation`` if the threshold is hit.
+
+        Live frames are decoupled from the safety poll: a full-frame
+        DATA.SCAN pull is an expensive COM transfer executed on STMAFM's
+        GUI thread, so frames are pulled only when a consumer opted in via
+        :meth:`enable_live_frames`, and never more often than its interval.
         """
         scan = self._stm.scan
         bridge = self._stm.events
@@ -1472,13 +1366,18 @@ class AutomationRunner(QThread):
             self._wait_if_paused()
             # Safety check — raises SafetyViolation if threshold exceeded
             self._check_safety()
-            # Pull one live frame for the viewer
-            try:
-                frame = scan.live_data()
-                if frame is not None:
-                    self.live_frame.emit(frame)
-            except Exception:
-                log.debug("live_data() raised", exc_info=True)
+            # Pull one live frame for the viewer — opt-in and rate-limited
+            frame_interval = self._live_frame_interval_s
+            if frame_interval is not None:
+                now = time.monotonic()
+                if now - self._last_frame_pull >= frame_interval:
+                    self._last_frame_pull = now
+                    try:
+                        frame = scan.live_data()
+                        if frame is not None:
+                            self._publish_live_frame(frame)
+                    except Exception:
+                        log.debug("live_data() raised", exc_info=True)
             # Either wake on an event or sleep the polling interval
             bridge.consume_flag(timeout=poll_interval_s)
         return True
@@ -1514,8 +1413,22 @@ class AutomationRunner(QThread):
         return False
 
     def _check_safety(self) -> None:
-        """Raise SafetyViolation if the current threshold is exceeded."""
+        """Raise SafetyViolation if the current threshold is exceeded.
+
+        Also fails closed on persistent current-readback failure: the
+        monitor reports read_failed and eventually flips ok=False (see
+        SafetyConfig.max_read_failures) — without this, a broken readback
+        would silently run the whole recipe unprotected.
+        """
         status = self._safety.check(self._stm)
+        if status.read_failed:
+            n = self._safety.consecutive_read_failures
+            if n == self._safety.config.warn_read_failures:
+                msg = (f"safety: current readback failed {n}× in a row — "
+                       "tip-crash protection is degraded")
+                log.warning(msg)
+                self._acq_log.emit("safety_read_failure", consecutive=n)
+                self.info_message.emit("⚠ " + msg)
         if status.measured_current_A is not None:
             current = abs(status.measured_current_A)
             if self._max_observed_current_A is None:
@@ -1525,6 +1438,20 @@ class AutomationRunner(QThread):
             self._acq_log.emit("safety_reading", current_A=current, ok=status.ok)
             self.safety_reading.emit(current)
         if not status.ok:
+            if status.kind == "tunnel_lost":
+                # Tip fell out of tunneling — stop gracefully WITHOUT a
+                # retract (it is already away from the surface). Let the
+                # current scan finish unwinding via the normal stop path.
+                self._acq_log.emit(
+                    "tunnel_lost_abort",
+                    reason=status.reason,
+                    current_A=status.measured_current_A,
+                )
+                log.error(status.reason)
+                self.info_message.emit("⚠ " + status.reason)
+                self.error.emit(status.reason)
+                self._stop_requested = True
+                return
             self._acq_log.emit(
                 "safety_abort",
                 reason=status.reason,
@@ -1532,131 +1459,6 @@ class AutomationRunner(QThread):
             )
             raise SafetyViolation(status.reason,
                                   current_A=status.measured_current_A)
-
-    def _do_alignment_scan(
-        self,
-        recipe: MeasurementRecipe,
-        data_params: Optional["ScanParams"] = None,
-    ) -> None:
-        """Run a tracking scan and move the offset to keep features centred.
-
-        If ``recipe.fast_alignment`` is True and ``data_params`` is given,
-        the alignment scan runs at half the data-scan pixel count (same
-        physical area). The reference is downsampled to match for the
-        correlation, and the data-scan pixels are restored before the
-        caller's data scan starts. Halves the alignment scan's wall-clock
-        time at the cost of slightly coarser cross-correlation precision.
-
-        The alignment frame is captured via ``live_data()`` and *not* saved
-        to disk.
-        """
-        from dataclasses import replace as _dc_replace
-        scan = self._stm.scan
-
-        fast = bool(getattr(recipe, "fast_alignment", False)) and data_params is not None
-        if fast:
-            align_params = _dc_replace(
-                data_params,
-                pixels=(max(64, int(data_params.pixels[0]) // 2),
-                        max(64, int(data_params.pixels[1]) // 2)),
-                memo=f"{data_params.memo} (fast align)" if data_params.memo else "fast align",
-            )
-            self._apply_scan_params(align_params)
-
-        if self._acq_log.path is None:
-            try:
-                self._ensure_acq_log_for_folder(Path(self._stm.raw.savedatfilename).parent)
-            except Exception:
-                pass
-        self._acq_log.emit(
-            "scan_started",
-            role="alignment",
-            step_index=self._current_step_index,
-            label=self._current_label,
-            scan_parameters=self._active_scan_params,
-        )
-        scan.start()
-        if not self._wait_for_scan_with_live_emit():
-            if fast and data_params is not None:
-                self._apply_scan_params(data_params)
-            return
-        current_array = scan.live_data()
-        if current_array is None or self._reference_array is None:
-            if fast and data_params is not None:
-                self._apply_scan_params(data_params)
-            return
-
-        # Cross-correlation needs matching shapes; downsample the full-res
-        # reference onto the alignment frame's grid if they differ.
-        ref_for_corr = self._reference_array
-        if fast and ref_for_corr.shape != current_array.shape:
-            try:
-                from skimage.transform import resize
-                ref_for_corr = resize(
-                    self._reference_array,
-                    current_array.shape,
-                    mode="reflect",
-                    anti_aliasing=True,
-                    preserve_range=True,
-                )
-            except Exception as e:
-                log.warning("Reference resize failed (%s); skipping alignment", e)
-                if data_params is not None:
-                    self._apply_scan_params(data_params)
-                return
-
-        cur_ts = time.time()
-        result = self._detector.measure(
-            reference=ref_for_corr,
-            current=current_array,
-            ref_timestamp=self._reference_timestamp,
-            cur_timestamp=cur_ts,
-            extra_seconds=recipe.drift_reposition_delay_s,
-        )
-        self._last_drift_result = result
-        self._acq_log.emit("drift_result", result=result)
-        self.drift_measured.emit(result)
-        log.info(
-            "Drift%s: dx=%.2f Å, dy=%.2f Å, magnitude=%.2f Å, confidence=%.2f",
-            " (fast)" if fast else "",
-            result.dx_angstrom, result.dy_angstrom,
-            result.magnitude_angstrom, result.confidence,
-        )
-
-        # Move while the alignment frame is still active so the pixel
-        # delta is interpreted in alignment-frame pixels (correct physical
-        # shift either way: dx_align_px × align_nm_per_px = dx_data_px ×
-        # data_nm_per_px, since size_nm is unchanged between modes).
-        frame_size_nm = data_params.size_nm if data_params is not None else scan.size_nm
-        frame_pixels = (
-            int(current_array.shape[1]),
-            int(current_array.shape[0]),
-        )
-        motion = self._motion_manager().move_relative_pixels(
-            result.dx_pixels,
-            result.dy_pixels,
-            frame_size_nm=frame_size_nm,
-            frame_pixels=frame_pixels,
-            reason="drift alignment",
-            settle_s=0.0,
-        )
-        self._record_motion_result(motion)
-        if not motion.ok:
-            msg = f"Drift correction motion failed: {'; '.join(motion.warnings)}"
-            log.warning(msg)
-            self.error.emit(msg)
-            self._stop_requested = True
-            if fast and data_params is not None:
-                self._apply_scan_params(data_params)
-            return
-
-        # Restore data-scan pixels before the caller's data scan starts.
-        if fast and data_params is not None:
-            self._apply_scan_params(data_params)
-
-        self._sleep_with_progress(recipe.drift_reposition_delay_s,
-                                  "Drift reposition")
-        self.drift_corrected.emit(result.dx_pixels, result.dy_pixels)
 
     def _wait_if_paused(self) -> None:
         if self._pause_requested:
@@ -1666,16 +1468,6 @@ class AutomationRunner(QThread):
             if not self._stop_requested:
                 self._set_state(RunnerState.RUNNING)
 
-    @staticmethod
-    def _load_channel(path: Path, channel: int) -> Optional[np.ndarray]:
-        try:
-            from createc.Createc_pyFile import DAT_IMG
-            img = DAT_IMG(str(path))
-            return np.array(img.img_array_list[channel], dtype=float)
-        except Exception as e:
-            log.warning("Could not load channel %d from %s: %s", channel, path, e)
-            return None
-
 
 def _save_image_preview(arr: np.ndarray, path: Path) -> Optional[Path]:
     """Render a 2-D scan array as a greyscale PNG using matplotlib."""
@@ -1683,7 +1475,7 @@ def _save_image_preview(arr: np.ndarray, path: Path) -> Optional[Path]:
         import matplotlib
         matplotlib.use("Agg")  # headless backend
         import matplotlib.pyplot as plt
-        from scanflow.drift.detector import _level_correct
+        from scanflow.analysis.feature_discovery import _level_correct
 
         levelled = _level_correct(arr.astype(float))
         fig, ax = plt.subplots(figsize=(4, 4), dpi=150)
@@ -1699,36 +1491,3 @@ def _save_image_preview(arr: np.ndarray, path: Path) -> Optional[Path]:
         return None
 
 
-def _save_overview_preview(
-    arr: np.ndarray,
-    candidates: list,
-    path: Path,
-) -> Optional[Path]:
-    """Render the wide scan with numbered boxes around each discovered feature."""
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from matplotlib.patches import Rectangle
-        from scanflow.drift.detector import _level_correct
-
-        levelled = _level_correct(arr.astype(float))
-        fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
-        ax.imshow(levelled, cmap="afmhot", origin="lower")
-        for i, c in enumerate(candidates, start=1):
-            min_row, min_col, max_row, max_col = c.bbox_px
-            rect = Rectangle((min_col, min_row), max_col - min_col, max_row - min_row,
-                             fill=False, edgecolor="cyan", linewidth=1.5)
-            ax.add_patch(rect)
-            ax.text(max_col + 2, min_row, str(i),
-                    color="cyan", fontsize=10, fontweight="bold",
-                    bbox=dict(facecolor="black", alpha=0.5, pad=1, edgecolor="none"))
-        ax.set_axis_off()
-        fig.tight_layout(pad=0)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(path, bbox_inches="tight", pad_inches=0.05)
-        plt.close(fig)
-        return path
-    except Exception as e:
-        log.warning("Could not write overview preview %s: %s", path, e)
-        return None

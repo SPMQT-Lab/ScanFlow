@@ -4,11 +4,6 @@ Given a wide STM image and its physical scale, segment bright features,
 optionally merge nearby pieces (so a cluster reads as one feature),
 filter by physical size and edge margin, and return sorted candidates
 with auto-sized zoom frames.
-
-Reuses the same Otsu + level-correct pipeline as :mod:`scanflow.drift.detector`,
-but returns bounding-box information so the runner can scale each zoom to the
-actual feature size — handles 1.2 nm molecules and 10 nm clusters with the
-same code path.
 """
 
 from __future__ import annotations
@@ -18,7 +13,33 @@ from typing import List, Tuple
 
 import numpy as np
 
-from scanflow.drift.detector import _level_correct
+def _level_correct(img: np.ndarray) -> np.ndarray:
+    """Subtract a fitted plane from a 2-D image array (de-tilts the wide scan).
+
+    NaN-safe by necessity: real rigs emit NaN rows in partial/interrupted
+    frames. The plane is fitted on FINITE pixels only — fitting through
+    NaNs silently poisons the whole result on some LAPACKs and raises
+    "SVD did not converge" outright on others (Windows lab PC — the
+    historical "NaN crashes the program" failure). Non-finite pixels stay
+    non-finite in the output; callers decide how to fill them.
+    """
+    img = np.asarray(img, dtype=float)
+    m, n = img.shape
+    finite = np.isfinite(img)
+    x1, x2 = np.mgrid[:m, :n]
+    X = np.column_stack([np.ones(m * n), x1.ravel(), x2.ravel()])
+    Y = img.ravel()
+    mask = finite.ravel()
+    if mask.sum() < 8:
+        # Not enough data for a plane — best effort: remove the median.
+        offset = float(np.nanmedian(img)) if mask.any() else 0.0
+        return img - offset
+    try:
+        theta, *_ = np.linalg.lstsq(X[mask], Y[mask], rcond=None)
+    except np.linalg.LinAlgError:
+        return img - float(np.nanmedian(img))
+    plane = (X @ theta).reshape(m, n)
+    return img - plane
 
 
 @dataclass
@@ -54,6 +75,17 @@ def discover_features(
     from skimage.measure import label, regionprops
 
     levelled = _level_correct(image)
+    # Fill non-finite pixels (NaN rows from partial/interrupted frames)
+    # with the MEDIAN of the valid region: a median-filled block looks
+    # like flat terrace to Otsu (filling with the minimum would skew the
+    # histogram so far that the whole terrace thresholds as "bright"),
+    # so features in the valid region remain detectable and the blank
+    # region can never produce features of its own.
+    finite = np.isfinite(levelled)
+    if not finite.any():
+        return []
+    if not finite.all():
+        levelled = np.where(finite, levelled, float(np.median(levelled[finite])))
     smoothed = gaussian(rescale_intensity(levelled.astype(float)), sigma=1.0)
     try:
         thresh = threshold_otsu(smoothed)

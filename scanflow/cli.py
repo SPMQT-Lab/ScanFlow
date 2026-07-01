@@ -20,7 +20,10 @@ import math
 import sys
 from pathlib import Path
 
-from scanflow.automation import MeasurementRecipe, AutomationRunner
+# Keep this module Qt-free at import time: AutomationRunner subclasses
+# QThread, so it is imported inside _run_blocking() only. `estimate` (and
+# plan printing / validation for all commands) must work without PySide6.
+from scanflow.automation import MeasurementRecipe
 from scanflow.automation.recipe import format_duration
 
 
@@ -51,14 +54,25 @@ def _print_plan(recipe: MeasurementRecipe, what: str) -> None:
         per_s = s0.estimate_duration_s() if hasattr(s0, "estimate_duration_s") else 0.0
         if per_s:
             print(f"  Per scan  : ≈ {format_duration(per_s)}")
-    print(f"  Drift     : {'on' if recipe.drift_correction else 'off'}"
-          + ("   (adds ~50% alignment time)" if recipe.drift_correction else ""))
     print(f"  Safety    : "
           f"{'on, threshold ' + f'{recipe.safety_max_current_A*1e9:.3f} nA' if recipe.safety_enable else 'off'}")
     if recipe.save_folder:
         print(f"  Output    : {recipe.save_folder}")
     print(f"  Estimated total time: {format_duration(total_s)}")
     print()
+
+
+def _check_recipe(recipe: MeasurementRecipe, mock: bool) -> bool:
+    """Print recipe.validate() issues. Returns False when errors block the run."""
+    issues = recipe.validate(mode="mock" if mock else "live")
+    for issue in issues:
+        print(f"  {issue}", file=sys.stderr if issue.startswith("ERROR") else sys.stdout)
+    errors = [i for i in issues if i.startswith("ERROR")]
+    if errors:
+        print(f"\nAborted: {len(errors)} validation error(s) — fix the recipe first.",
+              file=sys.stderr)
+        return False
+    return True
 
 
 def _confirm(skip: bool) -> bool:
@@ -86,13 +100,20 @@ def _connect(mock: bool):
     return stm
 
 
-def _run_blocking(stm, recipe: MeasurementRecipe) -> int:
+def _run_blocking(stm, recipe: MeasurementRecipe,
+                  arm_tip_form: bool = False) -> int:
     """Execute a recipe and stream progress to stdout. Returns the exit code."""
     from PySide6.QtCore import QCoreApplication
+    from scanflow.automation import AutomationRunner
 
     app = QCoreApplication.instance() or QCoreApplication(sys.argv)
 
     runner = AutomationRunner(stm, recipe)
+    if arm_tip_form:
+        # One supervised pulse for THIS run only (--arm-tip-form). The
+        # runner halts at any further tip-form steps.
+        runner.approve_next_tip_form()
+        print("Tip forming ARMED for this run (one pulse).")
     state = {"err": None}
 
     def on_progress(i, n, label):
@@ -109,18 +130,10 @@ def _run_blocking(stm, recipe: MeasurementRecipe) -> int:
         print(f"⚠ SAFETY ABORT: {msg}  (|I|={current_A*1e9:.3f} nA)",
               file=sys.stderr)
 
-    def on_drift(result):
-        try:
-            print(f"        drift: dx={result.dx_angstrom:+.3f} Å  "
-                  f"dy={result.dy_angstrom:+.3f} Å  |d|={result.magnitude_angstrom:.3f} Å")
-        except AttributeError:
-            pass
-
     runner.progress.connect(on_progress)
     runner.scan_completed.connect(on_saved)
     runner.error.connect(on_error)
     runner.safety_violation.connect(on_safety)
-    runner.drift_measured.connect(on_drift)
     runner.finished.connect(app.quit)
     runner.start()
 
@@ -150,7 +163,6 @@ def _build_bias_recipe(a) -> MeasurementRecipe:
         size_nm=(a.size, a.size),
         speed_nm_s=a.speed,
         pixels=(a.pixels, a.pixels),
-        drift_correction=not a.no_drift,
     )
     recipe.save_folder = a.save_folder or ""
     recipe.safety_max_current_A = a.safety_nA * 1e-9
@@ -168,7 +180,6 @@ def _build_current_recipe(a) -> MeasurementRecipe:
         size_nm=(a.size, a.size),
         speed_nm_s=a.speed,
         pixels=(a.pixels, a.pixels),
-        drift_correction=not a.no_drift,
     )
     recipe.save_folder = a.save_folder or ""
     recipe.safety_max_current_A = a.safety_nA * 1e-9
@@ -185,6 +196,8 @@ def cmd_bias(a) -> int:
     _print_plan(recipe,
                 f"Bias ramp {a.start:.3f} → {a.end:.3f} V  step {a.step*1000:.1f} mV  "
                 f"@ {a.setpoint:.2f} pA")
+    if not _check_recipe(recipe, a.mock):
+        return 2
     if not _confirm(a.yes):
         print("Aborted.")
         return 1
@@ -200,6 +213,8 @@ def cmd_current(a) -> int:
     _print_plan(recipe,
                 f"Current ramp {a.start:.2f} → {a.end:.2f} pA  step {a.step:.2f} pA  "
                 f"@ {a.bias*1000:.1f} mV")
+    if not _check_recipe(recipe, a.mock):
+        return 2
     if not _confirm(a.yes):
         print("Aborted.")
         return 1
@@ -213,14 +228,47 @@ def cmd_current(a) -> int:
 def cmd_run(a) -> int:
     recipe = MeasurementRecipe.load(Path(a.recipe))
     _print_plan(recipe, f"Recipe from {a.recipe}")
+    if not _check_recipe(recipe, a.mock):
+        return 2
+    has_tip_form = any(getattr(s, "kind", "") == "tip_form" for s in recipe.steps)
+    if has_tip_form and not a.arm_tip_form:
+        print("NOTE: this recipe contains tip-form step(s). Without "
+              "--arm-tip-form the run will HALT at the first one "
+              "(operator approval required).")
     if not _confirm(a.yes):
         print("Aborted.")
         return 1
     stm = _connect(a.mock)
     try:
-        return _run_blocking(stm, recipe)
+        return _run_blocking(stm, recipe,
+                             arm_tip_form=has_tip_form and a.arm_tip_form)
     finally:
         stm.disconnect()
+
+
+def cmd_diag_frame_resize(a) -> int:
+    """Operator-guided experiment for the B2 frame-resize question."""
+    from scanflow.diagnostics import run_frame_resize_experiment
+
+    stm = _connect(a.mock)
+    try:
+        report = run_frame_resize_experiment(
+            stm,
+            shrink_factor=a.shrink_factor,
+            with_scans=not a.no_scans,
+            save_folder=a.save_folder or "frame_resize_diag",
+            interactive=not a.no_input,
+        )
+    finally:
+        stm.disconnect()
+    derived = report.get("derived")
+    if derived:
+        print(f"\nOffset-Y readback shift: "
+              f"{derived['offset_y_readback_shift_nm']:+.3f} nm "
+              f"(centre-preserved predicts "
+              f"{derived['expected_shift_if_centre_preserved_nm']:+.3f}, "
+              f"top-edge-preserved predicts +0.000)")
+    return 0
 
 
 def cmd_estimate(a) -> int:
@@ -248,8 +296,6 @@ def _add_common_scan_args(p: argparse.ArgumentParser) -> None:
                    help="Image resolution per side (default 256)")
     p.add_argument("--save-folder", default="",
                    help="Directory for .dat files (default: STMAFM default)")
-    p.add_argument("--no-drift", action="store_true",
-                   help="Disable drift correction")
     p.add_argument("--safety-nA", type=float, default=1.0,
                    help="Tip-crash current threshold in nA (default 1.0)")
     p.add_argument("--no-safety", action="store_true",
@@ -292,7 +338,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("recipe", help="Path to a recipe.yaml")
     p_run.add_argument("--mock", action="store_true", help="Use mock STM")
     p_run.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
+    p_run.add_argument("--arm-tip-form", action="store_true",
+                       help="Explicitly arm ONE supervised tip-form pulse for "
+                            "this run (never implied by --yes)")
     p_run.set_defaults(func=cmd_run)
+
+    # diagnostics (operator-guided rig experiments)
+    p_diag = sub.add_parser("diag", help="Operator-guided rig diagnostics")
+    diag_sub = p_diag.add_subparsers(dest="what", required=True)
+    p_fr = diag_sub.add_parser(
+        "frame-resize",
+        help="Resolve the B2 frame-resize convention question "
+             "(docs/b2_frame_resize_experiment.md)",
+    )
+    p_fr.add_argument("--mock", action="store_true", help="Use mock STM")
+    p_fr.add_argument("--shrink-factor", type=float, default=2.0,
+                      help="Frame-height divisor for the resize step (default 2)")
+    p_fr.add_argument("--no-scans", action="store_true",
+                      help="Skip the before/after scans (offset readbacks only)")
+    p_fr.add_argument("--no-input", action="store_true",
+                      help="Non-interactive: auto-confirm every step (mock/testing)")
+    p_fr.add_argument("--save-folder", default="",
+                      help="Report/scan output folder (default ./frame_resize_diag)")
+    p_fr.set_defaults(func=cmd_diag_frame_resize)
 
     # estimate (no execution)
     p_est = sub.add_parser("estimate", help="Estimate run time without scanning")

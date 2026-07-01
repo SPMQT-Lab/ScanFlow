@@ -10,12 +10,18 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 from PySide6.QtGui import QTextCursor
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 
 
 class LogPanel(QWidget):
+    # Pop-out support: the panel itself only emits intent; MainWindow owns
+    # the tab/window juggling (it knows the tab index and the app icon).
+    popout_clicked = Signal()
+    floating_closed = Signal()
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self._floating = False
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -27,6 +33,14 @@ class LogPanel(QWidget):
         layout.addWidget(self._log)
 
         btn_row = QHBoxLayout()
+        self._popout_btn = QPushButton("Pop out")
+        self._popout_btn.setToolTip(
+            "Show the log in its own window — handy on a second monitor "
+            "while a sweep runs. Close the window (or click again) to "
+            "return it to the tab bar."
+        )
+        self._popout_btn.clicked.connect(self.popout_clicked)
+        btn_row.addWidget(self._popout_btn)
         btn_row.addStretch()
         save_btn = QPushButton("Save log…")
         save_btn.setToolTip(
@@ -41,6 +55,17 @@ class LogPanel(QWidget):
         clear_btn.clicked.connect(self._log.clear)
         btn_row.addWidget(clear_btn)
         layout.addLayout(btn_row)
+
+    def set_floating(self, floating: bool) -> None:
+        self._floating = floating
+        self._popout_btn.setText("Dock back" if floating else "Pop out")
+
+    def closeEvent(self, event) -> None:
+        if self._floating:
+            # Closing the floating window means "return to the tab bar",
+            # never "discard the log".
+            self.floating_closed.emit()
+        super().closeEvent(event)
 
     def append(self, message: str) -> None:
         ts = datetime.datetime.now().strftime("%H:%M:%S")

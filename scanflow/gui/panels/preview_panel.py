@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+import datetime as _dt
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +16,8 @@ from PySide6.QtCore import QThread, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
@@ -54,6 +58,18 @@ from probeflow.core.scan_loader import load_scan
 from probeflow.processing.geometry import set_zero_plane
 
 from scanflow.core import STMClient, SafetyConfig, SafetyMonitor, TipMotionManager, ScanParams
+from scanflow.core.scan import (
+    estimate_scan_duration_s as _estimate_scan_duration,
+    estimate_scan_timeout_s as _estimate_scan_timeout,
+    format_duration as _format_duration,
+)
+from scanflow.automation.workers import (
+    FeatureGroupScanWorker as _FeatureGroupScanWorker,
+    FeatureScanWorker as _FeatureScanWorker,
+    latest_dat_in_folder as _latest_dat_in_folder,
+    unique_dat_path as _unique_dat_path,
+)
+from scanflow.automation.group_survey import FeatureGroup, group_features
 
 log = logging.getLogger(__name__)
 
@@ -191,77 +207,418 @@ class _ClassificationWorker(QThread):
         self.result_ready.emit((classifs, used_encoder))
 
 
-class _FeatureScanWorker(QThread):
-    scan_saved = Signal(str)
-    failed = Signal(str)
-    progress = Signal(int, int, str)
 
-    def __init__(self, stm: STMClient, source_path: Path, targets: list[PreviewFeatureRow]) -> None:
-        super().__init__()
-        self._stm = stm
-        self._source_path = Path(source_path)
-        self._targets = list(targets)
 
-    def run(self) -> None:
+class _GroupScanDialog(QDialog):
+    """Parameter dialog shown before launching a grouped follow-up scan.
+
+    Collects grouping knobs (max_per_group, max_group_nm, feature_padding_nm)
+    and scan acquisition settings (pixels, speed, iterations, settling).
+    """
+
+    def __init__(self, parent=None, *, defaults: dict | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Scan as Groups — parameters")
+        self.setModal(True)
+        d = defaults or {}
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(10)
+
+        # ── Grouping ──────────────────────────────────────────────────────
+        self._max_per_group = QSpinBox()
+        self._max_per_group.setRange(2, 8)
+        self._max_per_group.setValue(int(d.get("max_per_group", 4)))
+        self._max_per_group.setToolTip("Maximum number of features captured in one scan frame.")
+        form.addRow("Max features / group", self._max_per_group)
+
+        self._max_group_nm = QDoubleSpinBox()
+        self._max_group_nm.setRange(5.0, 200.0)
+        self._max_group_nm.setSingleStep(5.0)
+        self._max_group_nm.setDecimals(1)
+        self._max_group_nm.setSuffix(" nm")
+        self._max_group_nm.setValue(float(d.get("max_group_nm", 30.0)))
+        self._max_group_nm.setToolTip("Maximum side length of any group's scan frame.")
+        form.addRow("Max frame size", self._max_group_nm)
+
+        self._padding_nm = QDoubleSpinBox()
+        self._padding_nm.setRange(0.5, 20.0)
+        self._padding_nm.setSingleStep(0.5)
+        self._padding_nm.setDecimals(1)
+        self._padding_nm.setSuffix(" nm")
+        self._padding_nm.setValue(float(d.get("feature_padding_nm", 3.0)))
+        self._padding_nm.setToolTip("Margin added on each side of the feature bounding boxes.")
+        form.addRow("Feature padding", self._padding_nm)
+
+        # ── Scan acquisition ──────────────────────────────────────────────
+        self._pixels = QComboBox()
+        for label, val in [("128 × 128", 128), ("256 × 256", 256), ("512 × 512", 512)]:
+            self._pixels.addItem(label, val)
+        default_px = int(d.get("group_pixels", 256))
+        for i in range(self._pixels.count()):
+            if self._pixels.itemData(i) == default_px:
+                self._pixels.setCurrentIndex(i)
+                break
+        form.addRow("Resolution", self._pixels)
+
+        self._speed = QDoubleSpinBox()
+        self._speed.setRange(1.0, 1000.0)
+        self._speed.setSingleStep(5.0)
+        self._speed.setDecimals(1)
+        self._speed.setSuffix(" nm/s")
+        self._speed.setValue(float(d.get("group_speed_nm_s", 20.0)))
+        form.addRow("Scan speed", self._speed)
+
+        self._time_preset = QComboBox()
+        for _label, _minutes in [("5 min", 5), ("10 min", 10), ("15 min", 15), ("Custom", None)]:
+            self._time_preset.addItem(_label, _minutes)
+        self._time_preset.setCurrentIndex(3)  # default: Custom
+        self._time_preset.setToolTip(
+            "Shortcut: sets Scan speed so one full pass takes the chosen time.\n"
+            "Uses Max frame size × Resolution to compute the speed."
+        )
+        form.addRow("Target scan time", self._time_preset)
+
+        self._time_preset.currentIndexChanged.connect(self._on_time_preset_changed)
+        self._max_group_nm.valueChanged.connect(self._on_time_preset_changed)
+        self._pixels.currentIndexChanged.connect(self._on_time_preset_changed)
+        self._speed.valueChanged.connect(self._on_speed_manual_edit)
+
+        self._bias = QDoubleSpinBox()
+        self._bias.setRange(-10.0, 10.0)
+        self._bias.setDecimals(4)
+        self._bias.setSingleStep(0.1)
+        self._bias.setSuffix(" V")
+        self._bias.setValue(float(d.get("bias_V", 0.1)))
+        self._bias.setToolTip("Tip-sample bias for the group scan (must not be 0 V).")
+        form.addRow("Bias", self._bias)
+
+        self._setpoint = QDoubleSpinBox()
+        self._setpoint.setRange(0.001, 1000.0)
+        self._setpoint.setDecimals(3)
+        self._setpoint.setSingleStep(0.1)
+        self._setpoint.setSuffix(" nA")
+        self._setpoint.setValue(float(d.get("setpoint_nA", 0.1)))
+        self._setpoint.setToolTip("Tunnelling setpoint current.")
+        form.addRow("Setpoint", self._setpoint)
+
+        self._iterations = QSpinBox()
+        self._iterations.setRange(1, 10)
+        self._iterations.setValue(int(d.get("group_iterations", 3)))
+        self._iterations.setToolTip("Number of repeat acquisitions per group (drift corrected).")
+        form.addRow("Iterations / group", self._iterations)
+
+        self._bias_seq = QLineEdit()
+        self._bias_seq.setPlaceholderText("e.g. -1.0, -0.5, 0.5, 1.0  (overrides Bias + Iterations)")
+        self._bias_seq.setText(str(d.get("bias_sequence_str", "")))
+        self._bias_seq.setToolTip(
+            "Comma-separated bias values (V).  Each group is scanned once per value.\n"
+            "Leave empty to use Bias + Iterations instead."
+        )
+        form.addRow("Bias sequence", self._bias_seq)
+
+        self._bias_seq.textChanged.connect(self._on_seq_changed)
+        self._on_seq_changed(self._bias_seq.text())
+
+        self._settling = QDoubleSpinBox()
+        self._settling.setRange(0.0, 60.0)
+        self._settling.setSingleStep(0.5)
+        self._settling.setDecimals(1)
+        self._settling.setSuffix(" s")
+        self._settling.setValue(float(d.get("settling_s", 3.0)))
+        self._settling.setToolTip("Settling pause after positioning and before each acquisition.")
+        form.addRow("Settling time", self._settling)
+
+        # ── Output folder (optional) ──────────────────────────────────────
+        folder_row = QWidget()
+        folder_layout = QHBoxLayout(folder_row)
+        folder_layout.setContentsMargins(0, 0, 0, 0)
+        self._folder_edit = QLineEdit()
+        self._folder_edit.setPlaceholderText("(optional — defaults to source scan folder)")
+        self._folder_edit.setText(str(d.get("output_folder", "")))
+        folder_browse = QPushButton("Browse…")
+        folder_browse.setFixedWidth(80)
+        folder_browse.clicked.connect(self._pick_folder)
+        folder_layout.addWidget(self._folder_edit, 1)
+        folder_layout.addWidget(folder_browse)
+        form.addRow("Output folder", folder_row)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+        self.adjustSize()
+
+    # ------------------------------------------------------------------
+    def _on_time_preset_changed(self) -> None:
+        minutes = self._time_preset.currentData()
+        if minutes is None:
+            return
+        px = int(self._pixels.currentData() or 256)
+        frame_nm = float(self._max_group_nm.value())
+        target_s = minutes * 60.0
+        speed = max(1.0, min(1000.0, (2.0 * frame_nm * px) / target_s))
+        self._speed.blockSignals(True)
         try:
-            if not self._stm.bind_thread():
-                raise RuntimeError("could not bind STM to preview scan worker thread")
-            motion = TipMotionManager(
-                self._stm,
-                safety=SafetyMonitor(
-                    SafetyConfig(
-                        max_current_A=1e-9,
-                        enable_current_check=True,
-                        retract_on_violation_nm=10.0,
-                    )
-                ),
-            )
-            current = self._stm.scan.read()
-            base_folder = self._source_path.parent
-            base_stem = self._source_path.stem
-            total = len(self._targets)
-            for i, row in enumerate(self._targets, start=1):
-                self.progress.emit(i, total, f"Target {row.index + 1}/{total}")
-                motion.assert_safe_to_move()
-                move = motion.move_relative_nm(
-                    row.dx_nm,
-                    row.dy_nm,
-                    reason=f"preview follow-up target {row.index + 1}",
-                    settle_s=3.0,
-                )
-                if not move.ok:
-                    raise RuntimeError(
-                        f"target {row.index + 1} move failed: {move.reason} "
-                        + ("; ".join(move.warnings) if move.warnings else "")
-                    )
-
-                params = ScanParams(
-                    bias_V=current.bias_V,
-                    setpoint_A=current.setpoint_A,
-                    size_nm=current.size_nm,
-                    speed_nm_s=current.speed_nm_s,
-                    pixels=current.pixels,
-                    rotation_deg=current.rotation_deg,
-                    const_height=current.const_height,
-                    channels=current.channels,
-                    preamp_exponent=current.preamp_exponent,
-                    memo=f"preview target {row.index + 1}",
-                )
-                self._stm.scan.apply(params)
-                target = _unique_dat_path(base_folder, f"{base_stem}_feature_{row.index + 1:02d}")
-                timeout_s = _estimate_scan_timeout(params)
-                saved = self._stm.scan.scan_and_save(str(target), timeout_s=timeout_s)
-                if saved is None:
-                    raise RuntimeError(f"scan timed out for target {row.index + 1}")
-                self.scan_saved.emit(str(saved))
-        except Exception as exc:  # pragma: no cover - exercised via panel tests
-            log.exception("Preview follow-up scan failed")
-            self.failed.emit(str(exc))
+            self._speed.setValue(speed)
         finally:
+            self._speed.blockSignals(False)
+
+    def _on_speed_manual_edit(self) -> None:
+        for i in range(self._time_preset.count()):
+            if self._time_preset.itemData(i) is None:
+                self._time_preset.blockSignals(True)
+                try:
+                    self._time_preset.setCurrentIndex(i)
+                finally:
+                    self._time_preset.blockSignals(False)
+                break
+
+    def _on_seq_changed(self, text: str) -> None:
+        active = bool(text.strip())
+        self._bias.setEnabled(not active)
+        self._iterations.setEnabled(not active)
+
+    def _on_accept(self) -> None:
+        seq_text = self._bias_seq.text().strip()
+        if seq_text:
             try:
-                self._stm.unbind_thread()
-            except Exception:
-                pass
+                biases = [float(x.strip()) for x in seq_text.split(",") if x.strip()]
+            except ValueError:
+                QMessageBox.warning(
+                    self, "Invalid bias sequence",
+                    "Bias sequence must be comma-separated numbers, e.g. -1.0, -0.5, 0.5, 1.0"
+                )
+                return
+            if any(abs(b) < 1e-9 for b in biases):
+                QMessageBox.warning(
+                    self, "Invalid bias",
+                    "Bias must not be 0 V — scanning at 0 V in constant-current mode crashes the tip."
+                )
+                return
+        else:
+            if abs(self._bias.value()) < 1e-9:
+                QMessageBox.warning(
+                    self, "Invalid bias",
+                    "Bias must not be 0 V — scanning at 0 V in constant-current mode crashes the tip."
+                )
+                return
+        self.accept()
+
+    def _pick_folder(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Output folder for group scans")
+        if path:
+            self._folder_edit.setText(path)
+
+    def values(self) -> dict:
+        px = int(self._pixels.currentData() or 256)
+        seq_text = self._bias_seq.text().strip()
+        bias_sequence: list[float] = []
+        if seq_text:
+            bias_sequence = [float(x.strip()) for x in seq_text.split(",") if x.strip()]
+        preset_minutes = self._time_preset.currentData()  # int or None (Custom)
+        return {
+            "max_per_group": int(self._max_per_group.value()),
+            "max_group_nm": float(self._max_group_nm.value()),
+            "feature_padding_nm": float(self._padding_nm.value()),
+            "group_pixels": px,
+            "group_speed_nm_s": float(self._speed.value()),
+            "target_scan_time_s": float(preset_minutes * 60) if preset_minutes is not None else None,
+            "group_iterations": int(self._iterations.value()),
+            "settling_s": float(self._settling.value()),
+            "output_folder": self._folder_edit.text().strip(),
+            "bias_V": float(self._bias.value()),
+            "setpoint_nA": float(self._setpoint.value()),
+            "bias_sequence": bias_sequence,
+            "bias_sequence_str": seq_text,
+        }
+
+
+class _FeatureScanDialog(QDialog):
+    """Parameter dialog for the Queue-selected follow-up scan flow.
+
+    Collects bias, setpoint, repetition count, and an optional multi-bias
+    sequence.  When a bias sequence is provided it takes precedence: each
+    feature is scanned once per bias value in the list and the single-bias /
+    repetitions fields are ignored.
+    """
+
+    def __init__(self, parent=None, *, defaults: dict | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Queue selected — scan parameters")
+        self.setModal(True)
+        d = defaults or {}
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(10)
+
+        # ── Scan geometry ────────────────────────────────────────────────
+        self._size = QDoubleSpinBox()
+        self._size.setRange(1.0, 500.0)
+        self._size.setSingleStep(1.0)
+        self._size.setDecimals(1)
+        self._size.setSuffix(" nm")
+        self._size.setValue(float(d.get("size_nm", 10.0)))
+        self._size.setToolTip("Square scan frame side length for each follow-up feature scan.")
+        form.addRow("Scan size", self._size)
+
+        self._pixels = QComboBox()
+        for _label, _val in [("128 × 128", 128), ("256 × 256", 256), ("512 × 512", 512)]:
+            self._pixels.addItem(_label, _val)
+        _default_px = int(d.get("pixels", 256))
+        for _i in range(self._pixels.count()):
+            if self._pixels.itemData(_i) == _default_px:
+                self._pixels.setCurrentIndex(_i)
+                break
+        self._pixels.setToolTip("Pixel resolution of each feature scan (no longer inherited from the wide scan).")
+        form.addRow("Resolution", self._pixels)
+
+        # Target wall-clock time per feature image. The worker computes the
+        # scan speed from size + resolution to hit this, so small features
+        # are always imaged in a fixed ~5 min instead of a few fast seconds.
+        self._time_preset = QComboBox()
+        for _label, _minutes in [("5 min", 5.0), ("10 min", 10.0),
+                                 ("15 min", 15.0), ("Inherit rig speed", None)]:
+            self._time_preset.addItem(_label, _minutes)
+        _default_min = d.get("target_minutes", 5.0)
+        _idx = next((i for i in range(self._time_preset.count())
+                     if self._time_preset.itemData(i) == _default_min), 0)
+        self._time_preset.setCurrentIndex(_idx)
+        self._time_preset.setToolTip(
+            "Per-image scan time. Sets the scan speed so each feature takes\n"
+            "this long — keeps drift per image bounded. Default 5 min."
+        )
+        form.addRow("Target scan time", self._time_preset)
+
+        # ── Electrical parameters ─────────────────────────────────────────
+        self._bias = QDoubleSpinBox()
+        self._bias.setRange(-10.0, 10.0)
+        self._bias.setDecimals(4)
+        self._bias.setSingleStep(0.1)
+        self._bias.setSuffix(" V")
+        self._bias.setValue(float(d.get("bias_V", 0.1)))
+        self._bias.setToolTip("Tip-sample bias for the follow-up scan (must not be 0 V).")
+        form.addRow("Bias", self._bias)
+
+        self._setpoint = QDoubleSpinBox()
+        self._setpoint.setRange(0.001, 1000.0)
+        self._setpoint.setDecimals(3)
+        self._setpoint.setSingleStep(0.1)
+        self._setpoint.setSuffix(" nA")
+        self._setpoint.setValue(float(d.get("setpoint_nA", 0.1)))
+        self._setpoint.setToolTip("Tunnelling setpoint current.")
+        form.addRow("Setpoint", self._setpoint)
+
+        # ── Repetitions ───────────────────────────────────────────────────
+        self._repetitions = QSpinBox()
+        self._repetitions.setRange(1, 20)
+        self._repetitions.setValue(int(d.get("repetitions", 1)))
+        self._repetitions.setToolTip(
+            "How many times each feature is scanned at the chosen bias/setpoint."
+        )
+        form.addRow("Repetitions", self._repetitions)
+
+        # ── Bias sequence (optional) ──────────────────────────────────────
+        self._bias_seq = QLineEdit()
+        self._bias_seq.setPlaceholderText("e.g. -1.0, -0.5, 0.5, 1.0  (overrides Bias + Repetitions)")
+        self._bias_seq.setText(str(d.get("bias_sequence_str", "")))
+        self._bias_seq.setToolTip(
+            "Comma-separated bias values (V).  Each feature is scanned once per value.\n"
+            "Leave empty to use Bias + Repetitions instead."
+        )
+        form.addRow("Bias sequence", self._bias_seq)
+
+        self._bias_seq.textChanged.connect(self._on_seq_changed)
+        self._on_seq_changed(self._bias_seq.text())
+
+        # ── Auto-center ───────────────────────────────────────────────────
+        self._center_check = QCheckBox("Auto-center (quick scan before each feature)")
+        self._center_check.setChecked(bool(d.get("enable_centering", False)))
+        self._center_check.setToolTip(
+            "Run a fast low-resolution finder scan, detect the feature position, "
+            "and correct the tip offset before the full-resolution scan."
+        )
+        form.addRow("", self._center_check)
+
+        self._quick_px_spin = QSpinBox()
+        self._quick_px_spin.setRange(32, 128)
+        self._quick_px_spin.setSingleStep(16)
+        self._quick_px_spin.setValue(int(d.get("quick_pixels", 64)))
+        self._quick_px_spin.setToolTip("Resolution of the quick finder scan (same area, same speed).")
+        self._quick_px_spin.setEnabled(self._center_check.isChecked())
+        form.addRow("Quick-scan pixels", self._quick_px_spin)
+
+        self._center_check.toggled.connect(self._quick_px_spin.setEnabled)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+        self.adjustSize()
+
+    def _on_seq_changed(self, text: str) -> None:
+        active = bool(text.strip())
+        self._bias.setEnabled(not active)
+        self._repetitions.setEnabled(not active)
+
+    def _on_accept(self) -> None:
+        seq_text = self._bias_seq.text().strip()
+        if seq_text:
+            try:
+                biases = [float(x.strip()) for x in seq_text.split(",") if x.strip()]
+            except ValueError:
+                QMessageBox.warning(
+                    self, "Invalid bias sequence",
+                    "Bias sequence must be comma-separated numbers, e.g. -1.0, -0.5, 0.5, 1.0"
+                )
+                return
+            if any(abs(b) < 1e-9 for b in biases):
+                QMessageBox.warning(
+                    self, "Invalid bias",
+                    "Bias must not be 0 V — scanning at 0 V in constant-current mode crashes the tip."
+                )
+                return
+        else:
+            if abs(self._bias.value()) < 1e-9:
+                QMessageBox.warning(
+                    self, "Invalid bias",
+                    "Bias must not be 0 V — scanning at 0 V in constant-current mode crashes the tip."
+                )
+                return
+        self.accept()
+
+    def values(self) -> dict:
+        seq_text = self._bias_seq.text().strip()
+        bias_sequence: list[float] = []
+        if seq_text:
+            bias_sequence = [float(x.strip()) for x in seq_text.split(",") if x.strip()]
+        return {
+            "size_nm": float(self._size.value()),
+            "pixels": int(self._pixels.currentData() or 256),
+            "target_minutes": self._time_preset.currentData(),
+            "bias_V": float(self._bias.value()),
+            "setpoint_nA": float(self._setpoint.value()),
+            "repetitions": int(self._repetitions.value()),
+            "bias_sequence": bias_sequence,
+            "bias_sequence_str": seq_text,
+            "enable_centering": bool(self._center_check.isChecked()),
+            "quick_pixels": int(self._quick_px_spin.value()),
+        }
 
 
 class _PreviewImageView(QWidget):
@@ -494,6 +851,9 @@ class PreviewPanel(QWidget):
         self._segmentation_worker: _SegmentationWorker | None = None
         self._classification_worker: _ClassificationWorker | None = None
         self._scan_worker: _FeatureScanWorker | None = None
+        self._group_scan_worker: _FeatureGroupScanWorker | None = None
+        self._group_scan_defaults: dict = {}
+        self._feature_scan_defaults: dict = {}
         self._building_table = False
         self._stage = "raw"
         self._zero_plane_points: list[tuple[int, int]] = []
@@ -507,6 +867,20 @@ class PreviewPanel(QWidget):
         self._analysis_timer.setInterval(40)
         self._analysis_timer.timeout.connect(self._refresh_live_segmentation)
         self._queue_armed = False
+        # Position captured at segmentation-apply time; used as group-scan anchor
+        self._preview_home_nm: tuple[float, float] | None = None
+        # Periodic STM scan status poller (2 s)
+        self._scan_info_timer = QTimer(self)
+        self._scan_info_timer.setInterval(2000)
+        self._scan_info_timer.timeout.connect(self._refresh_scan_info)
+        self._scan_info_timer.start()
+        self._scan_was_running: bool = False  # tracks transition to log scan-start once
+        self._feat_scan_start_t: float | None = None
+        self._feat_scan_total: int = 0
+        self._feat_scans_saved: int = 0
+        self._eta_timer = QTimer(self)
+        self._eta_timer.setInterval(60_000)
+        self._eta_timer.timeout.connect(self._refresh_eta)
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -531,6 +905,27 @@ class PreviewPanel(QWidget):
             }
         """)
         root.addWidget(self._status)
+
+        self._scan_info_label = QLabel("")
+        self._scan_info_label.setWordWrap(True)
+        self._scan_info_label.setStyleSheet("""
+            QLabel {
+                background: #f0fdf4;
+                color: #14532d;
+                border: 1px solid #86efac;
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-family: monospace;
+                min-height: 22px;
+            }
+        """)
+        self._scan_info_label.setVisible(False)
+        root.addWidget(self._scan_info_label)
+
+        self._time_label = QLabel("")
+        self._time_label.setStyleSheet("color: #555; font-style: italic; padding: 2px 4px;")
+        self._time_label.setVisible(False)
+        root.addWidget(self._time_label)
 
         self._viewer = _PreviewImageView()
         self._viewer.feature_clicked.connect(self._toggle_feature_selection)
@@ -603,6 +998,15 @@ class PreviewPanel(QWidget):
         self._scan_selected_btn = QPushButton("Queue selected")
         self._scan_selected_btn.clicked.connect(self._scan_selected_features)
         self._scan_selected_btn.setToolTip("Queue the checked molecules for follow-up scans.")
+        self._scan_groups_btn = QPushButton("Scan as Groups")
+        self._scan_groups_btn.clicked.connect(self._scan_selected_as_groups)
+        self._scan_groups_btn.setToolTip(
+            "Group checked features spatially and scan each group in one frame."
+        )
+        self._stop_scan_btn = QPushButton("Stop scan")
+        self._stop_scan_btn.clicked.connect(self._stop_active_scan)
+        self._stop_scan_btn.setToolTip("Request graceful stop after the current feature/group finishes.")
+        self._stop_scan_btn.setStyleSheet("QPushButton { color: #c0392b; font-weight: bold; }")
         self._select_class_btn = QPushButton("Select class")
         self._select_class_btn.clicked.connect(self._select_class_rows_from_combo)
         self._select_class_btn.setToolTip("Select every structure that belongs to the chosen class.")
@@ -615,6 +1019,8 @@ class PreviewPanel(QWidget):
         self._label_btn.setEnabled(False)
         self._classify_btn.setEnabled(False)
         self._scan_selected_btn.setEnabled(False)
+        self._scan_groups_btn.setEnabled(False)
+        self._stop_scan_btn.setEnabled(False)
         self._select_class_btn.setEnabled(False)
         self._queue_class_btn.setEnabled(False)
         self._reset_btn.setEnabled(False)
@@ -829,6 +1235,8 @@ class PreviewPanel(QWidget):
         class_container.addWidget(self._label_btn)
         class_container.addWidget(self._classify_btn)
         class_container.addWidget(self._scan_selected_btn)
+        class_container.addWidget(self._scan_groups_btn)
+        class_container.addWidget(self._stop_scan_btn)
         controls.addWidget(self._classification_section)
 
         self._feature_mode.currentIndexChanged.connect(lambda *_: self._schedule_live_segmentation())
@@ -1318,12 +1726,27 @@ class PreviewPanel(QWidget):
         self._render_current_state()
         self._set_stage("classification")
         self._render_current_state()
+
+        # Capture tip position as the anchor reference for all follow-up group scans.
+        # Reading here (not at scan-start time) ensures groups stay within the wide image
+        # even if there is a delay between segmentation and launching the scan worker.
+        self._preview_home_nm = None
+        try:
+            if self._stm.connected:
+                self._preview_home_nm = self._stm.scan.get_offset_nm()
+        except Exception:
+            pass
+        home_str = (
+            f"  |  home ({self._preview_home_nm[0]:+.2f}, {self._preview_home_nm[1]:+.2f}) nm"
+            if self._preview_home_nm else ""
+        )
+
         self._show_status(
-            f"{self._current_source.name}: applied {len(self._current_state.feature_rows)} feature(s)"
+            f"{self._current_source.name}: applied {len(self._current_state.feature_rows)} feature(s){home_str}"
         )
         self.log_message.emit(
             f"Segmentation settings applied for {self._current_source.name} "
-            f"({len(self._current_state.feature_rows)} feature(s))"
+            f"({len(self._current_state.feature_rows)} feature(s)){home_str}"
         )
 
     def _label_selected_samples(self) -> None:
@@ -1827,19 +2250,76 @@ class PreviewPanel(QWidget):
             QMessageBox.information(self, "Busy", "A follow-up scan is already running.")
             return
 
+        # Pre-populate dialog with current STM parameters (fall back to last-used defaults)
+        feat_defaults = dict(self._feature_scan_defaults)
+        try:
+            current = self._stm.scan.read()
+            feat_defaults.setdefault("bias_V", current.bias_V)
+            feat_defaults.setdefault("setpoint_nA", current.setpoint_A * 1e9)
+            # Default size to 1/5 of the current scan width if not previously set
+            if "size_nm" not in feat_defaults and current.size_nm:
+                feat_defaults["size_nm"] = round(current.size_nm[0] / 5.0, 1)
+        except Exception:
+            pass
+
+        dlg = _FeatureScanDialog(self, defaults=feat_defaults)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        scan_params = dlg.values()
+        self._feature_scan_defaults = dict(scan_params)
+
         self._scan_selected_btn.setEnabled(False)
-        self._scan_worker = _FeatureScanWorker(self._stm, self._current_state.source_path, selected)
+        self._stop_scan_btn.setEnabled(True)
+        feat_scan_range_m = getattr(self._current_scan, "scan_range_m", None)
+        self._scan_worker = _FeatureScanWorker(
+            self._stm,
+            self._current_state.source_path,
+            selected,
+            bias_V=scan_params["bias_V"],
+            setpoint_A=scan_params["setpoint_nA"] * 1e-9,
+            n_reps=scan_params["repetitions"],
+            bias_sequence=scan_params["bias_sequence"] or None,
+            size_nm=scan_params["size_nm"],
+            home_nm=self._preview_home_nm,
+            scan_range_nm=(
+                (feat_scan_range_m[0] * 1e9, feat_scan_range_m[1] * 1e9)
+                if feat_scan_range_m is not None else None
+            ),
+            enable_centering=scan_params.get("enable_centering", False),
+            quick_pixels=scan_params.get("quick_pixels", 64),
+            pixels=scan_params.get("pixels", 256),
+            target_duration_s=(
+                scan_params["target_minutes"] * 60.0
+                if scan_params.get("target_minutes") is not None else None
+            ),
+        )
+        n_reps = len(scan_params["bias_sequence"]) if scan_params["bias_sequence"] else scan_params["repetitions"]
         self._scan_worker.progress.connect(self._on_scan_progress)
         self._scan_worker.scan_saved.connect(self._on_followup_scan_saved)
         self._scan_worker.failed.connect(self._on_followup_scan_failed)
         self._scan_worker.finished.connect(lambda: self._scan_selected_btn.setEnabled(True))
+        self._scan_worker.finished.connect(lambda: self._stop_scan_btn.setEnabled(False))
+        self._scan_worker.finished.connect(self._on_feat_scan_finished)
         self._scan_worker.start()
-        self._show_status(f"Scanning {len(selected)} selected feature(s)...")
+
+        self._feat_scan_start_t = time.time()
+        self._feat_scan_total = len(selected) * n_reps
+        self._feat_scans_saved = 0
+        self._time_label.setVisible(True)
+        self._time_label.setText("")
+        self._eta_timer.start()
+
+        self._show_status(
+            f"Scanning {len(selected)} feature(s)"
+            + (f" × {n_reps} bias steps" if n_reps > 1 else "") + "…"
+        )
 
     def _on_scan_progress(self, idx: int, total: int, label: str) -> None:
         self._show_status(f"{label} ({idx}/{total})")
 
     def _on_followup_scan_saved(self, path: str) -> None:
+        self._feat_scans_saved += 1
+        self._refresh_eta()
         self.scan_completed.emit(path)
         self.handle_scan_completed(path)
         self.log_message.emit(f"Follow-up scan saved: {path}")
@@ -1847,6 +2327,234 @@ class PreviewPanel(QWidget):
     def _on_followup_scan_failed(self, message: str) -> None:
         self.error_message.emit(message)
         self._show_status(f"Follow-up scan failed: {message}")
+
+    def _on_feat_scan_finished(self) -> None:
+        self._eta_timer.stop()
+        self._time_label.setVisible(False)
+        self._feat_scan_start_t = None
+
+    def _refresh_eta(self) -> None:
+        if self._feat_scan_start_t is None or self._feat_scan_total == 0:
+            return
+        elapsed = time.time() - self._feat_scan_start_t
+        saved = self._feat_scans_saved
+        total = self._feat_scan_total
+        if saved > 0:
+            pace_s = elapsed / saved
+            remaining_s = max(0.0, (total - saved) * pace_s)
+        else:
+            remaining_s = 0.0
+            self._time_label.setText(f"0/{total} scans done — estimating…")
+            return
+        if remaining_s < 60:
+            rem_str = "< 1 min"
+        elif remaining_s < 3600:
+            rem_str = f"~{int(remaining_s / 60)}m"
+        else:
+            h = int(remaining_s / 3600)
+            m = int((remaining_s % 3600) / 60)
+            rem_str = f"~{h}h {m:02d}m"
+        eta = _dt.datetime.now() + _dt.timedelta(seconds=remaining_s)
+        self._time_label.setText(
+            f"{saved}/{total} scans done — Remaining: {rem_str}  (ETA {eta.strftime('%H:%M')})"
+        )
+
+    # ------------------------------------------------------------------
+    # Group scan
+    # ------------------------------------------------------------------
+
+    def _scan_selected_as_groups(self) -> None:
+        """Cluster the checked features spatially and scan each group."""
+        if self._current_state is None:
+            QMessageBox.information(self, "No preview", "Load a scan before scanning groups.")
+            return
+        selected = self._selected_feature_rows()
+        if not selected:
+            QMessageBox.information(self, "No selection",
+                                    "Select at least one feature before scanning groups.")
+            return
+        if (self._group_scan_worker is not None
+                and self._group_scan_worker.isRunning()):
+            QMessageBox.information(self, "Busy", "A group scan is already running.")
+            return
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            QMessageBox.information(self, "Busy",
+                                    "A follow-up scan is already running. "
+                                    "Wait for it to finish before launching a group scan.")
+            return
+
+        # Show parameter dialog (pre-populated with last-used values, then current STM)
+        group_defaults = dict(self._group_scan_defaults)
+        # Bias sequences are one-off; don't carry them over so iterations is always editable
+        group_defaults.pop("bias_sequence_str", None)
+        group_defaults.pop("bias_sequence", None)
+        try:
+            current = self._stm.scan.read()
+            group_defaults.setdefault("bias_V", current.bias_V)
+            group_defaults.setdefault("setpoint_nA", current.setpoint_A * 1e9)
+        except Exception:
+            pass
+        dlg = _GroupScanDialog(self, defaults=group_defaults)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        params = dlg.values()
+        self._group_scan_defaults = dict(params)  # remember for next time
+
+        # Compute groups
+        scan_range_m = getattr(self._current_scan, "scan_range_m", None)
+        scan_shape = self._current_state.raw_plane.shape  # (ny, nx)
+        groups = group_features(
+            selected,
+            scan_range_m,
+            scan_shape,
+            max_per_group=params["max_per_group"],
+            max_group_nm=params["max_group_nm"],
+            feature_padding_nm=params["feature_padding_nm"],
+        )
+        if not groups:
+            QMessageBox.information(self, "No groups",
+                                    "Feature grouping produced no groups — "
+                                    "check that at least one feature is selected.")
+            return
+
+        n_feat = len(selected)
+        n_groups = len(groups)
+        member_summary = ", ".join(
+            str(len(g.members)) for g in groups
+        )
+        msg = (
+            f"{n_feat} feature(s) grouped into {n_groups} group(s) "
+            f"[{member_summary} feature(s) each].\n\n"
+            f"Proceed to scan all {n_groups} group(s)?"
+        )
+        if QMessageBox.question(
+            self, "Confirm group scan", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        px = params["group_pixels"]
+        self._scan_groups_btn.setEnabled(False)
+        self._scan_selected_btn.setEnabled(False)
+        self._stop_scan_btn.setEnabled(True)
+        bias_seq = params.get("bias_sequence") or []
+        self._group_scan_worker = _FeatureGroupScanWorker(
+            self._stm,
+            self._current_state.source_path,
+            groups,
+            group_pixels=(px, px),
+            group_speed_nm_s=params["group_speed_nm_s"],
+            group_iterations=params["group_iterations"],
+            settling_s=params["settling_s"],
+            output_folder=params["output_folder"],
+            bias_V=params.get("bias_V"),
+            setpoint_A=params["setpoint_nA"] * 1e-9 if params.get("setpoint_nA") else None,
+            bias_sequence=bias_seq or None,
+            home_nm=self._preview_home_nm,
+            scan_range_nm=(
+                (scan_range_m[0] * 1e9, scan_range_m[1] * 1e9)
+                if scan_range_m is not None else None
+            ),
+            target_scan_time_s=params.get("target_scan_time_s"),
+        )
+        self._group_scan_worker.group_started.connect(self._on_group_started)
+        self._group_scan_worker.group_scan_saved.connect(self._on_group_scan_saved)
+        self._group_scan_worker.failed.connect(self._on_group_scan_failed)
+        self._group_scan_worker.finished_all.connect(self._on_group_scan_finished_all)
+        self._group_scan_worker.finished.connect(self._on_group_scan_thread_done)
+        self._group_scan_worker.start()
+        n_steps = len(bias_seq) if bias_seq else params["group_iterations"]
+        self.log_message.emit(
+            f"Group scan started: {n_feat} feature(s) → {n_groups} group(s)"
+            + (f" × {n_steps} bias steps" if bias_seq else f" × {n_steps} iter(s)")
+        )
+        self._show_status(
+            f"Scanning {n_groups} group(s) ({n_feat} feature(s) total)"
+            + (f" × {n_steps} bias steps" if bias_seq else "") + "…"
+        )
+
+    def _on_group_started(self, group_idx: int, total: int, label: str) -> None:
+        self._show_status(f"Group scan {group_idx}/{total}: {label}")
+        self.log_message.emit(f"Group scan {group_idx}/{total}: {label}")
+
+    def _on_group_scan_saved(self, group_idx: int, path: str) -> None:
+        self.scan_completed.emit(path)
+        self.log_message.emit(f"Group {group_idx} scan saved: {path}")
+
+    def _on_group_scan_failed(self, message: str) -> None:
+        self.error_message.emit(message)
+        self._show_status(f"Group scan failed: {message}")
+
+    def _on_group_scan_finished_all(self, folder: str) -> None:
+        self.log_message.emit(f"Group scan complete. Output: {folder}")
+        self._show_status(f"Group scan complete → {folder}")
+
+    def _on_group_scan_thread_done(self) -> None:
+        self._stop_scan_btn.setEnabled(False)
+        self._scan_groups_btn.setEnabled(
+            self._stage == "classification"
+            and self._current_state is not None
+            and bool(self._current_state.feature_rows)
+        )
+        self._scan_selected_btn.setEnabled(
+            self._stage == "classification"
+            and self._current_state is not None
+            and bool(self._current_state.feature_rows)
+        )
+
+    def _stop_active_scan(self) -> None:
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            self._scan_worker.stop()
+            self._show_status("Stop requested — will halt after current target.")
+        if self._group_scan_worker is not None and self._group_scan_worker.isRunning():
+            self._group_scan_worker.stop()
+            self._show_status("Stop requested — will halt after current group.")
+        self._stop_scan_btn.setEnabled(False)
+
+    # ------------------------------------------------------------------
+    # Scan status poller
+    # ------------------------------------------------------------------
+
+    def _refresh_scan_info(self) -> None:
+        """Called every 2 s — shows position + size whenever a scan is running."""
+        try:
+            if not self._stm.connected:
+                self._scan_info_label.setVisible(False)
+                self._scan_was_running = False
+                return
+            running = self._stm.scan.is_running
+            if not running:
+                self._scan_info_label.setVisible(False)
+                self._scan_was_running = False
+                return
+            offset = self._stm.scan.get_offset_nm()
+            params = self._stm.scan.read()
+            pos_str = (
+                f"X={offset[0]:+.2f}  Y={offset[1]:+.2f} nm"
+                if offset else "pos: n/a"
+            )
+            size_str = (
+                f"{params.size_nm[0]:.1f} × {params.size_nm[1]:.1f} nm"
+                if params.size_nm else "size: n/a"
+            )
+            est_s = _estimate_scan_duration(params)
+            est_str = _format_duration(est_s)
+            self._scan_info_label.setText(
+                f"Scanning  |  {pos_str}  |  {size_str}  |  ~{est_str}"
+            )
+            self._scan_info_label.setVisible(True)
+            # Log once on the scan-start transition so position appears in the log panel
+            if not self._scan_was_running:
+                self.log_message.emit(
+                    f"Scan started  |  {pos_str}  |  {size_str}  |  ~{est_str}"
+                )
+                log.info(
+                    "Scan detected: offset %s  size %s  est %s",
+                    pos_str, size_str, est_str,
+                )
+            self._scan_was_running = True
+        except Exception:
+            self._scan_info_label.setVisible(False)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1962,11 +2670,14 @@ class PreviewPanel(QWidget):
         self._label_btn.setVisible(stage == "classification")
         self._classify_btn.setVisible(stage == "classification")
         self._scan_selected_btn.setVisible(stage == "classification")
+        self._scan_groups_btn.setVisible(stage == "classification")
+        self._stop_scan_btn.setVisible(stage == "classification")
         self._select_class_btn.setVisible(stage == "classification")
         self._queue_class_btn.setVisible(stage == "classification")
         self._label_btn.setEnabled(stage == "classification" and self._current_state is not None and bool(self._current_state.feature_rows))
         self._classify_btn.setEnabled(stage == "classification" and self._current_state is not None and bool(self._current_state.feature_rows))
         self._scan_selected_btn.setEnabled(stage == "classification" and self._current_state is not None and bool(self._current_state.feature_rows))
+        self._scan_groups_btn.setEnabled(stage == "classification" and self._current_state is not None and bool(self._current_state.feature_rows))
         class_enabled = stage == "classification" and self._current_state is not None and bool(self._current_state.feature_rows)
         self._select_class_btn.setEnabled(class_enabled and self._class_pick_combo.count() > 0)
         self._queue_class_btn.setEnabled(class_enabled and self._class_pick_combo.count() > 0)
@@ -2025,15 +2736,6 @@ class PreviewPanel(QWidget):
         self.log_message.emit(message)
 
 
-def _latest_dat_in_folder(folder: Path) -> Path | None:
-    if not folder.exists():
-        return None
-    candidates = list(folder.glob("*.dat"))
-    if not candidates:
-        return None
-    return max(candidates, key=lambda p: p.stat().st_mtime)
-
-
 class PreviewWindow(QMainWindow):
     """Floating preview window that hosts the reusable PreviewPanel."""
 
@@ -2082,28 +2784,6 @@ class PreviewWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         event.ignore()
         self.hide()
-
-
-def _unique_dat_path(folder: Path, stem: str) -> Path:
-    folder.mkdir(parents=True, exist_ok=True)
-    candidate = folder / f"{stem}.dat"
-    if not candidate.exists():
-        return candidate
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    candidate = folder / f"{stem}_{stamp}.dat"
-    if not candidate.exists():
-        return candidate
-    idx = 2
-    while True:
-        candidate = folder / f"{stem}_{stamp}_{idx}.dat"
-        if not candidate.exists():
-            return candidate
-        idx += 1
-
-
-def _estimate_scan_timeout(params: ScanParams) -> float:
-    line_time = 2.0 * float(params.size_nm[0]) / max(float(params.speed_nm_s), 0.01)
-    return max(120.0, line_time * int(params.pixels[1]) + 90.0)
 
 
 def _pixel_size_x_m_from_scan_range(scan_range_m: tuple[float, float] | None, shape: tuple[int, int]) -> float:

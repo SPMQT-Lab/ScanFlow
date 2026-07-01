@@ -1,17 +1,25 @@
-"""Neutral ScanFlow acquisition sidecars for downstream tools."""
+"""Neutral ScanFlow acquisition sidecars for downstream tools.
+
+The sidecar's in-memory form is :class:`scanflow.contracts.ScanRecord` —
+this module converts control-layer objects (ScanParams, MotionResult) to
+JSON-safe dicts, builds a ScanRecord, and serialises its payload. Schema
+changes belong in the contracts module, not here.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import uuid
-from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .acquisition_log import write_json_atomic
+from scanflow.contracts import SCAN_RECORD_SCHEMA, ScanRecord
 
-SCAN_SIDECAR_SCHEMA = "scanflow.acquisition.v1"
+from .acquisition_log import write_json_atomic
+from .json_util import json_safe as _json_safe
+
+SCAN_SIDECAR_SCHEMA = SCAN_RECORD_SCHEMA  # "scanflow.acquisition.v1"
 SESSION_SCHEMA = "scanflow.session.v1"
 
 
@@ -103,42 +111,29 @@ def write_scan_sidecar(
     scan_parameters: Any | None = None,
     position_nm: tuple[float, float] | None = None,
     motion: Any | None = None,
-    drift: Any | None = None,
     quality: dict[str, Any] | None = None,
     safety: dict[str, Any] | None = None,
     include_hash: bool = False,
 ) -> Path:
     dat = Path(dat_path)
     sidecar = scanflow_sidecar_path(dat)
-    payload = {
-        "schema": SCAN_SIDECAR_SCHEMA,
-        "record_type": "scanflow_scan",
-        "scanflow_version": _scanflow_version(),
-        "created_at": _utc_now(),
-        "raw_file": {
-            "path": dat.name,
-            "source_format": "createc_dat",
-            "sha256": _sha256(dat) if include_hash and dat.exists() else None,
-        },
-        "session": {
-            "session_id": session_id,
-            "routine": routine,
-        },
-        "step": {
-            "index": step_index,
-            "kind": step_kind,
-            "label": step_label,
-        },
-        "scan_parameters": _scan_params_payload(scan_parameters),
-        "position": {
-            "scan_offset_nm": list(position_nm) if position_nm is not None else None,
-        },
-        "motion": _json_safe(motion) if motion is not None else None,
-        "drift": _drift_payload(drift),
-        "quality": quality or {},
-        "safety": safety or {},
-    }
-    return write_json_atomic(sidecar, payload)
+    record = ScanRecord(
+        session_id=session_id,
+        routine=routine,
+        raw_path=dat.name,
+        created_at=_utc_now(),
+        scanflow_version=_scanflow_version(),
+        sha256=_sha256(dat) if include_hash and dat.exists() else None,
+        step_index=step_index,
+        step_kind=step_kind,
+        step_label=step_label,
+        scan_parameters=_scan_params_payload(scan_parameters),
+        scan_offset_nm=tuple(position_nm) if position_nm is not None else None,
+        motion=_json_safe(motion) if motion is not None else None,
+        quality=quality or {},
+        safety=safety or {},
+    )
+    return write_json_atomic(sidecar, record.to_payload())
 
 
 def _scan_params_payload(params: Any | None) -> dict[str, Any]:
@@ -148,33 +143,6 @@ def _scan_params_payload(params: Any | None) -> dict[str, Any]:
     if isinstance(data, dict):
         return data
     return {}
-
-
-def _drift_payload(drift: Any | None) -> dict[str, Any]:
-    if drift is None:
-        return {"enabled": False}
-    data = _json_safe(drift)
-    if isinstance(data, dict):
-        data.setdefault("enabled", True)
-        return data
-    return {"enabled": True, "value": data}
-
-
-def _json_safe(value: Any) -> Any:
-    if is_dataclass(value):
-        return _json_safe(asdict(value))
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {str(k): _json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(v) for v in value]
-    if hasattr(value, "item"):
-        try:
-            return value.item()
-        except Exception:
-            pass
-    return value
 
 
 def _sha256(path: Path) -> str:

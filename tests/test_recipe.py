@@ -53,40 +53,22 @@ def test_recipe_yaml_roundtrip(tmp_path):
     assert r2.steps[0].size_nm == (50.0, 50.0)
 
 
-def test_fast_alignment_defaults_false():
-    """Backward-compat: existing recipes don't set fast_alignment, so it
-    defaults to False and behaves like before."""
-    r = MeasurementRecipe.overnight(bias_V=0.1, setpoint_A=50e-12)
-    assert r.fast_alignment is False
-
-
-def test_fast_alignment_propagates_through_bias_ramp():
-    r = MeasurementRecipe.bias_ramp(
-        start_V=-0.5, end_V=0.5, steps=11, setpoint_A=50e-12,
-        fast_alignment=True,
+def test_legacy_drift_keys_are_silently_dropped(tmp_path):
+    """Older recipes persist drift_* / fast_alignment keys at the top of the
+    YAML; load() must tolerate them rather than crashing on unknown kwargs."""
+    path = tmp_path / "legacy.yaml"
+    path.write_text(
+        "name: legacy\n"
+        "steps: []\n"
+        "drift_correction: true\n"
+        "drift_channel: 0\n"
+        "drift_reposition_delay_s: 3.0\n"
+        "drift_template: ''\n"
+        "drift_method: hybrid\n"
+        "fast_alignment: true\n",
+        encoding="utf-8",
     )
-    assert r.fast_alignment is True
-
-
-def test_fast_alignment_shortens_estimate():
-    full = MeasurementRecipe.bias_ramp(
-        start_V=-0.5, end_V=0.5, steps=11, setpoint_A=50e-12,
-        fast_alignment=False,
-    )
-    fast = MeasurementRecipe.bias_ramp(
-        start_V=-0.5, end_V=0.5, steps=11, setpoint_A=50e-12,
-        fast_alignment=True,
-    )
-    assert full.drift_correction and fast.drift_correction
-    assert fast.estimate_duration_s() < full.estimate_duration_s()
-
-
-def test_fast_alignment_persists_through_yaml(tmp_path):
-    r = MeasurementRecipe.bias_ramp(
-        start_V=-0.5, end_V=0.5, steps=11, setpoint_A=50e-12,
-        fast_alignment=True,
-    )
-    path = tmp_path / "recipe.yaml"
-    r.save(path)
-    r2 = MeasurementRecipe.load(path)
-    assert r2.fast_alignment is True
+    r = MeasurementRecipe.load(path)
+    assert r.name == "legacy"
+    assert not hasattr(r, "drift_correction")
+    assert not hasattr(r, "fast_alignment")

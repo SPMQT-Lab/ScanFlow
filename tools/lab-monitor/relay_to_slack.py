@@ -54,15 +54,27 @@ def slack_uploader(token: str, channel: str):
 
     def upload(path: Path, caption: str) -> bool:
         try:
-            client.files_upload_v2(
-                channel=channel,
-                file=str(path),
-                title=path.name,
-                initial_comment=caption,
-            )
+            if hasattr(client, "files_upload_v2"):
+                client.files_upload_v2(
+                    channel=channel,
+                    file=str(path),
+                    title=path.name,
+                    initial_comment=caption,
+                )
+            else:
+                client.files_upload(
+                    channels=channel,
+                    file=str(path),
+                    title=path.name,
+                    initial_comment=caption,
+                )
             return True
         except SlackApiError as e:
-            log.warning("Slack upload failed for %s: %s", path.name, e.response["error"])
+            err = e.response.get("error", str(e)) if hasattr(e, "response") else str(e)
+            log.warning("Slack upload failed for %s: %s", path.name, err)
+            return False
+        except Exception as e:
+            log.warning("Unexpected Slack error for %s: %s", path.name, e)
             return False
     return upload
 
@@ -152,62 +164,85 @@ def caption_for(path: Path) -> str:
     return path.name
 
 
-def relay_once(folder: Path, sent: SentState, upload) -> int:
+def relay_once(folder: Path, sent: SentState, upload, delay_s: float = 0.0) -> int:
     """Send any new PNGs. Returns the number sent in this pass."""
-    if not folder.exists():
-        log.warning("folder does not exist (yet?): %s", folder)
+    try:
+        if not folder.exists():
+            log.warning("folder does not exist (yet?): %s", folder)
+            return 0
+        files = sorted(folder.glob("*.png"))
+    except Exception as e:
+        log.warning("Cannot read folder %s: %s", folder, e)
         return 0
-    files = sorted(folder.glob("*.png"))
+
+    pending = [p for p in files if not sent.has(p.name)]
+    if not pending:
+        log.debug("no new files (total in folder: %d)", len(files))
+        return 0
+
+    log.info("%d new file(s) to send (of %d total)", len(pending), len(files))
     n = 0
-    for p in files:
-        if sent.has(p.name):
-            continue
+    for p in pending:
         cap = caption_for(p)
         ok = upload(p, cap)
         if ok:
             sent.mark(p.name)
-            log.info("sent %s", p.name)
+            log.info("sent: %s", p.name)
             n += 1
+            if delay_s > 0:
+                time.sleep(delay_s)
         else:
-            log.info("will retry next cycle: %s", p.name)
+            log.warning("upload failed, will retry next cycle: %s", p.name)
     return n
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Forward lab screenshots to Slack / Telegram.")
     ap.add_argument("--folder", type=Path,
-                    default=Path(r"\\LABPC\ScanflowMonitor\screenshots"),
+                    default=Path(r"\\SMP-8HSN6L3\scanflow\screenshots"),
                     help="Shared folder containing PNGs to forward")
-    ap.add_argument("--state", type=Path, default=Path("relay_state.json"),
-                    help="JSON file remembering which images have been sent")
+    ap.add_argument("--state", type=Path,
+                    default=Path(os.environ.get("TEMP", os.path.expanduser("~"))) / "scanflow_relay_state.json",
+                    help="JSON file remembering which images have been sent "
+                         "(default: %%TEMP%%\\scanflow_relay_state.json)")
     ap.add_argument("--interval", type=float, default=60.0,
-                    help="Seconds between scans (default 60)")
+                    help="Seconds between folder scans (default 60)")
+    ap.add_argument("--delay", type=float, default=2.0,
+                    help="Seconds between individual uploads (default 2, avoids rate limiting)")
     ap.add_argument("--once", action="store_true",
                     help="Process current backlog once and exit")
     ap.add_argument("--catch-up", action="store_true",
-                    help="On first run, mark *all* existing files as already sent "
-                         "so you don't get a flood. Only sends files that appear "
-                         "after the relay starts.")
+                    help="Mark all existing files as already sent, then forward only new ones.")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    log.info("state file: %s", args.state)
     upload = pick_backend()
     sent = SentState(args.state)
 
     if args.catch_up:
-        for p in sorted(args.folder.glob("*.png") if args.folder.exists() else []):
+        try:
+            existing = sorted(args.folder.glob("*.png")) if args.folder.exists() else []
+        except Exception:
+            existing = []
+        for p in existing:
             sent.mark(p.name)
-        log.info("catch-up: marked %d existing files as sent", len(list(args.folder.glob('*.png'))))
+        log.info("catch-up: marked %d existing files as sent", len(existing))
 
     if args.once:
-        n = relay_once(args.folder, sent, upload)
+        n = relay_once(args.folder, sent, upload, delay_s=args.delay)
         log.info("done: %d sent", n)
         return 0
 
-    log.info("watching %s every %.0fs (Ctrl-C to stop)", args.folder, args.interval)
+    log.info("watching %s every %.0fs, %.1fs between uploads (Ctrl-C to stop)",
+             args.folder, args.interval, args.delay)
     try:
         while True:
-            relay_once(args.folder, sent, upload)
+            try:
+                relay_once(args.folder, sent, upload, delay_s=args.delay)
+            except Exception as e:
+                log.error("relay_once error (will retry next cycle): %s", e)
             time.sleep(args.interval)
     except KeyboardInterrupt:
         log.info("stopped")

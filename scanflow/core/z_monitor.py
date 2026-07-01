@@ -20,6 +20,8 @@ from typing import Optional, Tuple
 import numpy as np
 from PySide6.QtCore import QObject, QTimer, Signal
 
+from scanflow.core import activity
+
 log = logging.getLogger(__name__)
 
 
@@ -114,12 +116,22 @@ class ZMonitor(QObject):
     def _poll(self) -> None:
         if self._stm is None:
             return
+        # Stand down while automation runs: getdacvalfb() at 1 Hz is
+        # serialised onto the STMAFM GUI thread and lags the Createc
+        # display (H7). Per-scan Z stability comes from the runner then.
+        if activity.is_active():
+            return
         try:
-            raw = self._stm.raw.getdacvalfb()
+            raw = float(self._stm.raw.getdacvalfb())
         except Exception as e:
             log.debug("getdacvalfb() failed: %s", e)
             return
-        self.add_sample(time.time(), float(raw))
+        if not np.isfinite(raw):
+            # One NaN sample would poison every rolling statistic (ptp,
+            # std, polyfit slope all become NaN) — skip it.
+            log.debug("non-finite Z sample skipped: %r", raw)
+            return
+        self.add_sample(time.time(), raw)
 
     # ------------------------------------------------------------------
     # Statistics

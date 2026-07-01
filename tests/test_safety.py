@@ -44,6 +44,39 @@ def test_safety_disabled_passes_through(stm):
     assert status.ok is True
 
 
+def test_safety_fails_closed_on_persistent_read_failure(stm):
+    """A monitor that cannot read the current must not report ok forever."""
+    monitor = SafetyMonitor(SafetyConfig(warn_read_failures=2,
+                                         max_read_failures=4))
+    monitor.measure_current_A = lambda _stm: None  # simulate broken readback
+
+    for i in range(1, 4):
+        status = monitor.check(stm)
+        assert status.read_failed is True
+        assert status.ok is True, f"check {i} should still pass (grace period)"
+        assert monitor.consecutive_read_failures == i
+
+    status = monitor.check(stm)  # 4th consecutive failure → fail closed
+    assert status.read_failed is True
+    assert status.ok is False
+    assert "readback unavailable" in status.reason
+
+
+def test_safety_read_failure_counter_resets_on_success(stm):
+    monitor = SafetyMonitor(SafetyConfig(max_read_failures=3))
+    real_measure = monitor.measure_current_A
+    monitor.measure_current_A = lambda _stm: None
+    monitor.check(stm)
+    monitor.check(stm)
+    assert monitor.consecutive_read_failures == 2
+    # One good reading clears the streak
+    monitor.measure_current_A = real_measure
+    status = monitor.check(stm)
+    assert status.ok is True
+    assert status.read_failed is False
+    assert monitor.consecutive_read_failures == 0
+
+
 def test_emergency_stop_retracts_tip(stm):
     monitor = SafetyMonitor(SafetyConfig(max_current_A=1e-9,
                                          retract_on_violation_nm=15.0))
@@ -109,7 +142,6 @@ def test_runner_completes_safely_without_crash(stm):
     )
     r.safety_max_current_A = 1e-9
     r.safety_poll_interval_s = 0.1
-    r.drift_correction = False  # avoid createc.Createc_pyFile dependency
 
     runner = AutomationRunner(stm, r)
 

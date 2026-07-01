@@ -6,6 +6,7 @@ for bias/setpoint). All keys go through the modern setp/getp API.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -17,6 +18,8 @@ import numpy as np
 if TYPE_CHECKING:
     from .stm_client import STMClient
 
+log = logging.getLogger(__name__)
+
 
 class ScanStatus(IntEnum):
     STOPPED = 0
@@ -26,15 +29,20 @@ class ScanStatus(IntEnum):
     # is_running purposes.
     PAUSED = 1
     SCANNING = 2
+    # CreaTec returns 3 as a brief wrap-up state between SCANNING(2) and
+    # FINISHED(9) — the scan data is complete, the file write is in progress.
+    # Treat as STOPPED so the wait loop exits cleanly.
+    WRAPPING_UP = 3
+    # CreaTec returns 9 immediately after a scan completes cleanly. Treated
+    # the same as STOPPED — added explicitly so it doesn't spam the log
+    # with "Unknown SCANSTATUS 9" warnings on every scan.
+    FINISHED = 9
 
     @classmethod
     def _missing_(cls, value):
         """Any unrecognised status value falls back to STOPPED so the
         runner never crashes on a numeric value we haven't catalogued."""
-        import logging as _logging
-        _logging.getLogger(__name__).warning(
-            "Unknown SCANSTATUS %r — treating as STOPPED", value,
-        )
+        log.warning("Unknown SCANSTATUS %r — treating as STOPPED", value)
         return cls.STOPPED
 
 
@@ -84,6 +92,32 @@ class ScanParams:
     memo: str = ""
 
 
+def _safe_float(raw, default: float = 0.0) -> float:
+    """Parse a getp() result that may be '', None, garbage, or NaN.
+
+    STMAFM occasionally returns empty strings for valid keys while busy
+    (saving, mid-stop); a bare ``float(...)`` here used to crash whatever
+    automation step happened to read parameters at that moment. A wrong
+    default is recoverable and visible in logs; a crashed overnight run
+    is not.
+    """
+    try:
+        if raw in (None, ""):
+            return float(default)
+        value = float(raw)
+    except (TypeError, ValueError):
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "unparseable instrument value %r — using %s", raw, default)
+        return float(default)
+    if value != value or value in (float("inf"), float("-inf")):  # NaN/Inf
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "non-finite instrument value %r — using %s", raw, default)
+        return float(default)
+    return value
+
+
 class ScanController:
     def __init__(self, client: "STMClient") -> None:
         self._c = client
@@ -108,8 +142,8 @@ class ScanController:
 
     @property
     def size_nm(self) -> tuple[float, float]:
-        x = float(self._c.getp("SCAN.IMAGESIZE.NM.X", ""))
-        y = float(self._c.getp("SCAN.IMAGESIZE.NM.Y", ""))
+        x = _safe_float(self._c.getp("SCAN.IMAGESIZE.NM.X", ""), 0.0)
+        y = _safe_float(self._c.getp("SCAN.IMAGESIZE.NM.Y", ""), 0.0)
         return (x, y)
 
     @size_nm.setter
@@ -119,7 +153,7 @@ class ScanController:
 
     @property
     def speed_nm_s(self) -> float:
-        return float(self._c.getp("SCAN.SPEED.NM/SEC", ""))
+        return _safe_float(self._c.getp("SCAN.SPEED.NM/SEC", ""), 0.0)
 
     @speed_nm_s.setter
     def speed_nm_s(self, value: float) -> None:
@@ -127,9 +161,19 @@ class ScanController:
 
     @property
     def pixels(self) -> tuple[int, int]:
-        x = int(self._c.getp("SCAN.NUM.X", "") or 256)
-        y = int(self._c.getp("SCAN.NUM.Y", "") or 256)
-        return (x, y)
+        # Createc stores pixel count as "Num.X" / "Num.Y" in the dat file and
+        # exposes those raw keys via COM for reading. "SCAN.NUM.X" is accepted
+        # for writing (apply()) but returns "" on getp in some Createc versions,
+        # causing silent fallback to 256. Try the raw key first.
+        def _read_px(raw_key: str, structured_key: str) -> int:
+            v = self._c.getp(raw_key, "")
+            if not v:
+                v = self._c.getp(structured_key, "")
+            try:
+                return int(float(v)) if v else 256
+            except (ValueError, TypeError):
+                return 256
+        return (_read_px("Num.X", "SCAN.NUM.X"), _read_px("Num.Y", "SCAN.NUM.Y"))
 
     @pixels.setter
     def pixels(self, value: tuple[int, int]) -> None:
@@ -138,7 +182,7 @@ class ScanController:
 
     @property
     def rotation_deg(self) -> float:
-        return float(self._c.getp("SCAN.ROTATION.DEG", "") or 0.0)
+        return _safe_float(self._c.getp("SCAN.ROTATION.DEG", ""), 0.0)
 
     @rotation_deg.setter
     def rotation_deg(self, value: float) -> None:
@@ -174,24 +218,47 @@ class ScanController:
         self._c.setp("STMAFM.CMD.SETXYOFF.IMAGECOORD", (int(x_pixel), int(y_pixel)))
 
     def nudge_offset_pixels(self, dx: float, dy: float) -> None:
-        """Shift the scan offset by a sub-pixel amount (used for drift correction)."""
+        """Shift the scan offset by a sub-pixel amount (used by survey
+        per-feature re-centring and any other small in-frame nudge)."""
         self._c.raw.setxyoffpixel(dx, dy)
 
-    def set_offset_nm(self, x_nm: float, y_nm: float) -> None:
-        """Set the scan-frame XY offset in nanometres (absolute positioning).
+    def _get_offset_volt(self) -> Optional[Tuple[float, float]]:
+        """Read the current piezo XY voltage from SCAN.OFFSET.{X,Y}.VOLT."""
+        try:
+            x = self._c.getp("SCAN.OFFSET.X.VOLT", None)
+            y = self._c.getp("SCAN.OFFSET.Y.VOLT", None)
+            if x in (None, "") or y in (None, ""):
+                return None
+            return (float(x), float(y))
+        except Exception:
+            return None
 
-        Routes through ``setxyoffvolt`` which truly takes piezo volts:
-        empirically on this rig, ``setxyoffvolt(1, 0)`` produces an
-        offset of ~9.6 nm (see calibrate_xy_from_current). We multiply
-        the requested nm by the cached V/nm ratio.
+    def set_offset_nm(
+        self, x_nm: float, y_nm: float,
+        *,
+        tolerance_nm: float = 0.3,
+        max_iterations: int = 5,
+        settle_s: float = 0.25,
+    ) -> None:
+        """Set the scan-frame XY offset in nanometres (closed-loop).
 
-        If no calibration is available yet, we try to derive one from
-        the current SCAN.OFFSET.{X,Y}.NM/VOLT readings. If even that
-        fails (offset near zero), we WARN loudly and pass through 1:1 —
-        the user will see the resulting WARN line in the log and know to
-        recalibrate.
+        The initial voltage estimate uses the CURRENT absolute piezo
+        voltage as the reference point, then adds the required nm delta
+        scaled by the local calibration:
+
+            target_V = current_V + (target_nm - current_nm) × V/nm
+
+        This eliminates the systematic ~8-9 nm open-loop error that
+        previously arose because V/nm (a local slope) was multiplied by
+        the absolute nm target (which assumed the piezo origin is at 0 V,
+        which it is not). With a correct first-shot estimate the
+        iterations only need to correct small nonlinearity residuals and
+        converge in 1-2 steps.
+
+        Fallback if no calibration: pass nm through to setxyoffvolt 1:1.
         """
         import logging as _logging
+        import time as _time
         log = _logging.getLogger(__name__)
 
         if self._volts_per_nm_x is None or self._volts_per_nm_y is None:
@@ -200,22 +267,73 @@ class ScanController:
         if self._volts_per_nm_x is None or self._volts_per_nm_y is None:
             log.warning(
                 "set_offset_nm(%.3f, %.3f) without calibration — "
-                "passing nm to setxyoffvolt 1:1, position will likely be wrong. "
-                "Move the scan to a non-zero offset first so calibration can derive.",
+                "passing nm to setxyoffvolt 1:1, position will likely be wrong.",
                 x_nm, y_nm,
             )
             self._c.raw.setxyoffvolt(float(x_nm), float(y_nm))
             return
 
-        x_volts = float(x_nm) * self._volts_per_nm_x
-        y_volts = float(y_nm) * self._volts_per_nm_y
-        log.debug(
-            "set_offset_nm(%.3f, %.3f) → setxyoffvolt(%.5f, %.5f) "
-            "[cal: %.5f, %.5f V/nm]",
-            x_nm, y_nm, x_volts, y_volts,
-            self._volts_per_nm_x, self._volts_per_nm_y,
+        target = (float(x_nm), float(y_nm))
+        vx_per_nm = float(self._volts_per_nm_x)
+        vy_per_nm = float(self._volts_per_nm_y)
+
+        # Read current absolute piezo voltage to seed the first shot correctly.
+        # Without this, the code would compute target_nm × V_per_nm which assumes
+        # the piezo passes through (0 nm, 0 V) — it doesn't, causing a systematic
+        # ~8-9 nm initial overshoot that 3 iterations cannot fully recover from.
+        cur_nm = self.get_offset_nm()
+        cur_v  = self._get_offset_volt()
+        if cur_nm is not None and cur_v is not None:
+            x_volts = cur_v[0] + (target[0] - cur_nm[0]) * vx_per_nm
+            y_volts = cur_v[1] + (target[1] - cur_nm[1]) * vy_per_nm
+            log.debug(
+                "set_offset_nm: delta init from (%.3f, %.3f) nm / (%.4f, %.4f) V"
+                " → first-shot (%.4f, %.4f) V",
+                cur_nm[0], cur_nm[1], cur_v[0], cur_v[1], x_volts, y_volts,
+            )
+        else:
+            # Fallback to absolute estimate (old behaviour) if readback fails.
+            x_volts = target[0] * vx_per_nm
+            y_volts = target[1] * vy_per_nm
+            log.debug("set_offset_nm: using absolute fallback init (%.4f, %.4f) V",
+                      x_volts, y_volts)
+
+        err_x = err_y = 0.0
+        for attempt in range(max(1, max_iterations)):
+            self._c.raw.setxyoffvolt(x_volts, y_volts)
+            _time.sleep(settle_s)
+            actual = self.get_offset_nm()
+            if actual is None:
+                log.debug(
+                    "set_offset_nm: readback failed at iter %d; "
+                    "leaving at open-loop volts (%.5f, %.5f)",
+                    attempt + 1, x_volts, y_volts,
+                )
+                return
+            err_x = target[0] - actual[0]
+            err_y = target[1] - actual[1]
+            if abs(err_x) <= tolerance_nm and abs(err_y) <= tolerance_nm:
+                log.info(
+                    "set_offset_nm: converged in %d iter(s) "
+                    "[target (%.3f, %.3f) → actual (%.3f, %.3f) nm, "
+                    "residual (%+.3f, %+.3f) nm]",
+                    attempt + 1, target[0], target[1],
+                    actual[0], actual[1], err_x, err_y,
+                )
+                return
+            log.debug(
+                "set_offset_nm iter %d: actual (%.3f, %.3f), "
+                "residual (%+.3f, %+.3f) nm → adding (%+.5f, %+.5f) V",
+                attempt + 1, actual[0], actual[1], err_x, err_y,
+                err_x * vx_per_nm, err_y * vy_per_nm,
+            )
+            x_volts += err_x * vx_per_nm
+            y_volts += err_y * vy_per_nm
+        log.warning(
+            "set_offset_nm: max %d iterations reached — "
+            "residual (%+.3f, %+.3f) nm, left at best-effort position",
+            max_iterations, err_x, err_y,
         )
-        self._c.raw.setxyoffvolt(x_volts, y_volts)
 
     def get_offset_nm(self) -> Optional[Tuple[float, float]]:
         """Read the current scan-frame XY offset in nanometres.
@@ -430,8 +548,8 @@ class ScanController:
     def read(self) -> ScanParams:
         """Read the current scan parameters from the instrument."""
         return ScanParams(
-            bias_V=float(self._c.getp("SCAN.BIASVOLTAGE.VOLT", "")),
-            setpoint_A=float(self._c.getp("SCAN.SETPOINT.AMPERE", "") or 0.0),
+            bias_V=_safe_float(self._c.getp("SCAN.BIASVOLTAGE.VOLT", ""), 0.0),
+            setpoint_A=_safe_float(self._c.getp("SCAN.SETPOINT.AMPERE", ""), 0.0),
             size_nm=self.size_nm,
             speed_nm_s=self.speed_nm_s,
             pixels=self.pixels,
@@ -469,7 +587,24 @@ class ScanController:
 
     def save_dat(self, filepath: str) -> None:
         """Save the most recent scan as a .dat file at the given path."""
-        self._c.setp("STMAFM.FILE.SAVE.DAT", str(filepath))
+        try:
+            self._c.setp("STMAFM.FILE.SAVE.DAT", str(filepath))
+        except Exception as exc:
+            # Createc generates a .dat.jpeg thumbnail after saving the .dat.
+            # On Windows, file indexers (Explorer, antivirus) occasionally hold
+            # an exclusive lock on that thumbnail file, causing a COM error even
+            # though the .dat itself was written successfully.  Treat this as a
+            # non-fatal warning so the sweep can continue.
+            msg = str(exc)
+            if ".jpeg" in msg.lower() and (
+                "cannot create" in msg.lower() or "being used by another" in msg.lower()
+            ):
+                log.warning(
+                    "save_dat: .dat.jpeg thumbnail locked by another process — "
+                    ".dat was saved, thumbnail skipped. (%s)", exc
+                )
+            else:
+                raise
 
     def last_saved_path(self) -> Optional[Path]:
         path = self._c.getp("STMAFM.LASTSAVEDFILE", "") or self._c.raw.savedatfilename
@@ -522,3 +657,47 @@ class ScanController:
             return self._c.raw.scandatabitmap()
         except Exception:
             return None
+
+
+# ------------------------------------------------------------------
+# Scan timing helpers (used by GUI panels and automation executors)
+# ------------------------------------------------------------------
+
+def estimate_scan_duration_s(params: "ScanParams") -> float:
+    """Best-estimate scan duration in seconds (forward + reverse, no settle padding)."""
+    line_time = 2.0 * float(params.size_nm[0]) / max(float(params.speed_nm_s), 0.01)
+    return line_time * int(params.pixels[1])
+
+
+def estimate_scan_timeout_s(params: "ScanParams") -> float:
+    """Scan duration estimate plus generous safety margin, floored at 2 min."""
+    return max(120.0, estimate_scan_duration_s(params) + 90.0)
+
+
+def speed_for_target_duration_s(
+    size_nm: float,
+    pixels_y: int,
+    target_s: float,
+    *,
+    min_speed_nm_s: float = 0.5,
+    max_speed_nm_s: float = 1000.0,
+) -> float:
+    """Scan speed (nm/s) that makes one full image take ``target_s`` seconds.
+
+    Inverts :func:`estimate_scan_duration_s` (duration = 2·size·pixels_y /
+    speed). Used to keep small feature scans at a fixed wall-clock time so
+    per-image drift stays bounded, instead of inheriting the wide scan's
+    fast speed and finishing in seconds. Result is clamped to a sane range.
+    """
+    target_s = max(1.0, float(target_s))
+    speed = 2.0 * float(size_nm) * int(pixels_y) / target_s
+    return max(min_speed_nm_s, min(max_speed_nm_s, speed))
+
+
+def format_duration(seconds: float) -> str:
+    """Human-readable mm:ss formatting (or 'Ns' under one minute)."""
+    s = int(round(seconds))
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    return f"{m}m {s:02d}s"

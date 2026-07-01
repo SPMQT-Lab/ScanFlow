@@ -24,7 +24,6 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional, List, Union
 
-from scanflow.automation.survey import SurveyConfig
 from scanflow.automation.mosaic import MosaicConfig
 
 
@@ -157,25 +156,6 @@ class TipFormStep:
 
 
 @dataclass
-class SurveyStep:
-    """Wide scan + auto feature discovery + per-feature zoom campaign."""
-    config: "SurveyConfig" = field(default_factory=lambda: SurveyConfig())
-    label: str = ""
-    kind: str = "survey"
-
-    def estimate_duration_s(self) -> float:
-        cfg = self.config
-        wide_t = (2.0 * cfg.wide_size_nm[0] / max(cfg.wide_speed_nm_s, 0.01)
-                  * cfg.wide_pixels[1] + 4.0)
-        zoom_t = (2.0 * cfg.min_zoom_nm / max(cfg.zoom_speed_nm_s, 0.01)
-                  * cfg.zoom_pixels[1] + 4.0)
-        n_zooms = cfg.max_features * cfg.zoom_iterations
-        # One pre-wide settle + one settle per zoom iteration
-        settle_t = cfg.settling_s * (1 + n_zooms)
-        return wide_t + n_zooms * zoom_t + settle_t
-
-
-@dataclass
 class MosaicStep:
     """Wide scan + 3×3 zoom tiles + wide scan (a 'before/after' mosaic)."""
     config: "MosaicConfig" = field(default_factory=lambda: MosaicConfig())
@@ -192,7 +172,8 @@ class MosaicStep:
         tile_t = (2.0 * tx / max(cfg.tile_speed_nm_s, 0.01)
                   * cfg.tile_pixels[1] + 4.0)
         n_tiles = cfg.total_tiles()
-        n_iters = cfg.iterations_per_tile
+        # effective_iterations() respects bias_sweep override
+        n_iters = cfg.effective_iterations()
         # Settle: one before each wide, one before each tile iteration
         settle_t = cfg.settling_s * (2 + n_tiles * n_iters)
         return 2 * wide_t + n_tiles * n_iters * tile_t + settle_t
@@ -200,7 +181,7 @@ class MosaicStep:
 
 RecipeStep = Union[
     ScanStep, SpectroscopyStep, ApproachStep, WaitStep,
-    TipFormStep, SurveyStep, MosaicStep,
+    TipFormStep, MosaicStep,
 ]
 
 _STEP_CLASSES = {
@@ -209,7 +190,6 @@ _STEP_CLASSES = {
     "approach": ApproachStep,
     "wait": WaitStep,
     "tip_form": TipFormStep,
-    "survey": SurveyStep,
     "mosaic": MosaicStep,
 }
 
@@ -264,18 +244,6 @@ class MeasurementRecipe:
     name: str = "Untitled recipe"
     steps: list = field(default_factory=list)
 
-    # Drift correction
-    drift_correction: bool = True
-    drift_channel: int = 0
-    drift_reposition_delay_s: float = 3.0
-    drift_template: str = ""
-    # "phase" | "features" | "hybrid" — see scanflow.drift.detector.DriftDetector.
-    drift_method: str = "hybrid"
-    # When True, the alignment scan runs at half the data-scan pixel count;
-    # the reference is downsampled on the fly to match. Roughly halves the
-    # alignment scan's wall-clock time, ~33% faster sweep overall.
-    fast_alignment: bool = False
-
     # Execution
     repetitions: int = 1
     inter_step_delay_s: float = 0.0
@@ -291,21 +259,111 @@ class MeasurementRecipe:
     safety_retract_nm: float = 10.0
     safety_poll_interval_s: float = 0.5
 
+    # Frozen-Z safety: stop scanning when a completed scan shows exactly
+    # zero Z variation (a stuck feedback loop / Z readback looks perfectly
+    # flat — real data always has some residual).
+    stop_on_frozen_z: bool = True
+
+    # Tunneling-loss safety: stop scanning when the tip falls out of
+    # tunneling range mid-scan (current collapses to ~0 and the software
+    # would otherwise keep "scanning" nothing). The live floor is
+    # max(tunnel_lost_floor_A, tunnel_lost_fraction × setpoint), and it must
+    # stay below that for tunnel_lost_grace_s before halting.
+    stop_on_tunnel_lost: bool = True
+    tunnel_lost_fraction: float = 0.15
+    tunnel_lost_floor_A: float = 3e-12
+    tunnel_lost_grace_s: float = 8.0
+
     # ------------------------------------------------------------------
 
     def add_step(self, step: RecipeStep) -> None:
         self.steps.append(step)
 
+    def validate(self, mode: str = "live") -> list[str]:
+        """Pre-flight checks. Returns issue strings prefixed ``ERROR:`` or
+        ``WARNING:``; an empty list means nothing was flagged.
+
+        Errors describe steps the runner would refuse or that would harm
+        the tip; warnings flag risky-but-legal configurations. ``mode``
+        is ``"live"`` or ``"mock"`` — some warnings only matter live.
+        """
+        issues: list[str] = []
+        if not self.steps:
+            issues.append("ERROR: recipe has no steps")
+
+        for i, step in enumerate(self.steps, start=1):
+            kind = getattr(step, "kind", "scan")
+            tag = f"step {i} ({step.label or kind})"
+            if kind == "scan":
+                if not step.const_height and abs(step.bias_V) < MIN_CONST_CURRENT_BIAS_V:
+                    issues.append(
+                        f"ERROR: {tag}: constant-current scan at "
+                        f"|bias|={abs(step.bias_V)*1000:.2f} mV "
+                        f"< {MIN_CONST_CURRENT_BIAS_V*1000:.1f} mV would crash the tip"
+                    )
+                if abs(step.bias_V) > 10.0:
+                    issues.append(f"ERROR: {tag}: |bias| {step.bias_V:.2f} V exceeds ±10 V")
+                if step.setpoint_A <= 0:
+                    issues.append(f"ERROR: {tag}: setpoint must be positive")
+                elif step.setpoint_A > 100e-9:
+                    issues.append(
+                        f"WARNING: {tag}: setpoint {step.setpoint_A*1e9:.1f} nA "
+                        "is unusually high"
+                    )
+                if min(step.size_nm) <= 0 or min(step.pixels) <= 0:
+                    issues.append(f"ERROR: {tag}: scan size and pixels must be positive")
+            elif kind == "mosaic":
+                for b in step.config.effective_bias_sequence():
+                    if abs(b) < MIN_CONST_CURRENT_BIAS_V:
+                        issues.append(
+                            f"WARNING: {tag}: bias sequence contains "
+                            f"{b*1000:.1f} mV — that iteration will be skipped"
+                        )
+            elif kind == "tip_form":
+                issues.append(
+                    f"WARNING: {tag}: tip-form step requires explicit operator "
+                    "approval (approve_next_tip_form) or the run will halt there"
+                )
+                # Createc quirk: the move to the tip-form spot happens at
+                # the step's lateral speed, not the scan speed, and cannot
+                # be interrupted. Flag big mismatches against the scan
+                # speeds present in this recipe.
+                scan_speeds = [
+                    s.speed_nm_s for s in self.steps
+                    if getattr(s, "kind", "") == "scan"
+                ]
+                if scan_speeds:
+                    ratio = step.lateral_speed_nm_s / max(min(scan_speeds), 1e-9)
+                    if ratio > 10.0:
+                        issues.append(
+                            f"WARNING: {tag}: tip-form lateral speed "
+                            f"{step.lateral_speed_nm_s:.1f} nm/s is {ratio:.0f}× "
+                            "the recipe's scan speed — the move to the target "
+                            "will be a fast jump"
+                        )
+                    elif ratio < 0.1:
+                        issues.append(
+                            f"WARNING: {tag}: tip-form lateral speed "
+                            f"{step.lateral_speed_nm_s:.1f} nm/s is far below the "
+                            "recipe's scan speed — slow travel that cannot be "
+                            "interrupted once commanded"
+                        )
+
+        if mode == "live" and not self.safety_enable:
+            issues.append("WARNING: tip-crash safety abort is DISABLED")
+        total_s = self.estimate_duration_s()
+        if total_s > 24 * 3600:
+            issues.append(
+                f"WARNING: estimated total run time {format_duration(total_s)} "
+                "exceeds 24 h"
+            )
+        return issues
+
     def total_steps(self) -> int:
         return len(self.steps) * self.repetitions
 
     def estimate_duration_s(self) -> float:
-        """Sum estimated durations of every step across all repetitions.
-
-        Includes an extra alignment-scan worth of time per step when
-        drift correction is enabled (the runner takes a quick alignment
-        image before each data scan).
-        """
+        """Sum estimated durations of every step across all repetitions."""
         per_iter = 0.0
         for step in self.steps:
             if hasattr(step, "estimate_duration_s"):
@@ -317,10 +375,6 @@ class MeasurementRecipe:
             else:
                 t = 0.0
             per_iter += t
-            if self.drift_correction and getattr(step, "kind", "scan") == "scan":
-                # Alignment scan budget: ~50% of data scan time at full
-                # resolution, ~25% (half pixels → half lines) with fast mode.
-                per_iter += t * (0.25 if self.fast_alignment else 0.5)
             per_iter += self.inter_step_delay_s
         return per_iter * self.repetitions
 
@@ -340,10 +394,18 @@ class MeasurementRecipe:
         data = yaml.safe_load(text)
         steps_raw = data.pop("steps", [])
         steps = [_step_from_dict(dict(s)) for s in steps_raw]
-        for k in ("drift_reposition_delay_s", "inter_step_delay_s",
+        for k in ("inter_step_delay_s",
                   "safety_max_current_A", "safety_retract_nm", "safety_poll_interval_s"):
             if k in data:
                 data[k] = float(data[k])
+        # Drop any drift-* / fast_alignment keys persisted by older recipes —
+        # the feature was removed, so silently strip them rather than crash
+        # on unknown kwargs.
+        for stale_key in (
+            "drift_correction", "drift_channel", "drift_reposition_delay_s",
+            "drift_template", "drift_method", "fast_alignment",
+        ):
+            data.pop(stale_key, None)
         return cls(steps=steps, **data)
 
     @classmethod
@@ -364,16 +426,12 @@ class MeasurementRecipe:
         size_nm: tuple[float, float] = (50.0, 50.0),
         speed_nm_s: float = 50.0,
         pixels: tuple[int, int] = (256, 256),
-        drift_correction: bool = True,
         channels: tuple[str, ...] = DEFAULT_CHANNELS,
         const_height: bool = False,
         settling_s: float = 0.0,
-        fast_alignment: bool = False,
     ) -> "MeasurementRecipe":
         import numpy as np
-        recipe = cls(name=f"Bias ramp {start_V:.2f}–{end_V:.2f} V",
-                     drift_correction=drift_correction,
-                     fast_alignment=fast_alignment)
+        recipe = cls(name=f"Bias ramp {start_V:.2f}–{end_V:.2f} V")
         for bias in np.linspace(start_V, end_V, steps):
             # Constant-current scans at 0 V can never reach the setpoint —
             # the feedback loop pushes the tip into the surface. Skip
@@ -402,11 +460,9 @@ class MeasurementRecipe:
         size_nm: tuple[float, float] = (50.0, 50.0),
         speed_nm_s: float = 50.0,
         pixels: tuple[int, int] = (256, 256),
-        drift_correction: bool = True,
         channels: tuple[str, ...] = DEFAULT_CHANNELS,
     ) -> "MeasurementRecipe":
         recipe = cls(name="Overnight scan",
-                     drift_correction=drift_correction,
                      repetitions=repetitions,
                      suppress_dst_change=True)
         recipe.add_step(ScanStep(
@@ -429,14 +485,10 @@ class MeasurementRecipe:
         size_nm: tuple[float, float] = (50.0, 50.0),
         speed_nm_s: float = 50.0,
         pixels: tuple[int, int] = (256, 256),
-        drift_correction: bool = True,
         settling_s: float = 0.0,
-        fast_alignment: bool = False,
     ) -> "MeasurementRecipe":
         import numpy as np
-        recipe = cls(name=f"Current ramp {start_pA:.1f}–{end_pA:.1f} pA",
-                     drift_correction=drift_correction,
-                     fast_alignment=fast_alignment)
+        recipe = cls(name=f"Current ramp {start_pA:.1f}–{end_pA:.1f} pA")
         for c_pA in np.linspace(start_pA, end_pA, steps):
             recipe.add_step(ScanStep(
                 bias_V=bias_V,

@@ -110,9 +110,8 @@ _DEFAULTS: Dict[str, Any] = {
     "AFM.SRS_GAIN": 100.0,
     "AFM.PLL_AMPLITUDE.NM": 0.2,
     "AFM.RESULTS.FCENTER.HZ": 24500.0,
-    "T_ADC2[K]": 4.5,
-    "T_ADC3[K]": 77.0,
-    "T-STM:": 4.5,
+    "T_AUXADC6[K]": 4.5,    # STM stage temperature
+    "T_AUXADC7[K]": 4.2,    # LHe bath temperature
     "Block_DSTime_Change": False,
 }
 
@@ -415,7 +414,17 @@ class MockDispatch:
 
     def setxyoffvolt(self, x: float, y: float) -> None:
         """Absolute set in piezo volts. Real Createc takes volts; the mock
-        simulates a 10 nm/V calibration to match a typical LT-STM head."""
+        simulates a 10 nm/V calibration to match a typical LT-STM head.
+
+        FIXME(B2-frame-resize): this model is too simple to catch
+        coordinate-convention bugs — SCAN.OFFSET.{X,Y}.NM here is a plain
+        linear function of volts with NO dependence on SCAN.IMAGESIZE, so
+        the centre-vs-top-edge question (see scan_geometry.py and
+        runner._do_feature_zoom) is invisible to every mock test. Once the
+        rig experiment settles what a frame resize preserves, model it
+        here (offset readback derived from a stored frame position + the
+        current IMAGESIZE) so survey/mosaic centering becomes testable.
+        """
         with self._lock:
             self._params["SCAN.OFFSET.X.VOLT"] = float(x)
             self._params["SCAN.OFFSET.Y.VOLT"] = float(y)

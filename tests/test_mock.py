@@ -72,9 +72,9 @@ def test_live_scan_partial_during_scan(stm):
 def test_temperature_readouts(stm):
     reading = stm.temperature.read()
     assert reading is not None
-    # The default mock has 4.5 K STM, 77 K cryostat
-    assert reading.stm == pytest.approx(4.5)
-    assert reading.adc3_K == pytest.approx(77.0)
+    # This rig wires STM (AUXADC6) and LHe (AUXADC7); mock defaults 4.5 / 4.2 K
+    assert reading.aux6_K == pytest.approx(4.5)
+    assert reading.aux7_K == pytest.approx(4.2)
 
 
 def test_user_dispatch_available(stm):
