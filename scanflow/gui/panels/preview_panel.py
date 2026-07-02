@@ -15,12 +15,12 @@ import pyqtgraph as pg
 from PySide6.QtCore import QThread, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QAbstractSpinBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
-    QGridLayout,
     QHeaderView,
     QHBoxLayout,
     QFrame,
@@ -42,6 +42,8 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QVBoxLayout,
     QMainWindow,
+    QToolButton,
+    QSizePolicy,
     QWidget,
     QCheckBox,
 )
@@ -58,6 +60,7 @@ from probeflow.core.scan_loader import load_scan
 from probeflow.processing.geometry import set_zero_plane
 
 from scanflow.core import STMClient, SafetyConfig, SafetyMonitor, TipMotionManager, ScanParams
+from scanflow.gui import theme as _theme
 from scanflow.core.scan import (
     estimate_scan_duration_s as _estimate_scan_duration,
     estimate_scan_timeout_s as _estimate_scan_timeout,
@@ -72,6 +75,374 @@ from scanflow.automation.workers import (
 from scanflow.automation.group_survey import FeatureGroup, group_features
 
 log = logging.getLogger(__name__)
+
+
+def _preview_stylesheet() -> str:
+    return f"""
+    QWidget#previewWindow {{
+        background-color: {_theme.DARK_BG};
+        color: {_theme.DARK_TEXT};
+    }}
+    QWidget#previewControls, QWidget#previewTableBox {{
+        background-color: {_theme.DARK_BG};
+    }}
+    QLabel#previewStatus {{
+        background-color: {_theme.DARK_BLUE_DARK};
+        color: {_theme.DARK_WHITE};
+        border: 1px solid {_theme.DARK_BORDER};
+        border-left: 4px solid {_theme.AMBER};
+        border-radius: 4px;
+        padding: 7px 10px;
+        font-weight: 600;
+        min-height: 28px;
+    }}
+    QLabel#previewScanInfo {{
+        background-color: {_theme.DARK_SURFACE};
+        color: {_theme.DARK_TEXT};
+        border: 1px solid {_theme.DARK_BORDER};
+        border-radius: 4px;
+        padding: 4px 8px;
+        min-height: 22px;
+        font-family: monospace;
+    }}
+    QLabel#previewTime {{
+        color: {_theme.DARK_TEXT_MUTED};
+        font-style: italic;
+        padding: 2px 4px;
+    }}
+    QLabel#previewSection {{
+        color: {_theme.DARK_BLUE};
+        font-weight: 700;
+        margin-top: 6px;
+        margin-bottom: 2px;
+    }}
+    QWidget#previewControls QLabel {{
+        color: {_theme.DARK_TEXT};
+        background: transparent;
+    }}
+    QWidget#previewControls QLineEdit,
+    QWidget#previewControls QComboBox,
+    QWidget#previewControls QDoubleSpinBox,
+    QWidget#previewControls QSpinBox {{
+        background-color: {_theme.DARK_SURFACE};
+        color: {_theme.DARK_TEXT};
+        border: 1px solid {_theme.DARK_BORDER};
+        border-radius: 4px;
+        padding: 4px 8px;
+        min-height: 24px;
+    }}
+    QWidget#previewControls QLineEdit:focus,
+    QWidget#previewControls QComboBox:focus,
+    QWidget#previewControls QDoubleSpinBox:focus,
+    QWidget#previewControls QSpinBox:focus {{
+        border: 1px solid {_theme.DARK_BLUE};
+    }}
+    QWidget#previewControls QSpinBox,
+    QWidget#previewControls QDoubleSpinBox {{
+        padding-right: 4px;
+    }}
+    QWidget#previewControls QSpinBox::up-button,
+    QWidget#previewControls QSpinBox::down-button,
+    QWidget#previewControls QDoubleSpinBox::up-button,
+    QWidget#previewControls QDoubleSpinBox::down-button {{
+        width: 0px;
+        border: none;
+        background: transparent;
+    }}
+    QWidget#previewControls QCheckBox {{
+        color: {_theme.DARK_TEXT};
+        background: transparent;
+    }}
+    QWidget#previewControls QListWidget,
+    QWidget#previewTableBox QTableWidget {{
+        background-color: {_theme.DARK_SURFACE};
+        color: {_theme.DARK_TEXT};
+        border: 1px solid {_theme.DARK_BORDER};
+        border-radius: 4px;
+        alternate-background-color: {_theme.DARK_BLUE_LIGHT};
+        selection-background-color: {_theme.DARK_BLUE};
+        selection-color: {_theme.DARK_WHITE};
+    }}
+    QWidget#previewTableBox QHeaderView::section,
+    QWidget#previewControls QHeaderView::section {{
+        background-color: {_theme.DARK_BLUE_LIGHT};
+        color: {_theme.DARK_WHITE};
+        padding: 4px 6px;
+        border: none;
+        border-right: 1px solid {_theme.DARK_BORDER};
+        border-bottom: 1px solid {_theme.DARK_BORDER};
+        font-weight: 700;
+    }}
+    QWidget#previewControls QPushButton,
+    QWidget#previewTableBox QPushButton {{
+        background-color: {_theme.DARK_BLUE};
+        color: {_theme.DARK_WHITE};
+        border: 1px solid rgba(255,255,255,0.12);
+        border-radius: 4px;
+        min-height: 28px;
+        padding: 4px 10px;
+        font-weight: 600;
+    }}
+    QWidget#previewControls QPushButton:hover,
+    QWidget#previewTableBox QPushButton:hover {{
+        background-color: #3B82F6;
+    }}
+    QWidget#previewControls QPushButton:disabled,
+    QWidget#previewTableBox QPushButton:disabled,
+    QWidget#previewControls QToolButton:disabled {{
+        background-color: #22344D;
+        color: {_theme.DARK_TEXT_MUTED};
+        border: 1px solid #2B3D58;
+    }}
+    QWidget#previewControls QPushButton[role="secondary"] {{
+        background-color: {_theme.DARK_BLUE};
+        color: {_theme.DARK_WHITE};
+        border: 1px solid rgba(255,255,255,0.10);
+    }}
+    QWidget#previewControls QPushButton[role="secondary"]:hover {{
+        background-color: #3B82F6;
+    }}
+    QWidget#previewControls QPushButton[role="primary"] {{
+        background-color: {_theme.DARK_BLUE};
+        color: {_theme.DARK_WHITE};
+        border: 1px solid rgba(255,255,255,0.10);
+    }}
+    QWidget#previewControls QPushButton[role="primary"]:hover {{
+        background-color: #3B82F6;
+    }}
+    QWidget#previewControls QPushButton[role="primary"]:checked {{
+        background-color: {_theme.DARK_BLUE_LIGHT};
+        border: 1px solid {_theme.DARK_BORDER};
+    }}
+    QWidget#previewControls QPushButton[role="accent"] {{
+        background-color: {_theme.AMBER};
+        color: #1A1A1A;
+        font-weight: 700;
+    }}
+    QWidget#previewControls QPushButton[role="accent"]:hover {{
+        background-color: #E09A00;
+    }}
+    QWidget#previewControls QPushButton[role="danger"] {{
+        background-color: #7f1d1d;
+        color: {_theme.DARK_WHITE};
+        border: 1px solid #b91c1c;
+        font-weight: 700;
+    }}
+    QWidget#previewControls QPushButton[role="danger"]:hover {{
+        background-color: #991b1b;
+    }}
+    QWidget#previewControls QPushButton[role="toggle"] {{
+        background-color: {_theme.DARK_BLUE};
+        color: {_theme.DARK_WHITE};
+        border: 1px solid rgba(255,255,255,0.10);
+    }}
+    QWidget#previewControls QPushButton[role="toggle"]:hover {{
+        background-color: #3B82F6;
+    }}
+    QWidget#previewControls QPushButton[role="toggle"]:checked {{
+        background-color: {_theme.DARK_BLUE_LIGHT};
+        border: 1px solid {_theme.DARK_BORDER};
+    }}
+    QWidget#previewControls QToolButton {{
+        background-color: {_theme.DARK_BLUE};
+        color: {_theme.DARK_WHITE};
+        border: 1px solid rgba(255,255,255,0.10);
+        border-radius: 4px;
+        padding: 4px 10px;
+        min-height: 28px;
+        font-weight: 600;
+    }}
+    QWidget#previewControls QToolButton:hover {{
+        background-color: #3B82F6;
+    }}
+    QWidget#previewControls QToolButton:checked {{
+        background-color: {_theme.DARK_BLUE_LIGHT};
+        border: 1px solid {_theme.DARK_BORDER};
+    }}
+    QWidget#previewControls QScrollArea {{
+        background: transparent;
+        border: none;
+    }}
+    QScrollArea#previewControlsScroll {{
+        background: transparent;
+        border: none;
+    }}
+    QWidget#previewControls QScrollArea > QWidget {{
+        background: transparent;
+    }}
+    QFrame#previewClassCard {{
+        background-color: {_theme.DARK_SURFACE};
+        border: 1px solid {_theme.DARK_BORDER};
+        border-radius: 6px;
+    }}
+    QFrame#previewClassHeader {{
+        background-color: #2E5279;
+        border: 1px solid rgba(255,255,255,0.12);
+        border-radius: 5px;
+    }}
+    QFrame#previewClassHeader[active="true"] {{
+        background-color: #3A638F;
+        border: 1px solid {_theme.AMBER};
+    }}
+    QFrame#previewClassHeader:hover {{
+        background-color: #3D6B99;
+    }}
+    QFrame#previewClassHeader QLabel {{
+        color: {_theme.DARK_WHITE};
+        background: transparent;
+        font-weight: 700;
+    }}
+    QFrame#previewClassHeader QToolButton {{
+        background-color: #35507A;
+        color: {_theme.DARK_WHITE};
+        border: 1px solid rgba(255,255,255,0.10);
+        border-radius: 4px;
+        padding: 2px 6px;
+        min-width: 22px;
+        min-height: 22px;
+    }}
+    QFrame#previewClassHeader QToolButton:hover {{
+        background-color: #406089;
+    }}
+    QFrame#previewClassHeader QPushButton[role="danger"] {{
+        min-height: 22px;
+        padding: 2px 8px;
+        min-width: 54px;
+    }}
+    QWidget#previewClassBody {{
+        background-color: {_theme.DARK_SURFACE};
+    }}
+    QLabel#previewClassStatus {{
+        color: {_theme.DARK_TEXT_MUTED};
+        background-color: #172840;
+        border: 1px solid #2B4565;
+        border-radius: 4px;
+        padding: 3px 6px;
+    }}
+    QWidget#previewScanHub {{
+        background-color: #172840;
+        border: 1px solid #2B4565;
+        border-radius: 6px;
+    }}
+    QPushButton[role="primary"],
+    QToolButton[role="primary"] {{
+        background-color: {_theme.DARK_BLUE};
+        color: #061122;
+        border: 1px solid #93C5FD;
+        border-radius: 4px;
+        min-height: 28px;
+        padding: 4px 10px;
+        font-weight: 700;
+    }}
+    QPushButton[role="primary"]:hover,
+    QToolButton[role="primary"]:hover {{
+        background-color: #93C5FD;
+        border-color: #BFDBFE;
+    }}
+    QPushButton[role="toggle"] {{
+        background-color: #315982;
+        color: {_theme.DARK_WHITE};
+        border: 1px solid #5A7DA6;
+        border-radius: 4px;
+        min-height: 28px;
+        padding: 4px 10px;
+        font-weight: 700;
+    }}
+    QPushButton[role="toggle"]:checked {{
+        background-color: {_theme.DARK_BLUE};
+        color: #061122;
+        border-color: #93C5FD;
+    }}
+    QPushButton[role="accent"] {{
+        background-color: {_theme.AMBER};
+        color: #1A1A1A;
+        border: 1px solid #FFD166;
+        border-radius: 4px;
+        min-height: 28px;
+        padding: 4px 10px;
+        font-weight: 800;
+    }}
+    QPushButton[role="accent"]:hover {{
+        background-color: #E09A00;
+    }}
+    QPushButton[role="danger"] {{
+        background-color: #7f1d1d;
+        color: {_theme.DARK_WHITE};
+        border: 1px solid #ef4444;
+        border-radius: 4px;
+        min-height: 28px;
+        padding: 4px 10px;
+        font-weight: 700;
+    }}
+    QPushButton[role="danger"]:hover {{
+        background-color: #991b1b;
+    }}
+    QPushButton[role="primary"]:disabled,
+    QToolButton[role="primary"]:disabled,
+    QPushButton[role="toggle"]:disabled,
+    QPushButton[role="accent"]:disabled,
+    QPushButton[role="danger"]:disabled {{
+        background-color: #22344D;
+        color: {_theme.DARK_TEXT_MUTED};
+        border: 1px solid #2B4565;
+    }}
+    QToolButton#previewTrayHeader {{
+        background-color: #315982;
+        color: {_theme.DARK_WHITE};
+        border: 1px solid #5A7DA6;
+        border-radius: 6px;
+        padding: 7px 10px;
+        font-weight: 700;
+        text-align: left;
+        min-height: 30px;
+    }}
+    QToolButton#previewTrayHeader:hover {{
+        background-color: #3D6B99;
+    }}
+    QToolButton#previewTrayHeader:checked {{
+        background-color: #3A638F;
+        border-left: 4px solid {_theme.AMBER};
+    }}
+    QWidget#previewSectionContent {{
+        background-color: #13233A;
+        border: 1px solid #2E486A;
+        border-radius: 6px;
+        padding: 4px;
+    }}
+    QWidget#previewControls QScrollBar:vertical,
+    QWidget#previewTableBox QScrollBar:vertical {{
+        background: {_theme.DARK_BLUE_LIGHT};
+        width: 10px;
+        border-radius: 5px;
+        margin: 0;
+    }}
+    QWidget#previewControls QScrollBar::handle:vertical,
+    QWidget#previewTableBox QScrollBar::handle:vertical {{
+        background: {_theme.DARK_BORDER};
+        border-radius: 5px;
+        min-height: 20px;
+    }}
+    QWidget#previewControls QScrollBar::handle:vertical:hover,
+    QWidget#previewTableBox QScrollBar::handle:vertical:hover {{
+        background: {_theme.DARK_BLUE};
+    }}
+    QWidget#previewControls QScrollBar:horizontal,
+    QWidget#previewTableBox QScrollBar:horizontal {{
+        background: {_theme.DARK_BLUE_LIGHT};
+        height: 10px;
+        border-radius: 5px;
+    }}
+    QWidget#previewControls QScrollBar::handle:horizontal,
+    QWidget#previewTableBox QScrollBar::handle:horizontal {{
+        background: {_theme.DARK_BORDER};
+        border-radius: 5px;
+        min-width: 20px;
+    }}
+    QWidget#previewControls QScrollBar::handle:horizontal:hover,
+    QWidget#previewTableBox QScrollBar::handle:horizontal:hover {{
+        background: {_theme.DARK_BLUE};
+    }}
+    """
 
 
 @dataclass
@@ -90,6 +461,100 @@ class _PreviewState:
     classifications: dict[int, str] = field(default_factory=dict)
     class_colors: dict[str, str] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
+
+
+@dataclass
+class _ClassRecord:
+    key: str
+    label: str
+    color: str
+    name_is_placeholder: bool = False
+    sample_indices: set[int] = field(default_factory=set)
+    encoder: str = "raw"
+    threshold: str = "gmm"
+    crop_size: int = 48
+    status: str = "No samples labelled yet."
+
+
+@dataclass
+class _ClassRowWidgets:
+    root: QWidget
+    header: "_ClickableFrame"
+    body_scroll: QWidget
+    arrow_btn: QToolButton
+    name_label: QLabel
+    swatch: QWidget
+    count_label: QLabel
+    delete_btn: QPushButton
+    name_edit: QLineEdit
+    encoder: QComboBox
+    threshold: QComboBox
+    crop_size: QSpinBox
+    status: QLabel
+
+
+class _WheelGuardComboBox(QComboBox):
+    def wheelEvent(self, event) -> None:  # pragma: no cover - simple Qt guard
+        event.ignore()
+
+
+class _StageSection(QWidget):
+    def __init__(self, title: str, *, expanded: bool = True, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("previewSectionBox")
+        self._toggle = QToolButton(self)
+        self._toggle.setObjectName("previewTrayHeader")
+        self._toggle.setCheckable(True)
+        self._toggle.setChecked(expanded)
+        self._toggle.setText(title)
+        self._toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        self._toggle.setProperty("section", True)
+        self._toggle.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._toggle.toggled.connect(self._on_toggled)
+
+        self._content = QWidget(self)
+        self._content.setObjectName("previewSectionContent")
+        self._content.setVisible(expanded)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        layout.addWidget(self._toggle)
+        layout.addWidget(self._content)
+
+    def content(self) -> QWidget:
+        return self._content
+
+    def setExpanded(self, expanded: bool) -> None:
+        self._toggle.blockSignals(True)
+        try:
+            self._toggle.setChecked(expanded)
+        finally:
+            self._toggle.blockSignals(False)
+        self._toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        self._content.setVisible(expanded)
+
+    def isExpanded(self) -> bool:
+        return self._toggle.isChecked()
+
+    def _on_toggled(self, checked: bool) -> None:
+        self._toggle.setArrowType(Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow)
+        self._content.setVisible(checked)
+
+
+class _ClickableFrame(QFrame):
+    clicked = Signal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event) -> None:  # pragma: no cover - trivial Qt hook
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
 
 
 class _ScanLoadWorker(QThread):
@@ -629,10 +1094,18 @@ class _PreviewImageView(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self.setObjectName("previewImageView")
+        self.setStyleSheet(f"background-color: {_theme.DARK_BG}; color: {_theme.DARK_TEXT};")
         self._title = QLabel("<b>Preview image</b>")
+        self._title.setStyleSheet(
+            f"color: {_theme.DARK_BLUE}; font-weight: 700; padding: 2px 4px;"
+        )
         self._current_state: _PreviewState | None = None
         self._plot = pg.PlotWidget()
-        self._plot.setBackground("w")
+        self._plot.setBackground(_theme.DARK_BG)
+        self._plot.setStyleSheet(
+            f"background-color: {_theme.DARK_BG}; border: none; color: {_theme.DARK_TEXT};"
+        )
         self._plot.setAspectLocked(True)
         self._plot.invertY(True)
         self._plot.showGrid(x=False, y=False)
@@ -642,9 +1115,14 @@ class _PreviewImageView(QWidget):
         self._image = pg.ImageItem(axisOrder="row-major")
         self._plot.addItem(self._image)
         self._plot.scene().sigMouseClicked.connect(self._on_scene_clicked)
+        self._image_shape: tuple[int, int] | None = None
 
         self._caption = QLabel("")
         self._caption.setWordWrap(True)
+        self._caption.setStyleSheet(
+            f"color: {_theme.DARK_TEXT_MUTED}; background-color: {_theme.DARK_SURFACE};"
+            f" border-top: 1px solid {_theme.DARK_BORDER}; padding: 4px 6px;"
+        )
         self._feature_rows: list[PreviewFeatureRow] = []
         self._box_items: list[QGraphicsRectItem] = []
         self._zero_items: list[QGraphicsEllipseItem] = []
@@ -664,6 +1142,7 @@ class _PreviewImageView(QWidget):
         overlay_rows: list[PreviewFeatureRow] | None = None,
         selected_rows: list[PreviewFeatureRow] | None = None,
         zero_points: list[tuple[int, int]] | None = None,
+        reset_view: bool = False,
     ) -> None:
         if state is None:
             self._current_state = None
@@ -671,6 +1150,7 @@ class _PreviewImageView(QWidget):
             self._clear_boxes()
             self._clear_zero_points()
             self._feature_rows = []
+            self._image_shape = None
             self._caption.setText("No preview loaded.")
             return
 
@@ -679,9 +1159,13 @@ class _PreviewImageView(QWidget):
         arr = np.asarray(image, dtype=np.float64)
         if arr.ndim != 2:
             self._image.clear()
+            self._image_shape = None
             self._caption.setText("Preview image is not 2-D.")
         else:
             self._image.setImage(arr, autoLevels=True)
+            if reset_view or self._image_shape != arr.shape:
+                self._plot.setRange(xRange=(0, arr.shape[1]), yRange=(0, arr.shape[0]), padding=0.02)
+            self._image_shape = arr.shape
             self._caption.setText(label)
 
         self._title.setText(f"<b>{state.source_path.name}</b>")
@@ -855,6 +1339,11 @@ class PreviewPanel(QWidget):
         self._group_scan_defaults: dict = {}
         self._feature_scan_defaults: dict = {}
         self._building_table = False
+        self._class_records: dict[str, _ClassRecord] = {}
+        self._class_widgets: dict[str, _ClassRowWidgets] = {}
+        self._active_class_key = ""
+        self._class_add_mode = False
+        self._class_expanded_keys: set[str] = set()
         self._stage = "raw"
         self._zero_plane_points: list[tuple[int, int]] = []
         self._zero_plane_mode = False
@@ -869,6 +1358,15 @@ class PreviewPanel(QWidget):
         self._queue_armed = False
         # Position captured at segmentation-apply time; used as group-scan anchor
         self._preview_home_nm: tuple[float, float] | None = None
+        self._initial_section: _StageSection | None = None
+        self._source_section: _StageSection | None = None
+        self._classification_section: _StageSection | None = None
+        self._scan_section: _StageSection | None = None
+        self._controls_scroll: QScrollArea | None = None
+        self._class_list_content: QWidget | None = None
+        self._class_list_layout: QVBoxLayout | None = None
+        self._class_empty_label: QLabel | None = None
+        self._class_action_btn: QPushButton | None = None
         # Periodic STM scan status poller (2 s)
         self._scan_info_timer = QTimer(self)
         self._scan_info_timer.setInterval(2000)
@@ -890,40 +1388,22 @@ class PreviewPanel(QWidget):
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
+        self.setObjectName("previewWindow")
+        self.setStyleSheet(_preview_stylesheet())
 
         self._status = QLabel("Ready")
+        self._status.setObjectName("previewStatus")
         self._status.setWordWrap(True)
-        self._status.setStyleSheet("""
-            QLabel {
-                background: #eef4ff;
-                color: #102040;
-                border: 1px solid #b8c8e8;
-                border-radius: 4px;
-                padding: 6px 8px;
-                font-weight: 600;
-                min-height: 28px;
-            }
-        """)
         root.addWidget(self._status)
 
         self._scan_info_label = QLabel("")
+        self._scan_info_label.setObjectName("previewScanInfo")
         self._scan_info_label.setWordWrap(True)
-        self._scan_info_label.setStyleSheet("""
-            QLabel {
-                background: #f0fdf4;
-                color: #14532d;
-                border: 1px solid #86efac;
-                border-radius: 4px;
-                padding: 4px 8px;
-                font-family: monospace;
-                min-height: 22px;
-            }
-        """)
         self._scan_info_label.setVisible(False)
         root.addWidget(self._scan_info_label)
 
         self._time_label = QLabel("")
-        self._time_label.setStyleSheet("color: #555; font-style: italic; padding: 2px 4px;")
+        self._time_label.setObjectName("previewTime")
         self._time_label.setVisible(False)
         root.addWidget(self._time_label)
 
@@ -933,87 +1413,75 @@ class PreviewPanel(QWidget):
 
         controls_panel = QWidget()
         controls_panel.setObjectName("previewControls")
-        controls_panel.setStyleSheet("""
-            QWidget#previewControls {
-                background: #f7f9fc;
-            }
-            QWidget#previewControls QLabel {
-                color: #111;
-            }
-            QWidget#previewControls QLineEdit,
-            QWidget#previewControls QComboBox,
-            QWidget#previewControls QDoubleSpinBox,
-            QWidget#previewControls QSpinBox {
-                background-color: #ffffff;
-                color: #111;
-                border: 1px solid #9a9a9a;
-                border-radius: 3px;
-                padding: 2px 6px;
-                min-height: 24px;
-            }
-            QWidget#previewControls QCheckBox {
-                color: #111;
-            }
-            QWidget#previewControls QPushButton {
-                min-height: 28px;
-            }
-        """)
         controls = QVBoxLayout(controls_panel)
-        controls.setContentsMargins(8, 8, 8, 8)
-        controls.setSpacing(10)
+        controls.setContentsMargins(6, 6, 6, 6)
+        controls.setSpacing(6)
 
         self._refresh_btn = QPushButton("Refresh latest")
         self._refresh_btn.clicked.connect(self.refresh_latest)
         self._refresh_btn.setToolTip("Reload the newest .dat file in the selected folder.")
-
-        self._load_raw_btn = QPushButton("Load raw")
-        self._load_raw_btn.clicked.connect(self._show_raw_plane)
-        self._load_raw_btn.setToolTip("Reset the viewer to the raw plane.")
+        self._refresh_btn.setProperty("role", "primary")
+        self._refresh_btn.setMinimumHeight(28)
+        self._refresh_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         self._reset_btn = QPushButton("Reset analysis")
         self._reset_btn.clicked.connect(self._reset_analysis)
-        self._reset_btn.setToolTip("Clear flattening, segmentation, and classification back to the raw image.")
+        self._reset_btn.setToolTip("Clear flattening, segmentation, and class state back to the raw image.")
+        self._reset_btn.setProperty("role", "primary")
 
         self._background_btn = QPushButton("Auto flatten")
         self._background_btn.clicked.connect(self._apply_background)
         self._background_btn.setToolTip("Flatten the current plane using ProbeFlow background correction.")
+        self._background_btn.setProperty("role", "primary")
 
         self._zero_plane_btn = QPushButton("3-point flatten")
         self._zero_plane_btn.setCheckable(True)
         self._zero_plane_btn.toggled.connect(self._toggle_zero_plane_mode)
         self._zero_plane_btn.setToolTip("Click 3 points on the image to subtract the plane they define.")
+        self._zero_plane_btn.setProperty("role", "primary")
 
         self._features_btn = QPushButton("Apply settings")
         self._features_btn.clicked.connect(self._apply_segmentation_settings)
         self._features_btn.setToolTip("Freeze the live segmentation into the feature table.")
+        self._features_btn.setProperty("role", "accent")
+        self._features_btn.setMinimumHeight(32)
 
         self._label_btn = QPushButton("Label selected")
         self._label_btn.clicked.connect(self._label_selected_samples)
-        self._label_btn.setToolTip("Assign the sample name to selected particles.")
+        self._label_btn.setToolTip("Assign the current class name to selected particles.")
+        self._label_btn.setProperty("role", "primary")
 
         self._classify_btn = QPushButton("Classify")
         self._classify_btn.clicked.connect(self._classify_particles)
         self._classify_btn.setToolTip("Run ProbeFlow-backed classification on the labeled samples.")
+        self._classify_btn.setProperty("role", "accent")
+        self._classify_btn.setMinimumHeight(32)
 
         self._scan_selected_btn = QPushButton("Queue selected")
         self._scan_selected_btn.clicked.connect(self._scan_selected_features)
         self._scan_selected_btn.setToolTip("Queue the checked molecules for follow-up scans.")
+        self._scan_selected_btn.setProperty("role", "primary")
         self._scan_groups_btn = QPushButton("Scan as Groups")
         self._scan_groups_btn.clicked.connect(self._scan_selected_as_groups)
         self._scan_groups_btn.setToolTip(
             "Group checked features spatially and scan each group in one frame."
         )
+        self._scan_groups_btn.setProperty("role", "primary")
         self._stop_scan_btn = QPushButton("Stop scan")
         self._stop_scan_btn.clicked.connect(self._stop_active_scan)
         self._stop_scan_btn.setToolTip("Request graceful stop after the current feature/group finishes.")
-        self._stop_scan_btn.setStyleSheet("QPushButton { color: #c0392b; font-weight: bold; }")
-        self._select_class_btn = QPushButton("Select class")
-        self._select_class_btn.clicked.connect(self._select_class_rows_from_combo)
-        self._select_class_btn.setToolTip("Select every structure that belongs to the chosen class.")
+        self._stop_scan_btn.setProperty("role", "danger")
         self._queue_class_btn = QPushButton("Queue class")
-        self._queue_class_btn.clicked.connect(self._queue_class_from_combo)
-        self._queue_class_btn.setToolTip("Select the chosen class and queue a follow-up scan for it.")
-        self._load_raw_btn.setEnabled(False)
+        self._queue_class_btn.clicked.connect(self._queue_class_from_active)
+        self._queue_class_btn.setToolTip("Queue a follow-up scan for the active class.")
+        self._queue_class_btn.setProperty("role", "primary")
+        self._queue_class_btn.setMinimumHeight(28)
+        self._background_btn.setMinimumHeight(28)
+        self._zero_plane_btn.setMinimumHeight(28)
+        self._reset_btn.setMinimumHeight(28)
+        self._scan_selected_btn.setMinimumHeight(28)
+        self._scan_groups_btn.setMinimumHeight(28)
+        self._stop_scan_btn.setMinimumHeight(28)
         self._background_btn.setEnabled(False)
         self._features_btn.setEnabled(False)
         self._label_btn.setEnabled(False)
@@ -1021,17 +1489,20 @@ class PreviewPanel(QWidget):
         self._scan_selected_btn.setEnabled(False)
         self._scan_groups_btn.setEnabled(False)
         self._stop_scan_btn.setEnabled(False)
-        self._select_class_btn.setEnabled(False)
         self._queue_class_btn.setEnabled(False)
         self._reset_btn.setEnabled(False)
-        controls.addWidget(self._section_label("Source"))
+        self._source_section = _StageSection("Source", expanded=True)
+        source_layout = QVBoxLayout(self._source_section.content())
+        source_layout.setContentsMargins(6, 6, 6, 6)
+        source_layout.setSpacing(5)
+
         source_form = QFormLayout()
         source_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         source_form.setFormAlignment(Qt.AlignmentFlag.AlignTop)
         source_form.setHorizontalSpacing(10)
-        source_form.setVerticalSpacing(8)
+        source_form.setVerticalSpacing(4)
         source_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        controls.addLayout(source_form)
+        source_layout.addLayout(source_form)
 
         self._source_path_edit = QLineEdit()
         self._source_path_edit.setReadOnly(True)
@@ -1041,50 +1512,68 @@ class PreviewPanel(QWidget):
 
         self._recent_list = QListWidget()
         self._recent_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self._recent_list.setMinimumHeight(104)
+        self._recent_list.setMinimumHeight(42)
+        self._recent_list.setMaximumHeight(62)
+        self._recent_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._recent_list.itemDoubleClicked.connect(self._open_recent_item)
-        source_form.addRow("Recent scans", self._recent_list)
-
-        for button in (
-            self._refresh_btn,
-            self._load_raw_btn,
-            self._reset_btn,
-            self._background_btn,
-            self._zero_plane_btn,
-        ):
-            controls.addWidget(button)
+        self._recent_label = QLabel("Recent scans")
+        source_form.addRow(self._recent_label, self._recent_list)
+        self._recent_empty_label = QLabel("No recent scans yet.")
+        self._recent_empty_label.setStyleSheet(
+            f"color: {_theme.DARK_TEXT_MUTED}; font-style: italic; padding: 0 2px 4px 2px;"
+        )
+        source_layout.addWidget(self._recent_empty_label)
 
         self._folder_edit = QLineEdit()
         self._folder_edit.setPlaceholderText("Folder containing completed .dat scans")
         self._style_control(self._folder_edit)
         source_form.addRow("Scan folder", self._folder_edit)
 
-        browse_btn = QPushButton("Browse folder...")
+        source_buttons = QHBoxLayout()
+        source_buttons.setContentsMargins(0, 0, 0, 0)
+        source_buttons.setSpacing(6)
+
+        browse_btn = QPushButton("Browse folder")
         browse_btn.clicked.connect(self._pick_folder)
-        self._style_button(browse_btn)
-        source_form.addRow("", browse_btn)
+        browse_btn.setProperty("role", "primary")
+        browse_btn.setMinimumHeight(28)
+        browse_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        source_buttons.addWidget(browse_btn)
 
-        open_btn = QPushButton("Open scan...")
+        open_btn = QPushButton("Open scan")
         open_btn.clicked.connect(self._pick_scan_file)
-        self._style_button(open_btn)
-        source_form.addRow("", open_btn)
+        open_btn.setProperty("role", "primary")
+        open_btn.setMinimumHeight(28)
+        open_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        source_buttons.addWidget(open_btn)
 
-        controls.addWidget(self._section_label("View"))
+        source_buttons.addWidget(self._refresh_btn)
+        source_layout.addLayout(source_buttons)
+        controls.addWidget(self._source_section)
+
+        self._initial_section = _StageSection("Initial Settings", expanded=True)
+        initial_layout = QVBoxLayout(self._initial_section.content())
+        initial_layout.setContentsMargins(6, 6, 6, 6)
+        initial_layout.setSpacing(5)
+
+        view_title = self._section_label("View")
+        initial_layout.addWidget(view_title)
         view_form = QFormLayout()
         view_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         view_form.setFormAlignment(Qt.AlignmentFlag.AlignTop)
         view_form.setHorizontalSpacing(10)
-        view_form.setVerticalSpacing(8)
+        view_form.setVerticalSpacing(4)
         view_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        controls.addLayout(view_form)
+        initial_layout.addLayout(view_form)
 
         self._plane_spin = QSpinBox()
         self._plane_spin.setRange(0, 0)
+        self._plane_spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self._plane_spin.valueChanged.connect(self._plane_changed)
         self._style_control(self._plane_spin)
         view_form.addRow("Plane", self._plane_spin)
 
-        self._display_mode = QComboBox()
+        self._display_mode = _WheelGuardComboBox()
         self._display_mode.addItem("Raw", "raw")
         self._display_mode.addItem("Background-corrected", "background_corrected")
         self._display_mode.addItem("Background image", "background_image")
@@ -1095,17 +1584,17 @@ class PreviewPanel(QWidget):
         self._flatten_section = QWidget()
         flatten_container = QVBoxLayout(self._flatten_section)
         flatten_container.setContentsMargins(0, 0, 0, 0)
-        flatten_container.setSpacing(8)
+        flatten_container.setSpacing(4)
         flatten_container.addWidget(self._section_label("Flatten"))
         flat_form = QFormLayout()
         flat_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         flat_form.setFormAlignment(Qt.AlignmentFlag.AlignTop)
         flat_form.setHorizontalSpacing(10)
-        flat_form.setVerticalSpacing(8)
+        flat_form.setVerticalSpacing(4)
         flat_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         flatten_container.addLayout(flat_form)
 
-        self._background_mode = QComboBox()
+        self._background_mode = _WheelGuardComboBox()
         self._background_mode.addItems(["linear", "poly2", "poly3", "low_pass"])
         self._style_control(self._background_mode)
         flat_form.addRow("Background", self._background_mode)
@@ -1114,6 +1603,7 @@ class PreviewPanel(QWidget):
         self._background_strength.setRange(0.5, 50.0)
         self._background_strength.setDecimals(1)
         self._background_strength.setValue(5.0)
+        self._background_strength.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self._style_control(self._background_strength)
         flat_form.addRow("Blur", self._background_strength)
 
@@ -1121,22 +1611,30 @@ class PreviewPanel(QWidget):
         self._zero_status.setWordWrap(True)
         flat_form.addRow("Status", self._zero_status)
 
-        controls.addWidget(self._flatten_section)
+        flatten_buttons = QHBoxLayout()
+        flatten_buttons.setContentsMargins(0, 0, 0, 0)
+        flatten_buttons.setSpacing(6)
+        flatten_buttons.addWidget(self._background_btn)
+        flatten_buttons.addWidget(self._zero_plane_btn)
+        flatten_buttons.addWidget(self._reset_btn)
+        flatten_buttons.addStretch(1)
+        flatten_container.addLayout(flatten_buttons)
+        initial_layout.addWidget(self._flatten_section)
 
         self._segmentation_section = QWidget()
         seg_container = QVBoxLayout(self._segmentation_section)
         seg_container.setContentsMargins(0, 0, 0, 0)
-        seg_container.setSpacing(8)
+        seg_container.setSpacing(4)
         seg_container.addWidget(self._section_label("Segmentation"))
         seg_form = QFormLayout()
         seg_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         seg_form.setFormAlignment(Qt.AlignmentFlag.AlignTop)
         seg_form.setHorizontalSpacing(10)
-        seg_form.setVerticalSpacing(8)
+        seg_form.setVerticalSpacing(4)
         seg_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         seg_container.addLayout(seg_form)
 
-        self._feature_mode = QComboBox()
+        self._feature_mode = _WheelGuardComboBox()
         self._feature_mode.addItems([
             "segmentation_first",
             "segmentation_only",
@@ -1176,68 +1674,82 @@ class PreviewPanel(QWidget):
         self._sigma_clip.setRange(0.0, 10.0)
         self._sigma_clip.setDecimals(1)
         self._sigma_clip.setValue(2.0)
+        self._sigma_clip.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self._style_control(self._sigma_clip)
         seg_form.addRow("sigma-clip", self._sigma_clip)
 
-        self._features_btn.setVisible(False)
         seg_container.addWidget(self._features_btn)
-        controls.addWidget(self._segmentation_section)
+        initial_layout.addWidget(self._segmentation_section)
 
-        self._classification_section = QWidget()
-        class_container = QVBoxLayout(self._classification_section)
-        class_container.setContentsMargins(0, 0, 0, 0)
-        class_container.setSpacing(8)
-        class_container.addWidget(self._section_label("Classification"))
-        class_form = QFormLayout()
-        class_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        class_form.setFormAlignment(Qt.AlignmentFlag.AlignTop)
-        class_form.setHorizontalSpacing(10)
-        class_form.setVerticalSpacing(8)
-        class_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        class_container.addLayout(class_form)
+        controls.addWidget(self._initial_section)
 
-        self._sample_name_edit = QLineEdit()
-        self._sample_name_edit.setPlaceholderText("Class name for selected samples")
-        self._style_control(self._sample_name_edit)
-        class_form.addRow("Sample name", self._sample_name_edit)
+        self._classification_section = _StageSection("Classification", expanded=False)
+        class_container = QVBoxLayout(self._classification_section.content())
+        class_container.setContentsMargins(6, 6, 6, 6)
+        class_container.setSpacing(4)
 
-        self._class_pick_combo = QComboBox()
-        self._style_control(self._class_pick_combo)
-        class_form.addRow("Target class", self._class_pick_combo)
+        class_top = QHBoxLayout()
+        class_top.setContentsMargins(0, 0, 0, 0)
+        class_top.setSpacing(6)
+        class_top.addWidget(self._label_btn)
+        self._add_class_btn = QPushButton("Add class")
+        self._add_class_btn.clicked.connect(self._add_class)
+        self._add_class_btn.setProperty("role", "primary")
+        self._add_class_btn.setMinimumHeight(28)
+        self._add_class_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        class_top.addWidget(self._add_class_btn)
+        class_container.addLayout(class_top)
 
-        self._encoder_mode = QComboBox()
-        self._encoder_mode.addItems(["raw", "pca_kmeans", "auto"])
-        self._style_control(self._encoder_mode)
-        class_form.addRow("Encoding", self._encoder_mode)
+        self._target_class_label = QLabel("Target class: none")
+        self._target_class_label.setObjectName("previewClassStatus")
+        self._target_class_label.setWordWrap(True)
+        class_container.addWidget(self._target_class_label)
 
-        self._class_threshold_mode = QComboBox()
-        self._class_threshold_mode.addItems(["gmm", "otsu", "distribution"])
-        self._style_control(self._class_threshold_mode)
-        class_form.addRow("Threshold", self._class_threshold_mode)
-
-        self._crop_size = QSpinBox()
-        self._crop_size.setRange(16, 256)
-        self._crop_size.setValue(48)
-        self._style_control(self._crop_size)
-        class_form.addRow("Crop size", self._crop_size)
-
-        self._sample_status = QLabel("No samples labeled yet.")
+        self._sample_status = QLabel("No Feature-classes labelled yet.")
+        self._sample_status.setObjectName("previewClassStatus")
         self._sample_status.setWordWrap(True)
-        class_form.addRow("Status", self._sample_status)
+        class_container.addWidget(self._sample_status)
 
-        class_pick_buttons = QHBoxLayout()
-        class_pick_buttons.setContentsMargins(0, 0, 0, 0)
-        class_pick_buttons.setSpacing(8)
-        class_pick_buttons.addWidget(self._select_class_btn)
-        class_pick_buttons.addWidget(self._queue_class_btn)
-        class_container.addLayout(class_pick_buttons)
+        self._class_empty_label = QLabel("No Feature-classes labelled")
+        self._class_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._class_empty_label.setStyleSheet(
+            f"color: {_theme.DARK_TEXT_MUTED}; font-style: italic; padding: 6px 8px;"
+        )
+        class_container.addWidget(self._class_empty_label)
 
-        class_container.addWidget(self._label_btn)
+        self._class_list_content = QWidget()
+        self._class_list_content.setObjectName("previewClassListContent")
+        self._class_list_layout = QVBoxLayout(self._class_list_content)
+        self._class_list_layout.setContentsMargins(0, 0, 0, 0)
+        self._class_list_layout.setSpacing(2)
+        class_container.addWidget(self._class_list_content)
+
         class_container.addWidget(self._classify_btn)
-        class_container.addWidget(self._scan_selected_btn)
-        class_container.addWidget(self._scan_groups_btn)
-        class_container.addWidget(self._stop_scan_btn)
         controls.addWidget(self._classification_section)
+
+        self._scan_section = _StageSection("Scan", expanded=False)
+        scan_container = QVBoxLayout(self._scan_section.content())
+        scan_container.setContentsMargins(6, 6, 6, 6)
+        scan_container.setSpacing(5)
+        scan_hub = QWidget()
+        scan_hub.setObjectName("previewScanHub")
+        scan_hub_layout = QVBoxLayout(scan_hub)
+        scan_hub_layout.setContentsMargins(6, 6, 6, 6)
+        scan_hub_layout.setSpacing(5)
+        scan_row_a = QHBoxLayout()
+        scan_row_a.setContentsMargins(0, 0, 0, 0)
+        scan_row_a.setSpacing(6)
+        scan_row_a.addWidget(self._scan_selected_btn)
+        scan_row_a.addWidget(self._queue_class_btn)
+        scan_hub_layout.addLayout(scan_row_a)
+        scan_row_b = QHBoxLayout()
+        scan_row_b.setContentsMargins(0, 0, 0, 0)
+        scan_row_b.setSpacing(6)
+        scan_row_b.addWidget(self._scan_groups_btn)
+        scan_row_b.addWidget(self._stop_scan_btn)
+        scan_hub_layout.addLayout(scan_row_b)
+        scan_container.addWidget(scan_hub)
+        controls.addWidget(self._scan_section)
 
         self._feature_mode.currentIndexChanged.connect(lambda *_: self._schedule_live_segmentation())
         self._invert_features.toggled.connect(lambda *_: self._schedule_live_segmentation())
@@ -1245,7 +1757,8 @@ class PreviewPanel(QWidget):
         self._min_area_slider.valueChanged.connect(lambda value: self._on_segmentation_slider_changed(value))
         self._max_area_slider.valueChanged.connect(lambda value: self._on_segmentation_slider_changed(value))
         self._sigma_clip.valueChanged.connect(lambda *_: self._schedule_live_segmentation())
-        self._classification_section.setVisible(False)
+        self._classification_section.setExpanded(False)
+        self._scan_section.setExpanded(False)
 
         controls.addStretch(1)
 
@@ -1254,21 +1767,29 @@ class PreviewPanel(QWidget):
         controls_widget.setFrameShape(QFrame.Shape.NoFrame)
         controls_widget.setWidget(controls_panel)
         controls_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        controls_widget.setMinimumWidth(470)
-        controls_widget.setMaximumWidth(620)
+        controls_widget.setObjectName("previewControlsScroll")
+        controls_widget.setMinimumWidth(410)
+        controls_widget.setMaximumWidth(540)
+        controls_widget.setStyleSheet("background: transparent; border: none;")
+        controls_widget.viewport().setStyleSheet("background: transparent;")
+        self._controls_scroll = controls_widget
 
         body = QSplitter(Qt.Orientation.Horizontal)
         body.setChildrenCollapsible(False)
         body.addWidget(self._viewer)
         body.addWidget(controls_widget)
-        body.setStretchFactor(0, 4)
-        body.setStretchFactor(1, 1)
-        body.setSizes([1000, 360])
+        body.setStretchFactor(0, 5)
+        body.setStretchFactor(1, 2)
+        body.setSizes([1180, 340])
         table_box = QWidget()
+        table_box.setObjectName("previewTableBox")
         table_layout = QVBoxLayout(table_box)
         table_layout.setContentsMargins(0, 0, 0, 0)
-        table_layout.addWidget(QLabel("<b>Detected features</b>"))
+        table_title = QLabel("Detected features")
+        table_title.setObjectName("previewSection")
+        table_layout.addWidget(table_title)
         self._feature_table = QTableWidget(0, 10)
+        self._feature_table.setObjectName("previewFeatureTable")
         self._feature_table.setHorizontalHeaderLabels([
             "Use",
             "#",
@@ -1292,9 +1813,11 @@ class PreviewPanel(QWidget):
         table_buttons = QHBoxLayout()
         table_buttons.addStretch(1)
         select_all_btn = QPushButton("Select all")
+        select_all_btn.setProperty("role", "primary")
         select_all_btn.clicked.connect(lambda: self._set_all_selected(True))
         table_buttons.addWidget(select_all_btn)
         clear_btn = QPushButton("Clear")
+        clear_btn.setProperty("role", "primary")
         clear_btn.clicked.connect(lambda: self._set_all_selected(False))
         table_buttons.addWidget(clear_btn)
         table_layout.addLayout(table_buttons)
@@ -1309,6 +1832,8 @@ class PreviewPanel(QWidget):
         main_splitter.setSizes([760, 240])
         root.addWidget(main_splitter, 1)
 
+        self._apply_preview_button_styles()
+        self._refresh_recent_list()
         self._set_stage("raw")
 
     # ------------------------------------------------------------------
@@ -1377,9 +1902,8 @@ class PreviewPanel(QWidget):
         self._set_plane_state(self._plane_spin.value(), clear_analysis=True)
         self._set_display_mode("raw")
         self._set_stage("raw")
-        self._load_raw_btn.setEnabled(True)
         self._background_btn.setEnabled(True)
-        self._sample_status.setText("No samples labeled yet.")
+        self._sample_status.setText("No Feature-classes labelled yet.")
         self._show_status(f"{source.name}: raw plane loaded")
         self.log_message.emit(f"Preview raw scan loaded: {source.name}")
 
@@ -1434,6 +1958,7 @@ class PreviewPanel(QWidget):
         self._set_stage("raw")
         self._refresh_class_selector()
         self._source_path_edit.setText(str(self._current_scan.source_path))
+        self._sample_status.setText("No Feature-classes labelled yet.")
         self._show_status(f"{Path(self._current_scan.source_path).name}: analysis reset to raw")
         self.log_message.emit(f"Analysis reset for {Path(self._current_scan.source_path).name}")
 
@@ -1513,8 +2038,14 @@ class PreviewPanel(QWidget):
         self._current_state.sample_labels.clear()
         self._current_state.classifications.clear()
         self._current_state.class_colors.clear()
+        self._class_records.clear()
+        self._class_widgets.clear()
+        self._active_class_key = ""
+        self._class_add_mode = False
+        self._class_expanded_keys.clear()
         self._clear_feature_table()
         self._preview_selected_indices.clear()
+        self._refresh_class_tree()
         self._set_stage("segmentation")
         self._set_display_mode("background_corrected")
         self._seed_segmentation_controls_from_plane(self._current_state.corrected_plane)
@@ -1543,10 +2074,16 @@ class PreviewPanel(QWidget):
         self._current_state.sample_labels.clear()
         self._current_state.classifications.clear()
         self._current_state.class_colors.clear()
+        self._class_records.clear()
+        self._class_widgets.clear()
+        self._active_class_key = ""
+        self._class_add_mode = False
+        self._class_expanded_keys.clear()
         self._clear_feature_table()
-        self._sample_status.setText("No samples labeled yet.")
+        self._sample_status.setText("No Feature-classes labelled yet.")
         self._zero_plane_points = []
         self._preview_selected_indices.clear()
+        self._refresh_class_tree()
         self._set_stage("segmentation")
         self._set_display_mode("background_corrected")
         self._seed_segmentation_controls_from_plane(self._current_state.corrected_plane)
@@ -1717,6 +2254,12 @@ class PreviewPanel(QWidget):
         self._current_state.particles = self._current_state.preview_particles
         self._current_state.sample_labels.clear()
         self._current_state.classifications.clear()
+        self._current_state.class_colors.clear()
+        self._class_records.clear()
+        self._class_widgets.clear()
+        self._active_class_key = ""
+        self._class_add_mode = False
+        self._class_expanded_keys.clear()
         self._preview_selected_indices = set(selected_indices)
         self._populate_feature_table(
             self._current_state.feature_rows,
@@ -1726,6 +2269,7 @@ class PreviewPanel(QWidget):
         self._render_current_state()
         self._set_stage("classification")
         self._render_current_state()
+        self._sample_status.setText("No Feature-classes labelled yet.")
 
         # Capture tip position as the anchor reference for all follow-up group scans.
         # Reading here (not at scan-start time) ensures groups stay within the wide image
@@ -1753,39 +2297,37 @@ class PreviewPanel(QWidget):
         if self._current_state is None or not self._current_state.feature_rows:
             QMessageBox.information(self, "No features", "Apply segmentation settings before labeling samples.")
             return
-        name = self._sample_name_edit.text().strip()
-        if not name:
-            QMessageBox.information(self, "Missing name", "Enter a class name before labeling samples.")
-            return
         selected = self._selected_feature_rows()
         if not selected:
             QMessageBox.information(self, "No selection", "Select one or more particles first.")
             return
+        record = self._active_class_record()
+        if record is None:
+            record = self._ensure_class_record(self._next_default_class_name(), placeholder_name=True)
+            self._class_expanded_keys.add(record.key)
+            self._set_active_class_key(record.key)
         for row in selected:
-            self._current_state.sample_labels[row.index] = name
-        self._register_class_color(name)
-        self._sample_status.setText(f"{len(self._current_state.sample_labels)} sample(s) labeled.")
+            for other in self._class_records.values():
+                if other.key != record.key:
+                    other.sample_indices.discard(row.index)
+            record.sample_indices.add(row.index)
+            self._current_state.sample_labels[row.index] = record.label
+            self._current_state.classifications[row.index] = record.label
+        record.status = f"{len(record.sample_indices)} sample(s) labeled."
+        self._sample_status.setText(
+            f"{len(self._class_records)} class(es), {len(self._current_state.sample_labels)} labeled sample(s)."
+        )
         self._populate_feature_table(
             self._current_state.feature_rows,
             selected_indices=self._selected_feature_indices_from_table(),
         )
-        self._refresh_class_selector(name)
-        self._building_table = True
-        try:
-            selected_indices = {row.index for row in selected}
-            for row_idx in range(self._feature_table.rowCount()):
-                item = self._feature_table.item(row_idx, 0)
-                if item is None:
-                    continue
-                data = item.data(Qt.ItemDataRole.UserRole)
-                if isinstance(data, int) and data in selected_indices:
-                    item.setCheckState(Qt.CheckState.Unchecked)
-        finally:
-            self._building_table = False
+        self._sync_class_records_from_state()
+        self._active_class_key = record.key
+        self._class_add_mode = True
         self._feature_table.clearSelection()
         self._render_current_state()
-        self._show_status(f"Assigned class {name!r} to {len(selected)} selected feature(s)")
-        self.log_message.emit(f"Sample label applied: {name!r}")
+        self._show_status(f"Assigned class {record.label!r} to {len(selected)} selected feature(s)")
+        self.log_message.emit(f"Sample label applied: {record.label!r}")
 
     def _classify_particles(self) -> None:
         if self._current_state is None or not self._current_state.feature_rows:
@@ -1799,8 +2341,9 @@ class PreviewPanel(QWidget):
             QMessageBox.information(self, "Busy", "Classification is already running.")
             return
 
-        encoder = str(self._encoder_mode.currentText())
-        threshold_method = str(self._class_threshold_mode.currentText())
+        active = self._active_class_record()
+        encoder = str(active.encoder if active is not None else "raw")
+        threshold_method = str(active.threshold if active is not None else "gmm")
         plane = self._current_state.corrected_plane if self._current_state.corrected_plane is not None else self._current_state.raw_plane
         self._show_status(f"Classifying {self._current_source.name}...")
         self._classification_worker = _ClassificationWorker(
@@ -1823,12 +2366,15 @@ class PreviewPanel(QWidget):
             if str(class_name).strip().lower() and str(class_name).strip().lower() != "other":
                 self._register_class_color(str(class_name))
         self._refresh_class_selector()
-        self._set_stage("classification")
+        self._set_stage("scan")
         self._populate_feature_table(
             self._current_state.feature_rows,
             selected_indices=self._selected_feature_indices_from_table(),
         )
         self._render_current_state()
+        self._sample_status.setText(
+            f"{len(self._class_records)} class(es), {len(self._current_state.classifications)} classified sample(s)."
+        )
         self._show_status(
             f"{self._current_source.name}: classification complete using {used_encoder}"
         )
@@ -1866,19 +2412,18 @@ class PreviewPanel(QWidget):
         self._current_state.classifications = {}
         self._current_state.class_colors = {}
         self._current_state.warnings = ()
+        self._class_records.clear()
+        self._class_widgets.clear()
+        self._active_class_key = ""
+        self._class_add_mode = False
+        self._class_expanded_keys.clear()
         self._zero_plane_points = []
         if clear_analysis:
             self._current_state.corrected_plane = None
             self._current_state.background_image = None
             self._clear_feature_table()
-            if hasattr(self, "_class_pick_combo"):
-                self._class_pick_combo.blockSignals(True)
-                try:
-                    self._class_pick_combo.clear()
-                finally:
-                    self._class_pick_combo.blockSignals(False)
-            self._select_class_btn.setEnabled(False)
             self._queue_class_btn.setEnabled(False)
+            self._refresh_class_tree()
         self._set_display_mode("raw")
         if plane_index < len(plane_names):
             self._viewer._title.setText(f"<b>{Path(self._current_scan.source_path).name} | {plane_names[plane_index]}</b>")
@@ -1890,6 +2435,7 @@ class PreviewPanel(QWidget):
         if self._current_state is None:
             self._viewer.set_state(None, display_mode="raw")
             return
+        reset_view = self._viewer._current_state is not self._current_state
         overlay_rows = [
             replace(row, label=self._row_class_label(row.index))
             for row in list(self._current_state.feature_rows or self._current_state.preview_rows)
@@ -1900,6 +2446,7 @@ class PreviewPanel(QWidget):
             overlay_rows=overlay_rows,
             selected_rows=self._highlighted_feature_rows(overlay_rows),
             zero_points=self._zero_plane_points,
+            reset_view=reset_view,
         )
 
     def _set_display_mode(self, mode: str) -> None:
@@ -2038,127 +2585,26 @@ class PreviewPanel(QWidget):
             return self._current_state.classifications[feature_index]
         return ""
 
-    def _available_class_labels(self) -> list[str]:
-        if self._current_state is None:
-            return []
-        rows = self._current_state.feature_rows or self._current_state.preview_rows
-        if not rows:
-            return []
-        seen: dict[str, str] = {}
-        for row in rows:
-            label = self._row_class_label(row.index).strip()
-            key = label.lower()
-            if not key or key == "other":
-                continue
-            if key not in seen:
-                seen[key] = label
-        return list(seen.values())
-
-    def _refresh_class_selector(self, preserve: str | None = None) -> None:
-        if not hasattr(self, "_class_pick_combo"):
-            return
-        labels = self._available_class_labels()
-        previous = str(preserve or self._class_pick_combo.currentData() or self._class_pick_combo.currentText()).strip().lower()
-        self._class_pick_combo.blockSignals(True)
-        try:
-            self._class_pick_combo.clear()
-            self._class_pick_combo.addItem("Choose class", "")
-            for label in labels:
-                self._class_pick_combo.addItem(label, label.lower())
-            if previous:
-                idx = self._class_pick_combo.findData(previous)
-                if idx >= 0:
-                    self._class_pick_combo.setCurrentIndex(idx)
-        finally:
-            self._class_pick_combo.blockSignals(False)
-        class_enabled = self._stage == "classification" and self._current_state is not None and bool(self._current_state.feature_rows)
-        enabled = class_enabled and len(labels) > 0
-        self._select_class_btn.setEnabled(enabled)
-        self._queue_class_btn.setEnabled(enabled)
-
-    def _current_class_key(self) -> str:
-        if not hasattr(self, "_class_pick_combo"):
-            return ""
-        data = self._class_pick_combo.currentData()
-        if isinstance(data, str) and data.strip():
-            return data.strip().lower()
-        text = self._class_pick_combo.currentText().strip().lower()
-        if not text or text == "choose class":
-            return ""
-        return text
-
-    def _select_class_rows_from_combo(self) -> None:
-        if self._current_state is None:
-            return
-        class_key = self._current_class_key()
-        if not class_key:
-            self._show_status("Choose a class before selecting rows.")
-            return
-        count = self._select_class_rows(class_key)
-        if count == 0:
-            self._show_status(f"No rows found for class {class_key!r}")
-
-    def _queue_class_from_combo(self) -> None:
-        if self._current_state is None:
-            return
-        class_key = self._current_class_key()
-        if not class_key:
-            self._show_status("Choose a class before queueing scans.")
-            return
-        count = self._select_class_rows(class_key)
-        if count == 0:
-            self._show_status(f"No rows found for class {class_key!r}")
-            return
-        self._scan_selected_features()
-
-    def _select_class_rows(self, class_key: str) -> int:
-        if self._current_state is None:
-            return 0
-        target = str(class_key).strip().lower()
-        if not target:
-            return 0
-        rows = self._current_state.feature_rows or self._current_state.preview_rows
-        if not rows:
-            return 0
-        matched_row_indices: list[int] = []
-        self._building_table = True
-        try:
-            for row_idx, row in enumerate(rows):
-                item = self._feature_table.item(row_idx, 0)
-                if item is None:
-                    continue
-                row_key = self._row_class_label(row.index).strip().lower()
-                checked = row_key == target
-                item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
-                if checked:
-                    matched_row_indices.append(row.index)
-        finally:
-            self._building_table = False
-        self._preview_selected_indices = set(matched_row_indices)
-        self._feature_table.clearSelection()
-        self._render_current_state()
-        return len(matched_row_indices)
-
     def _register_class_color(self, label: str) -> str:
         if self._current_state is None:
-            return "#2ecc71"
+            return _theme.DARK_BLUE
         key = str(label).strip().lower()
         if not key:
-            return "#2ecc71"
+            return _theme.DARK_BLUE
         existing = self._current_state.class_colors.get(key)
         if existing:
             return existing
         palette = [
-            "#3498db",
-            "#e74c3c",
-            "#9b59b6",
-            "#e67e22",
-            "#1abc9c",
-            "#f1c40f",
-            "#ff66cc",
-            "#00bcd4",
-            "#8e44ad",
-            "#2ecc71",
+            _theme.DARK_BLUE,
+            "#f97316",
+            "#a855f7",
+            "#22c55e",
+            "#ef4444",
+            "#14b8a6",
+            "#eab308",
+            "#06b6d4",
+            "#fb7185",
+            "#8b5cf6",
         ]
         used = {str(value).lower() for value in self._current_state.class_colors.values()}
         for candidate in palette:
@@ -2168,6 +2614,600 @@ class PreviewPanel(QWidget):
         color = palette[len(self._current_state.class_colors) % len(palette)]
         self._current_state.class_colors[key] = color
         return color
+
+    def _sync_class_records_from_state(self) -> None:
+        previous = {
+            key: _ClassRecord(
+                key=rec.key,
+                label=rec.label,
+                color=rec.color,
+                name_is_placeholder=rec.name_is_placeholder,
+                sample_indices=set(),
+                encoder=rec.encoder,
+                threshold=rec.threshold,
+                crop_size=rec.crop_size,
+                status=rec.status,
+            )
+            for key, rec in self._class_records.items()
+        }
+        self._class_records = {}
+        if self._current_state is None:
+            self._refresh_class_tree()
+            return
+        merged: dict[str, _ClassRecord] = {}
+        for idx, label in self._current_state.sample_labels.items():
+            key = str(label).strip().lower()
+            if not key or key == "other":
+                continue
+            rec = merged.get(key)
+            if rec is None:
+                base = previous.get(key)
+                rec = base if base is not None else _ClassRecord(
+                    key=key,
+                    label=str(label),
+                    color=self._register_class_color(str(label)),
+                    name_is_placeholder=False,
+                )
+                merged[key] = rec
+            rec.sample_indices.add(int(idx))
+            rec.status = f"{len(rec.sample_indices)} sample(s) labeled."
+        for idx, label in self._current_state.classifications.items():
+            key = str(label).strip().lower()
+            if not key or key == "other":
+                continue
+            rec = merged.get(key)
+            if rec is None:
+                base = previous.get(key)
+                rec = base if base is not None else _ClassRecord(
+                    key=key,
+                    label=str(label),
+                    color=self._register_class_color(str(label)),
+                    name_is_placeholder=False,
+                )
+                merged[key] = rec
+            rec.sample_indices.add(int(idx))
+            if not rec.status or rec.status.startswith("No samples"):
+                rec.status = f"{len(rec.sample_indices)} sample(s) labeled."
+        for key, rec in previous.items():
+            if key not in merged:
+                merged[key] = rec
+        self._class_records = merged
+        self._refresh_class_tree()
+
+    def _active_class_record(self) -> _ClassRecord | None:
+        return self._class_records.get(self._active_class_key) if self._active_class_key else None
+
+    def _available_class_labels(self) -> list[str]:
+        return [rec.label for rec in self._class_records.values() if rec.label.strip()]
+
+    def _refresh_class_selector(self, preserve: str | None = None) -> None:
+        self._sync_class_records_from_state()
+        if self._current_state is None:
+            self._queue_class_btn.setEnabled(False)
+            return
+        has_classes = bool(self._class_records)
+        has_features = bool(self._current_state.feature_rows)
+        enabled = self._stage in {"classification", "scan"} and has_classes and has_features
+        self._queue_class_btn.setEnabled(enabled and bool(self._active_class_key))
+        if preserve:
+            self._set_active_class_key(preserve, preserve_mode=True)
+
+    def _current_class_key(self) -> str:
+        return self._active_class_key
+
+    def _toggle_active_class_key(self, class_key: str) -> None:
+        key = str(class_key).strip().lower()
+        if not key:
+            self._set_active_class_key("")
+            return
+        if key == self._active_class_key:
+            self._set_active_class_key("")
+            return
+        self._set_active_class_key(key)
+        self._class_add_mode = True
+        self._show_status(f"Adding samples to class {self._active_class_record().label!r}.")
+
+    def _set_active_class_key(self, class_key: str, *, preserve_mode: bool = False) -> None:
+        key = str(class_key).strip().lower()
+        if not key:
+            previous_samples = set()
+            previous = self._active_class_record()
+            if previous is not None:
+                previous_samples = set(previous.sample_indices)
+            self._active_class_key = ""
+            self._class_add_mode = False
+            self._target_class_label.setText("Target class: none")
+            self._queue_class_btn.setEnabled(False)
+            if previous_samples and self._current_state is not None:
+                selected = self._selected_feature_indices_from_table()
+                selected.difference_update(previous_samples)
+                if self._current_state.feature_rows:
+                    self._populate_feature_table(
+                        self._current_state.feature_rows,
+                        selected_indices=selected,
+                    )
+                elif self._current_state.preview_rows:
+                    self._preview_selected_indices = selected
+            self._refresh_class_tree()
+            self._update_class_summary_text()
+            self._render_current_state()
+            return
+        if key not in self._class_records:
+            return
+        self._active_class_key = key
+        record = self._class_records[key]
+        self._target_class_label.setText(f"Target class: {record.label}")
+        self._queue_class_btn.setEnabled(
+            self._stage in {"classification", "scan"}
+            and self._current_state is not None
+            and bool(self._current_state.feature_rows)
+        )
+        self._sample_status.setText(
+            f"{len(self._class_records)} class(es), {sum(len(rec.sample_indices) for rec in self._class_records.values())} labeled sample(s)."
+        )
+        rows = ()
+        if self._current_state is not None:
+            rows = self._current_state.feature_rows or self._current_state.preview_rows
+        self._populate_feature_table(
+            rows,
+            selected_indices=set(record.sample_indices),
+        )
+        self._refresh_class_tree()
+        self._ensure_class_card_visible(key)
+        self._render_current_state()
+
+    def _select_class_rows_from_combo(self) -> None:
+        if self._active_class_key:
+            self._set_active_class_key(self._active_class_key)
+
+    def _queue_class_from_active(self) -> None:
+        if self._current_state is None or not self._active_class_key:
+            self._show_status("Select a class row before queueing a class.")
+            return
+        self._set_active_class_key(self._active_class_key)
+        self._scan_selected_features()
+
+    def _add_class(self) -> None:
+        label = self._next_default_class_name()
+        self._ensure_class_record(label, placeholder_name=True)
+        self._class_expanded_keys.add(label.strip().lower())
+        self._set_active_class_key(label)
+        self._class_add_mode = True
+        self._target_class_label.setText(f"Target class: {label}")
+        self._queue_class_btn.setEnabled(
+            self._stage in {"classification", "scan"}
+            and self._current_state is not None
+            and bool(self._current_state.feature_rows)
+        )
+        self._sample_status.setText(f"{len(self._class_records)} feature-class row(s) ready.")
+        self._show_status(f"Added {label}.")
+        self._ensure_class_card_visible(label)
+
+    def _next_default_class_name(self) -> str:
+        existing = {rec.label.strip().lower() for rec in self._class_records.values()}
+        idx = 1
+        while True:
+            label = f"Name {idx}"
+            if label.lower() not in existing:
+                return label
+            idx += 1
+
+    def _ensure_class_record(self, label: str, *, placeholder_name: bool = False) -> _ClassRecord:
+        key = str(label).strip().lower()
+        if not key:
+            label = self._next_default_class_name()
+            key = label.lower()
+        record = self._class_records.get(key)
+        if record is not None:
+            if placeholder_name:
+                record.name_is_placeholder = True
+            return record
+        record = _ClassRecord(
+            key=key,
+            label=str(label).strip() or key,
+            color=self._register_class_color(label),
+            name_is_placeholder=bool(placeholder_name),
+            encoder="raw",
+            threshold="gmm",
+            crop_size=48,
+        )
+        self._class_records[key] = record
+        if self._current_state is not None:
+            self._current_state.class_colors[key] = record.color
+        self._refresh_class_tree()
+        return record
+
+    def _refresh_class_tree(self) -> None:
+        if self._class_list_layout is None:
+            return
+        self._building_table = True
+        try:
+            self._class_widgets.clear()
+            self._clear_layout(self._class_list_layout)
+            if self._current_state is None or not self._class_records:
+                if self._class_empty_label is not None:
+                    self._class_empty_label.setVisible(True)
+                if self._class_list_content is not None:
+                    self._class_list_content.setVisible(False)
+                self._target_class_label.setText("Target class: none")
+                self._sample_status.setText("No Feature-classes labelled yet.")
+                return
+            if self._class_empty_label is not None:
+                self._class_empty_label.setVisible(False)
+            if self._class_list_content is not None:
+                self._class_list_content.setVisible(True)
+            records = sorted(self._class_records.values(), key=lambda item: item.label.lower())
+            for record in records:
+                record.status = (
+                    f"{len(record.sample_indices)} sample(s) labeled."
+                    if record.sample_indices
+                    else "No samples labeled yet."
+                )
+                widgets = self._build_class_card(record)
+                self._class_widgets[record.key] = widgets
+                self._class_list_layout.addWidget(widgets.root)
+        finally:
+            self._building_table = False
+        self._update_class_summary_text()
+        self._update_all_class_card_styles()
+
+    def _clear_layout(self, layout: QVBoxLayout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+                continue
+            child_layout = item.layout()
+            if child_layout is not None:
+                self._clear_layout(child_layout)  # type: ignore[arg-type]
+
+    def _build_class_card(self, record: _ClassRecord) -> _ClassRowWidgets:
+        root = QFrame()
+        root.setObjectName("previewClassCard")
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(4, 4, 4, 4)
+        root_layout.setSpacing(3)
+
+        header = _ClickableFrame()
+        header.setObjectName("previewClassHeader")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(6, 4, 6, 4)
+        header_layout.setSpacing(6)
+
+        arrow_btn = QToolButton()
+        arrow_btn.setCheckable(True)
+        arrow_btn.setChecked(record.key in self._class_expanded_keys)
+        arrow_btn.setArrowType(Qt.ArrowType.DownArrow if arrow_btn.isChecked() else Qt.ArrowType.RightArrow)
+        arrow_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        arrow_btn.setProperty("role", "toggle")
+
+        name_label = QLabel(record.label)
+        name_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+        swatch = QWidget()
+        swatch.setFixedSize(38, 14)
+        swatch.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+        count_label = QLabel(str(len(record.sample_indices)))
+        count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        count_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+        delete_btn = QPushButton("Delete")
+        delete_btn.setProperty("role", "danger")
+        delete_btn.setMinimumHeight(24)
+
+        header_layout.addWidget(arrow_btn)
+        header_layout.addWidget(name_label, 1)
+        header_layout.addWidget(swatch)
+        header_layout.addWidget(count_label)
+        header_layout.addStretch(1)
+        header_layout.addWidget(delete_btn)
+
+        body = QWidget()
+        body.setObjectName("previewClassBody")
+        body_layout = QFormLayout(body)
+        body_layout.setContentsMargins(2, 2, 2, 2)
+        body_layout.setHorizontalSpacing(8)
+        body_layout.setVerticalSpacing(3)
+
+        name_edit = QLineEdit(record.label)
+        name_edit.setPlaceholderText(record.label)
+        if record.name_is_placeholder:
+            name_edit.setText("")
+        self._style_control(name_edit)
+
+        encoder = _WheelGuardComboBox()
+        encoder.addItems(["raw", "pca_kmeans", "auto"])
+        encoder.setCurrentText(record.encoder)
+        self._style_control(encoder)
+
+        threshold = _WheelGuardComboBox()
+        threshold.addItems(["gmm", "otsu", "distribution"])
+        threshold.setCurrentText(record.threshold)
+        self._style_control(threshold)
+
+        crop_size = QSpinBox()
+        crop_size.setRange(16, 256)
+        crop_size.setValue(record.crop_size)
+        crop_size.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self._style_control(crop_size)
+
+        status = QLabel(record.status)
+        status.setWordWrap(True)
+
+        body_layout.addRow("Class name", name_edit)
+        body_layout.addRow("Encoding", encoder)
+        body_layout.addRow("Threshold", threshold)
+        body_layout.addRow("Crop size", crop_size)
+        body_layout.addRow("Status", status)
+
+        root_layout.addWidget(header)
+        root_layout.addWidget(body)
+
+        widgets = _ClassRowWidgets(
+            root=root,
+            header=header,
+            body_scroll=body,
+            arrow_btn=arrow_btn,
+            name_label=name_label,
+            swatch=swatch,
+            count_label=count_label,
+            delete_btn=delete_btn,
+            name_edit=name_edit,
+            encoder=encoder,
+            threshold=threshold,
+            crop_size=crop_size,
+            status=status,
+        )
+
+        header.clicked.connect(lambda key=record.key: self._toggle_active_class_key(key))
+        arrow_btn.toggled.connect(lambda checked, key=record.key: self._set_class_card_expanded(key, checked))
+        delete_btn.clicked.connect(lambda _=False, key=record.key: self._delete_class(key))
+        name_edit.editingFinished.connect(lambda key=record.key: self._rename_class_from_widget(key))
+        encoder.currentIndexChanged.connect(lambda *_args, key=record.key: self._update_class_settings_from_widget(key))
+        threshold.currentIndexChanged.connect(lambda *_args, key=record.key: self._update_class_settings_from_widget(key))
+        crop_size.valueChanged.connect(lambda *_args, key=record.key: self._update_class_settings_from_widget(key))
+
+        self._update_class_card_visual(record.key, widgets)
+        return widgets
+
+    def _update_class_summary_text(self) -> None:
+        if self._current_state is None:
+            return
+        total = sum(len(rec.sample_indices) for rec in self._class_records.values())
+        if self._class_records:
+            self._sample_status.setText(f"{len(self._class_records)} class(es), {total} labeled sample(s).")
+        else:
+            self._sample_status.setText("No Feature-classes labelled yet.")
+
+    def _update_class_card_visual(self, key: str, widget: _ClassRowWidgets | None = None) -> None:
+        record = self._class_records.get(key)
+        widgets = widget or self._class_widgets.get(key)
+        if record is None or widgets is None:
+            return
+        active = key == self._active_class_key
+        expanded = key in self._class_expanded_keys
+        widgets.root.setProperty("active", active)
+        widgets.header.setProperty("active", active)
+        widgets.name_label.setText(record.label)
+        widgets.count_label.setText(str(len(record.sample_indices)))
+        widgets.status.setText(record.status)
+        widgets.swatch.setStyleSheet(
+            f"background-color: {record.color}; border: 1px solid {_theme.DARK_BORDER}; border-radius: 4px;"
+        )
+        header_sheet = (
+            f"QFrame#previewClassHeader {{background-color: #3A638F; border: 1px solid {_theme.AMBER}; border-radius: 5px;}}"
+            if active
+            else "QFrame#previewClassHeader {background-color: #2E5279; border: 1px solid rgba(255,255,255,0.12); border-radius: 5px;}"
+        )
+        widgets.header.setStyleSheet(
+            header_sheet
+            + (
+                f"QFrame#previewClassHeader QLabel {{color: {_theme.DARK_WHITE}; background: transparent; font-weight: 700;}}"
+                "QFrame#previewClassHeader QToolButton {"
+                f"background-color: #35507A; color: {_theme.DARK_WHITE}; border: 1px solid rgba(255,255,255,0.10); border-radius: 4px; padding: 2px 6px; min-width: 22px; min-height: 22px;}}"
+                "QFrame#previewClassHeader QToolButton:hover {background-color: #406089;}"
+                "QFrame#previewClassHeader QPushButton[role=\"danger\"] {min-height: 22px; padding: 2px 8px; min-width: 54px;}"
+            )
+        )
+        widgets.body_scroll.setStyleSheet(f"QWidget#previewClassBody {{background-color: {_theme.DARK_SURFACE};}}")
+        widgets.arrow_btn.blockSignals(True)
+        try:
+            widgets.body_scroll.setVisible(expanded)
+            widgets.arrow_btn.setChecked(expanded)
+            widgets.arrow_btn.setArrowType(
+                Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+            )
+        finally:
+            widgets.arrow_btn.blockSignals(False)
+
+    def _update_all_class_card_styles(self) -> None:
+        for key in list(self._class_widgets.keys()):
+            self._update_class_card_visual(key)
+
+    def _set_class_card_expanded(self, key: str, expanded: bool) -> None:
+        widgets = self._class_widgets.get(key)
+        if widgets is None:
+            return
+        if expanded:
+            self._class_expanded_keys.add(key)
+        else:
+            self._class_expanded_keys.discard(key)
+        widgets.body_scroll.setVisible(bool(expanded))
+        self._update_class_card_visual(key, widgets)
+        if expanded and self._controls_scroll is not None:
+            self._controls_scroll.ensureWidgetVisible(widgets.root, 0, 8)
+
+    def _ensure_class_card_visible(self, key: str) -> None:
+        widgets = self._class_widgets.get(key)
+        if widgets is None or self._controls_scroll is None:
+            return
+        self._controls_scroll.ensureWidgetVisible(widgets.root, 0, 8)
+
+    def _rename_class_from_widget(self, key: str) -> None:
+        record = self._class_records.get(key)
+        widget = self._class_widgets.get(key)
+        if record is None or widget is None:
+            return
+        new_label = widget.name_edit.text().strip()
+        if not new_label:
+            if record.name_is_placeholder:
+                widget.name_edit.setText("")
+            else:
+                widget.name_edit.setText(record.label)
+            return
+        new_key = new_label.lower()
+        if new_key != key and new_key in self._class_records:
+            widget.name_edit.setText(record.label)
+            return
+        if new_key != key:
+            self._class_records.pop(key, None)
+            self._class_records[new_key] = record
+            self._class_widgets[new_key] = widget
+            self._class_widgets.pop(key, None)
+            if key in self._class_expanded_keys:
+                self._class_expanded_keys.discard(key)
+                self._class_expanded_keys.add(new_key)
+            for mapping in (self._current_state.sample_labels if self._current_state else {}, self._current_state.classifications if self._current_state else {}):
+                for idx, label in list(mapping.items()):
+                    if str(label).strip().lower() == key:
+                        mapping[idx] = new_label
+            if self._current_state is not None and key in self._current_state.class_colors:
+                self._current_state.class_colors[new_key] = self._current_state.class_colors.pop(key)
+            if self._active_class_key == key:
+                self._active_class_key = new_key
+        record.key = new_key
+        record.label = new_label
+        record.name_is_placeholder = False
+        self._update_class_settings_from_widget(new_key)
+        self._refresh_class_tree()
+        if self._current_state is not None and self._current_state.feature_rows:
+            self._populate_feature_table(
+                self._current_state.feature_rows,
+                selected_indices=self._selected_feature_indices_from_table(),
+            )
+        self._render_current_state()
+
+    def _update_class_settings_from_widget(self, key: str) -> None:
+        record = self._class_records.get(key)
+        widget = self._class_widgets.get(key)
+        if record is None or widget is None:
+            return
+        edited_label = widget.name_edit.text().strip()
+        if edited_label:
+            record.label = edited_label
+            record.name_is_placeholder = False
+        elif not record.name_is_placeholder:
+            widget.name_edit.setText(record.label)
+        else:
+            widget.name_edit.setText("")
+        record.encoder = str(widget.encoder.currentText())
+        record.threshold = str(widget.threshold.currentText())
+        record.crop_size = int(widget.crop_size.value())
+        record.status = f"{len(record.sample_indices)} sample(s) labeled."
+        widget.status.setText(record.status)
+        widget.count_label.setText(str(len(record.sample_indices)))
+        if self._current_state is not None:
+            self._current_state.class_colors[key] = record.color
+        self._update_class_card_visual(key, widget)
+        self._refresh_class_tree()
+
+    def _delete_class(self, key: str) -> None:
+        record = self._class_records.pop(key, None)
+        self._class_widgets.pop(key, None)
+        self._class_expanded_keys.discard(key)
+        if record is None:
+            return
+        if self._current_state is not None:
+            for idx, label in list(self._current_state.sample_labels.items()):
+                if str(label).strip().lower() == key:
+                    self._current_state.sample_labels.pop(idx, None)
+            for idx, label in list(self._current_state.classifications.items()):
+                if str(label).strip().lower() == key:
+                    self._current_state.classifications.pop(idx, None)
+            self._current_state.class_colors.pop(key, None)
+        if self._active_class_key == key:
+            self._active_class_key = ""
+            self._class_add_mode = False
+            self._queue_class_btn.setEnabled(False)
+            self._target_class_label.setText("Target class: none")
+        if self._class_records:
+            self._sample_status.setText(f"{len(self._class_records)} feature-class row(s) ready.")
+        else:
+            self._sample_status.setText("No Feature-classes labelled yet.")
+        self._refresh_class_tree()
+        if self._current_state is not None and self._current_state.feature_rows:
+            self._populate_feature_table(
+                self._current_state.feature_rows,
+                selected_indices=self._selected_feature_indices_from_table(),
+            )
+        self._render_current_state()
+
+    def _selected_feature_indices_from_active_class(self) -> set[int]:
+        record = self._active_class_record()
+        return set(record.sample_indices) if record is not None else set()
+
+    def _assign_feature_to_active_class(self, feature_index: int) -> None:
+        if self._current_state is None or not self._active_class_key:
+            return
+        record = self._class_records.get(self._active_class_key)
+        if record is None:
+            return
+        label = record.label
+        for key, other in self._class_records.items():
+            if feature_index in other.sample_indices and key != self._active_class_key:
+                other.sample_indices.discard(feature_index)
+        record.sample_indices.add(feature_index)
+        record.status = f"{len(record.sample_indices)} sample(s) labeled."
+        self._current_state.sample_labels[feature_index] = label
+        self._current_state.classifications[feature_index] = label
+        self._current_state.class_colors[self._active_class_key] = record.color
+        self._preview_selected_indices = set(record.sample_indices)
+        self._sync_feature_table_for_selection(feature_index, checked=True)
+        self._sync_feature_table_for_class_labels()
+        self._refresh_class_tree()
+        self._render_current_state()
+
+    def _sync_feature_table_for_selection(self, feature_index: int, *, checked: bool) -> None:
+        if self._feature_table.rowCount() == 0:
+            if self._current_state is not None and self._current_state.feature_rows == () and self._current_state.preview_rows:
+                if checked:
+                    self._preview_selected_indices.add(feature_index)
+                else:
+                    self._preview_selected_indices.discard(feature_index)
+            return
+        self._building_table = True
+        try:
+            for row_idx in range(self._feature_table.rowCount()):
+                item = self._feature_table.item(row_idx, 0)
+                if item is None:
+                    continue
+                data = item.data(Qt.ItemDataRole.UserRole)
+                if isinstance(data, int) and data == feature_index:
+                    item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+                    self._feature_table.selectRow(row_idx)
+                    self._feature_table.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtCenter)
+                    break
+        finally:
+            self._building_table = False
+
+    def _sync_feature_table_for_class_labels(self) -> None:
+        if self._current_state is None or self._feature_table.rowCount() == 0:
+            return
+        self._building_table = True
+        try:
+            for row_idx in range(self._feature_table.rowCount()):
+                item = self._feature_table.item(row_idx, 0)
+                if item is None:
+                    continue
+                data = item.data(Qt.ItemDataRole.UserRole)
+                if isinstance(data, int):
+                    label = self._row_class_label(data)
+                    self._feature_table.item(row_idx, 3).setText(label)
+        finally:
+            self._building_table = False
 
     def _set_all_selected(self, checked: bool) -> None:
         if self._current_state is None:
@@ -2193,6 +3233,9 @@ class PreviewPanel(QWidget):
 
     def _toggle_feature_selection(self, feature_index: int) -> None:
         if self._zero_plane_mode:
+            return
+        if self._class_add_mode and self._active_class_key:
+            self._assign_feature_to_active_class(feature_index)
             return
         matched = False
         for row_idx in range(self._feature_table.rowCount()):
@@ -2492,12 +3535,12 @@ class PreviewPanel(QWidget):
     def _on_group_scan_thread_done(self) -> None:
         self._stop_scan_btn.setEnabled(False)
         self._scan_groups_btn.setEnabled(
-            self._stage == "classification"
+            self._stage in {"classification", "scan"}
             and self._current_state is not None
             and bool(self._current_state.feature_rows)
         )
         self._scan_selected_btn.setEnabled(
-            self._stage == "classification"
+            self._stage in {"classification", "scan"}
             and self._current_state is not None
             and bool(self._current_state.feature_rows)
         )
@@ -2604,32 +3647,137 @@ class PreviewPanel(QWidget):
                 item.setToolTip(str(path))
                 item.setData(Qt.ItemDataRole.UserRole, str(path))
                 self._recent_list.addItem(item)
+            if hasattr(self, "_recent_empty_label"):
+                self._recent_empty_label.setVisible(self._recent_list.count() == 0)
+            if hasattr(self, "_recent_label"):
+                self._recent_label.setVisible(self._recent_list.count() > 0)
+            self._recent_list.setVisible(self._recent_list.count() > 0)
         finally:
             self._recent_list.blockSignals(False)
 
     def _section_label(self, text: str) -> QLabel:
         label = QLabel(text)
-        label.setStyleSheet("color: #111; font-weight: 700; margin-top: 4px;")
+        label.setObjectName("previewSection")
         return label
 
     def _style_control(self, widget: QWidget) -> None:
         widget.setStyleSheet("""
             QWidget {
-                background-color: #ffffff;
-                color: #111111;
-                border: 1px solid #9a9a9a;
-                border-radius: 3px;
-                padding: 2px 6px;
+                background-color: %s;
+                color: %s;
+                border: 1px solid %s;
+                border-radius: 4px;
+                padding: 4px 8px;
                 min-height: 24px;
             }
-        """)
+            QWidget:focus {
+                border: 1px solid %s;
+            }
+        """ % (
+            _theme.DARK_SURFACE,
+            _theme.DARK_TEXT,
+            _theme.DARK_BORDER,
+            _theme.DARK_BLUE,
+        ))
 
     def _style_button(self, widget: QPushButton) -> None:
-        widget.setStyleSheet("""
-            QPushButton {
+        widget.setProperty("role", "primary")
+        self._apply_button_style(widget, "primary")
+
+    def _apply_preview_button_styles(self) -> None:
+        for widget in self.findChildren(QPushButton):
+            role = str(widget.property("role") or "").strip().lower()
+            if role:
+                self._apply_button_style(widget, role)
+        for widget in self.findChildren(QToolButton):
+            role = str(widget.property("role") or "").strip().lower()
+            if role:
+                self._apply_button_style(widget, role)
+
+    def _apply_button_style(self, widget: QWidget, role: str) -> None:
+        selector = "QToolButton" if isinstance(widget, QToolButton) else "QPushButton"
+        role = (role or "primary").strip().lower()
+        if role == "accent":
+            widget.setStyleSheet(f"""
+                {selector} {{
+                    background-color: {_theme.AMBER};
+                    color: #1A1A1A;
+                    border: 1px solid #FFD166;
+                    border-radius: 4px;
+                    min-height: 28px;
+                    padding: 4px 10px;
+                    font-weight: 800;
+                }}
+                {selector}:hover {{ background-color: #E09A00; }}
+                {selector}:disabled {{
+                    background-color: #22344D;
+                    color: {_theme.DARK_TEXT_MUTED};
+                    border: 1px solid #2B4565;
+                }}
+            """)
+            return
+        if role == "danger":
+            widget.setStyleSheet(f"""
+                {selector} {{
+                    background-color: #7f1d1d;
+                    color: {_theme.DARK_WHITE};
+                    border: 1px solid #ef4444;
+                    border-radius: 4px;
+                    min-height: 28px;
+                    padding: 4px 10px;
+                    font-weight: 700;
+                }}
+                {selector}:hover {{ background-color: #991b1b; }}
+                {selector}:disabled {{
+                    background-color: #22344D;
+                    color: {_theme.DARK_TEXT_MUTED};
+                    border: 1px solid #2B4565;
+                }}
+            """)
+            return
+        if role == "toggle":
+            widget.setStyleSheet(f"""
+                {selector} {{
+                    background-color: #315982;
+                    color: {_theme.DARK_WHITE};
+                    border: 1px solid #5A7DA6;
+                    border-radius: 4px;
+                    min-height: 28px;
+                    padding: 4px 10px;
+                    font-weight: 700;
+                }}
+                {selector}:hover {{ background-color: #3D6B99; }}
+                {selector}:checked {{
+                    background-color: {_theme.DARK_BLUE};
+                    color: #061122;
+                    border: 1px solid #93C5FD;
+                }}
+                {selector}:disabled {{
+                    background-color: #22344D;
+                    color: {_theme.DARK_TEXT_MUTED};
+                    border: 1px solid #2B4565;
+                }}
+            """)
+            return
+        widget.setStyleSheet(f"""
+            {selector} {{
+                background-color: {_theme.DARK_BLUE};
+                color: #061122;
+                border: 1px solid #93C5FD;
+                border-radius: 4px;
                 min-height: 28px;
-                padding: 4px 8px;
-            }
+                padding: 4px 10px;
+                font-weight: 700;
+            }}
+            {selector}:hover {{
+                background-color: #93C5FD;
+                border-color: #BFDBFE;
+            }}
+            {selector}:disabled {{
+                background-color: #22344D;
+                color: {_theme.DARK_TEXT_MUTED};
+                border: 1px solid #2B4565;
+            }}
         """)
 
     def _slider_row(self, slider: QSlider, value_label: QLabel) -> QWidget:
@@ -2663,37 +3811,30 @@ class PreviewPanel(QWidget):
 
     def _set_stage(self, stage: str) -> None:
         self._stage = stage
-        self._segmentation_section.setVisible(stage == "segmentation")
+        self._initial_section.setExpanded(stage in {"raw", "segmentation"})
+        self._classification_section.setExpanded(stage in {"classification", "scan"})
+        self._scan_section.setExpanded(stage == "scan")
         self._features_btn.setVisible(stage == "segmentation")
         self._features_btn.setEnabled(stage == "segmentation" and self._current_state is not None and self._current_state.preview_rows is not None)
-        self._classification_section.setVisible(stage == "classification")
-        self._label_btn.setVisible(stage == "classification")
+        self._label_btn.setVisible(stage in {"classification", "scan"})
         self._classify_btn.setVisible(stage == "classification")
-        self._scan_selected_btn.setVisible(stage == "classification")
-        self._scan_groups_btn.setVisible(stage == "classification")
-        self._stop_scan_btn.setVisible(stage == "classification")
-        self._select_class_btn.setVisible(stage == "classification")
-        self._queue_class_btn.setVisible(stage == "classification")
-        self._label_btn.setEnabled(stage == "classification" and self._current_state is not None and bool(self._current_state.feature_rows))
+        self._scan_selected_btn.setVisible(stage in {"classification", "scan"})
+        self._scan_groups_btn.setVisible(stage in {"classification", "scan"})
+        self._stop_scan_btn.setVisible(stage in {"classification", "scan"})
+        self._queue_class_btn.setVisible(stage in {"classification", "scan"})
+        self._label_btn.setEnabled(stage in {"classification", "scan"} and self._current_state is not None and bool(self._current_state.feature_rows))
         self._classify_btn.setEnabled(stage == "classification" and self._current_state is not None and bool(self._current_state.feature_rows))
-        self._scan_selected_btn.setEnabled(stage == "classification" and self._current_state is not None and bool(self._current_state.feature_rows))
-        self._scan_groups_btn.setEnabled(stage == "classification" and self._current_state is not None and bool(self._current_state.feature_rows))
-        class_enabled = stage == "classification" and self._current_state is not None and bool(self._current_state.feature_rows)
-        self._select_class_btn.setEnabled(class_enabled and self._class_pick_combo.count() > 0)
-        self._queue_class_btn.setEnabled(class_enabled and self._class_pick_combo.count() > 0)
-        self._flatten_section.setVisible(stage in {"raw", "segmentation"} and not self._flatten_collapsed)
-        if stage == "raw":
-            self._background_btn.setVisible(True)
-            self._zero_plane_btn.setVisible(True)
-            self._reset_btn.setVisible(True)
-        elif stage == "segmentation":
-            self._background_btn.setVisible(True)
-            self._zero_plane_btn.setVisible(True)
-            self._reset_btn.setVisible(True)
-        elif stage == "classification":
-            self._background_btn.setVisible(False)
-            self._zero_plane_btn.setVisible(False)
-            self._reset_btn.setVisible(True)
+        can_scan = stage in {"classification", "scan"} and self._current_state is not None and bool(self._current_state.feature_rows)
+        self._scan_selected_btn.setEnabled(can_scan)
+        self._scan_groups_btn.setEnabled(can_scan)
+        followup_running = bool(self._scan_worker is not None and self._scan_worker.isRunning())
+        group_running = bool(self._group_scan_worker is not None and self._group_scan_worker.isRunning())
+        self._stop_scan_btn.setEnabled(stage in {"classification", "scan"} and (followup_running or group_running))
+        class_enabled = self._current_state is not None and bool(self._current_state.feature_rows) and bool(self._class_records)
+        self._queue_class_btn.setEnabled(stage in {"classification", "scan"} and class_enabled and bool(self._active_class_key))
+        self._background_btn.setVisible(stage in {"raw", "segmentation"})
+        self._zero_plane_btn.setVisible(stage in {"raw", "segmentation"})
+        self._reset_btn.setVisible(stage in {"raw", "segmentation", "classification", "scan"})
         self._reset_btn.setEnabled(self._current_scan is not None)
 
     def _on_segmentation_slider_changed(self, value: int) -> None:
@@ -2708,8 +3849,14 @@ class PreviewPanel(QWidget):
                 self._current_state.sample_labels.clear()
                 self._current_state.classifications.clear()
                 self._current_state.class_colors.clear()
+                self._class_records.clear()
+                self._class_widgets.clear()
+                self._active_class_key = ""
+                self._class_add_mode = False
+                self._class_expanded_keys.clear()
                 self._clear_feature_table()
                 self._preview_selected_indices.clear()
+                self._sample_status.setText("No Feature-classes labelled yet.")
         elif self._stage == "segmentation" and self._current_state is not None and not self._current_state.feature_rows:
             self._preview_selected_indices = self._selected_feature_indices_from_table()
         self._schedule_live_segmentation()

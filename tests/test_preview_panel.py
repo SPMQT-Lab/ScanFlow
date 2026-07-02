@@ -122,7 +122,7 @@ def test_preview_panel_background_and_detection_are_user_driven(tmp_path) -> Non
     assert panel._feature_table.item(0, 0).checkState() == Qt.CheckState.Checked
 
 
-def test_preview_panel_labels_selected_features(tmp_path) -> None:
+def test_preview_panel_creates_default_class_names_and_allows_deselect(tmp_path) -> None:
     app = QApplication.instance() or QApplication([])
     source = tmp_path / FIXTURE.name
     shutil.copy2(FIXTURE, source)
@@ -143,15 +143,174 @@ def test_preview_panel_labels_selected_features(tmp_path) -> None:
     for feature_index in (first, second, third):
         panel._toggle_feature_selection(feature_index)
 
-    panel._sample_name_edit.setText("class-a")
     panel._label_selected_samples()
 
-    assert panel._current_state.sample_labels[first] == "class-a"
-    assert panel._current_state.sample_labels[second] == "class-a"
-    assert panel._current_state.sample_labels[third] == "class-a"
-    assert panel._feature_table.item(0, 3).text() == "class-a"
-    assert panel._feature_table.item(1, 3).text() == "class-a"
-    assert panel._feature_table.item(2, 3).text() == "class-a"
+    assert panel._current_state.sample_labels[first] == "Name 1"
+    assert panel._current_state.sample_labels[second] == "Name 1"
+    assert panel._current_state.sample_labels[third] == "Name 1"
+    assert panel._feature_table.item(0, 3).text() == "Name 1"
+    assert panel._feature_table.item(1, 3).text() == "Name 1"
+    assert panel._feature_table.item(2, 3).text() == "Name 1"
+
+    active = panel._active_class_record()
+    assert active is not None
+    widgets = panel._class_widgets[active.key]
+    card_margins = widgets.root.layout().getContentsMargins()
+    header_margins = widgets.header.layout().getContentsMargins()
+    assert panel._class_list_layout.spacing() <= 2
+    assert max(card_margins) <= 4
+    assert max(header_margins) <= 6
+    assert widgets.name_edit.text() == ""
+    assert widgets.name_edit.placeholderText() == "Name 1"
+    assert not widgets.body_scroll.isHidden()
+
+    panel._set_stage("scan")
+    panel._set_stage("classification")
+    assert panel._current_class_key() == active.key
+    assert panel._class_widgets[active.key].header.property("active") is True
+    panel._set_active_class_key(active.key)
+    assert panel._selected_feature_indices_from_table() == {first, second, third}
+    widgets = panel._class_widgets[active.key]
+
+    panel._set_class_card_expanded(active.key, False)
+    assert widgets.body_scroll.isHidden()
+
+    panel._toggle_active_class_key(active.key)
+    assert panel._current_class_key() == ""
+    assert not panel._queue_class_btn.isEnabled()
+    assert panel._selected_feature_indices_from_table().isdisjoint({first, second, third})
+
+
+def test_preview_panel_scan_tray_exposes_direct_scan_actions(tmp_path) -> None:
+    app = QApplication.instance() or QApplication([])
+    source = tmp_path / FIXTURE.name
+    shutil.copy2(FIXTURE, source)
+
+    panel = PreviewPanel(STMClient())
+    panel.handle_scan_completed(str(source))
+    _wait_until(app, lambda: panel._current_scan is not None)
+
+    panel._apply_background()
+    _wait_until(app, lambda: panel._current_state is not None and panel._current_state.corrected_plane is not None)
+    panel._detect_features()
+    _wait_until(app, lambda: panel._feature_table.rowCount() > 0)
+    panel._apply_segmentation_settings()
+
+    assert panel._features_btn.property("role") == "accent"
+    assert panel._classify_btn.property("role") == "accent"
+    assert panel._scan_selected_btn.property("role") == "primary"
+    assert panel._queue_class_btn.property("role") == "primary"
+    assert panel._source_section._toggle.objectName() == "previewTrayHeader"
+    assert panel._classification_section._toggle.objectName() == "previewTrayHeader"
+    assert panel._scan_section._toggle.objectName() == "previewTrayHeader"
+    for button in (
+        panel._scan_selected_btn,
+        panel._queue_class_btn,
+        panel._scan_groups_btn,
+        panel._stop_scan_btn,
+    ):
+        assert "background-color" in button.styleSheet()
+        assert "border:" in button.styleSheet()
+    assert not panel._scan_selected_btn.isHidden()
+    assert not panel._scan_groups_btn.isHidden()
+    assert panel._scan_selected_btn.isEnabled()
+    assert panel._scan_groups_btn.isEnabled()
+    assert not panel._stop_scan_btn.isEnabled()
+
+    panel._add_class()
+    assert panel._queue_class_btn.isEnabled()
+
+
+def test_preview_panel_allocates_next_default_class_name(tmp_path) -> None:
+    app = QApplication.instance() or QApplication([])
+    source = tmp_path / FIXTURE.name
+    shutil.copy2(FIXTURE, source)
+
+    panel = PreviewPanel(STMClient())
+    panel.handle_scan_completed(str(source))
+    _wait_until(app, lambda: panel._current_scan is not None)
+    panel._apply_background()
+    _wait_until(app, lambda: panel._current_state is not None and panel._current_state.corrected_plane is not None)
+    panel._detect_features()
+    _wait_until(app, lambda: panel._feature_table.rowCount() > 0)
+    panel._apply_segmentation_settings()
+
+    panel._add_class()
+    panel._toggle_active_class_key(panel._current_class_key())
+
+    panel._add_class()
+    active = panel._active_class_record()
+    assert active is not None
+    assert active.label == "Name 2"
+    assert active.key == "name 2"
+    assert panel._class_widgets[active.key].name_edit.text() == ""
+    assert panel._class_widgets[active.key].name_edit.placeholderText() == "Name 2"
+
+
+def test_preview_panel_can_assign_samples_to_multiple_default_classes(tmp_path) -> None:
+    app = QApplication.instance() or QApplication([])
+    source = tmp_path / FIXTURE.name
+    shutil.copy2(FIXTURE, source)
+
+    panel = PreviewPanel(STMClient())
+    panel.handle_scan_completed(str(source))
+    _wait_until(app, lambda: panel._current_scan is not None)
+    panel._apply_background()
+    _wait_until(app, lambda: panel._current_state is not None and panel._current_state.corrected_plane is not None)
+    panel._detect_features()
+    _wait_until(app, lambda: panel._feature_table.rowCount() > 0)
+    panel._apply_segmentation_settings()
+
+    assert panel._current_state is not None
+    rows = panel._current_state.feature_rows[:3]
+    assert len(rows) == 3
+
+    panel._add_class()
+    panel._toggle_feature_selection(rows[0].index)
+    panel._label_selected_samples()
+
+    panel._set_all_selected(False)
+    panel._add_class()
+    panel._toggle_feature_selection(rows[1].index)
+    panel._label_selected_samples()
+
+    panel._set_all_selected(False)
+    panel._add_class()
+    panel._toggle_feature_selection(rows[2].index)
+    panel._label_selected_samples()
+
+    labels = panel._current_state.sample_labels
+    assert labels[rows[0].index] == "Name 1"
+    assert labels[rows[1].index] == "Name 2"
+    assert labels[rows[2].index] == "Name 3"
+
+
+def test_preview_panel_preserves_zoom_when_selecting_samples(tmp_path) -> None:
+    app = QApplication.instance() or QApplication([])
+    source = tmp_path / FIXTURE.name
+    shutil.copy2(FIXTURE, source)
+
+    panel = PreviewPanel(STMClient())
+    panel.handle_scan_completed(str(source))
+    _wait_until(app, lambda: panel._current_scan is not None)
+    panel._apply_background()
+    _wait_until(app, lambda: panel._current_state is not None and panel._current_state.corrected_plane is not None)
+    panel._detect_features()
+    _wait_until(app, lambda: panel._feature_table.rowCount() > 0)
+    panel._apply_segmentation_settings()
+
+    panel._add_class()
+    panel._viewer._plot.setRange(xRange=(20.0, 60.0), yRange=(15.0, 45.0), padding=0.0)
+    before = panel._viewer._plot.viewRange()
+
+    first_index = panel._current_state.feature_rows[0].index
+    panel._toggle_feature_selection(first_index)
+
+    after = panel._viewer._plot.viewRange()
+    assert after[0][0] == before[0][0]
+    assert after[0][1] == before[0][1]
+    assert after[1][0] == before[1][0]
+    assert after[1][1] == before[1][1]
 
 
 def test_preview_panel_reset_analysis_returns_to_raw(tmp_path) -> None:
