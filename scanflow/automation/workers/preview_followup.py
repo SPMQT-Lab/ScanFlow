@@ -277,21 +277,43 @@ class FeatureScanWorker(QThread):
                         dx_nm, dy_nm, method, quality = find_feature_center_offset(
                             quick_image, nm_per_pixel
                         )
-                        pos = self._stm.scan.get_offset_nm()
-                        if pos is not None:
-                            self._stm.scan.set_offset_nm(pos[0] + dx_nm, pos[1] + dy_nm)
-                            center_result = CenteringResult(
-                                feature_idx=row.index,
-                                dx_nm=dx_nm,
-                                dy_nm=dy_nm,
-                                method=method,
-                                quality=quality,
+                        if method == "invalid":
+                            log.warning(
+                                "Auto-center target %d: quick scan unusable "
+                                "(mostly non-finite pixels) — skipping correction",
+                                row.index + 1,
                             )
-                            msg = correction_tracker.add(center_result)
-                            log.info(msg)
-                            self.progress.emit(i, total, msg)
                         else:
-                            log.warning("Auto-center: get_offset_nm() returned None, skipping correction")
+                            # The correction is tip motion like any other:
+                            # route it through the policy gate (scan-idle +
+                            # current check, single-move limit, readback
+                            # verification) instead of raw set_offset_nm.
+                            correction = motion.move_relative_nm(
+                                dx_nm,
+                                dy_nm,
+                                reason=f"auto-center target {row.index + 1}",
+                                settle_s=1.0,
+                            )
+                            if correction.ok:
+                                center_result = CenteringResult(
+                                    feature_idx=row.index,
+                                    dx_nm=dx_nm,
+                                    dy_nm=dy_nm,
+                                    method=method,
+                                    quality=quality,
+                                )
+                                msg = correction_tracker.add(center_result)
+                                log.info(msg)
+                                self.progress.emit(i, total, msg)
+                            else:
+                                log.warning(
+                                    "Auto-center target %d: correction "
+                                    "(%+.2f, %+.2f) nm refused/failed (%s) — "
+                                    "scanning at uncorrected position",
+                                    row.index + 1, dx_nm, dy_nm,
+                                    "; ".join(correction.warnings)
+                                    or correction.reason,
+                                )
                     else:
                         log.warning("Auto-center: quick scan live_data() returned no image, skipping correction")
 

@@ -225,6 +225,11 @@ class DriftTracker:
             return None
 
         corrected = _plane_subtract(arr)
+        # Non-finite pixels survive the (finite-fitted) plane subtraction;
+        # zero-fill them so they contribute nothing to the registration
+        # (the levelled data is ~zero-mean, same convention as the drift
+        # estimators in scanflow.drift.estimators).
+        corrected = np.nan_to_num(corrected, nan=0.0, posinf=0.0, neginf=0.0)
         self._scan_count += 1
 
         if self._prev_image is None:
@@ -462,12 +467,28 @@ class DriftTracker:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _plane_subtract(arr: np.ndarray) -> np.ndarray:
-    """Subtract a least-squares plane from *arr* to remove tilt before registration."""
+    """Subtract a least-squares plane from *arr* to remove tilt before registration.
+
+    NaN-safe: the plane is fitted on FINITE pixels only. Real rigs emit NaN
+    rows in partial/interrupted frames, and fitting through them silently
+    returns an all-NaN result on some LAPACKs and raises "SVD did not
+    converge" on others — either way poisoning every downstream consumer
+    (drift registration, auto-centering). Non-finite pixels stay non-finite
+    in the output; callers decide how to fill them.
+    """
     m, n = arr.shape
     r, c = np.mgrid[:m, :n]
     X = np.column_stack([np.ones(m * n), r.ravel(), c.ravel()])
     Y = arr.ravel()
-    theta, *_ = np.linalg.lstsq(X, Y, rcond=None)
+    mask = np.isfinite(Y)
+    if mask.sum() < 8:
+        # Not enough data for a plane — best effort: remove the median.
+        offset = float(np.nanmedian(arr)) if mask.any() else 0.0
+        return arr - offset
+    try:
+        theta, *_ = np.linalg.lstsq(X[mask], Y[mask], rcond=None)
+    except np.linalg.LinAlgError:
+        return arr - float(np.nanmedian(arr))
     return arr - (X @ theta).reshape(m, n)
 
 

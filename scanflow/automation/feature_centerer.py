@@ -22,8 +22,8 @@ class CenteringResult:
     feature_idx: int
     dx_nm: float        # correction applied to X offset
     dy_nm: float        # correction applied to Y offset
-    method: str         # 'gaussian_fit' | 'centroid' | 'peak'
-    quality: float      # R² (gaussian), mask fraction (centroid), 0.0 (peak)
+    method: str         # 'gaussian_fit' | 'centroid' | 'peak' | 'invalid'
+    quality: float      # R² (gaussian), mask fraction (centroid), 0.0 (peak/invalid)
 
 
 def find_feature_center_offset(
@@ -35,12 +35,29 @@ def find_feature_center_offset(
     Applies plane subtraction first, then cascades:
     1. 2D Gaussian fit (R² > 0.3 required)
     2. Thresholded centroid
-    3. Peak pixel (always succeeds)
+    3. Peak pixel (always succeeds on a usable image)
+
+    An unusable image (mostly NaN — interrupted quick scan, DSP hiccup)
+    returns ``(0, 0, "invalid", 0.0)``: with no valid data every cascade
+    step would land on garbage (the historical failure was the peak-pixel
+    fallback "finding" the image corner and dragging the frame half a
+    width toward it). Callers MUST NOT apply an "invalid" correction.
 
     Sign convention: positive dx means the feature is to the right of the
     image centre, so the offset must be shifted by +dx to re-centre it.
     """
-    arr = _plane_subtract(np.asarray(image, dtype=float))
+    raw = np.asarray(image, dtype=float)
+    finite = np.isfinite(raw)
+    n_finite = int(finite.sum())
+    if n_finite < 16 or n_finite < 0.5 * raw.size:
+        return 0.0, 0.0, "invalid", 0.0
+    arr = _plane_subtract(raw)
+    # Non-finite pixels survive the (finite-fitted) plane subtraction; fill
+    # them with the valid-region median so they read as flat terrace to
+    # every method below instead of poisoning std/argmax.
+    if n_finite < raw.size:
+        arr = np.where(np.isfinite(arr), arr,
+                       float(np.median(arr[np.isfinite(arr)])))
     ny, nx = arr.shape
 
     result = _try_gaussian_fit(arr, ny, nx)

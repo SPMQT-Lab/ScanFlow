@@ -158,6 +158,42 @@ def test_find_offset_always_returns_method_and_quality():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# NaN robustness — partial quick scans / DSP hiccups emit NaN rows
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_all_nan_image_returns_invalid():
+    """Regression: an all-NaN plane fit used to cascade into the peak-pixel
+    fallback, which "found" pixel (0, 0) and returned a confident correction
+    pointing at the image corner — half a frame width of bogus tip motion."""
+    dx, dy, method, quality = find_feature_center_offset(np.full((32, 32), np.nan), 0.2)
+    assert method == "invalid"
+    assert (dx, dy) == (0.0, 0.0)
+    assert quality == 0.0
+
+
+def test_mostly_nan_image_returns_invalid():
+    img = np.full((64, 64), np.nan)
+    img[:8, :] = 0.0  # only 12.5% valid — not enough to trust
+    _, _, method, _ = find_feature_center_offset(img, 0.2)
+    assert method == "invalid"
+
+
+def test_partial_nan_rows_still_center_valid_feature():
+    """NaN rows below the feature must not corrupt the correction."""
+    ny, nx = 64, 64
+    nm_per_pixel = 0.5
+    cy_true, cx_true = 20.0, 40.0
+    img = _gaussian_image(ny=ny, nx=nx, cy=cy_true, cx=cx_true, sigma=5.0, noise=0.01)
+    img[48:, :] = np.nan  # bottom quarter never scanned
+    dx_nm, dy_nm, method, quality = find_feature_center_offset(img, nm_per_pixel)
+    assert method != "invalid"
+    expected_dx = (cx_true - nx / 2.0) * nm_per_pixel
+    expected_dy = (cy_true - ny / 2.0) * nm_per_pixel
+    assert abs(dx_nm - expected_dx) < 3.0 * nm_per_pixel
+    assert abs(dy_nm - expected_dy) < 3.0 * nm_per_pixel
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CorrectionTracker
 # ─────────────────────────────────────────────────────────────────────────────
 

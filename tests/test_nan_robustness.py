@@ -181,3 +181,62 @@ def test_z_monitor_skips_non_finite_samples():
     stats = mon.window_stats(3600)
     assert np.isfinite(stats["ptp_A"])
     assert np.isfinite(stats["drift_A_per_h"])
+
+
+# ── plane subtraction + drift tracker: NaN frames must not poison motion ──
+
+def test_plane_subtract_fits_finite_pixels_only():
+    """_plane_subtract must fit the plane on finite pixels only.
+
+    Fitting through NaN rows returned an all-NaN array on this platform
+    (and raises "SVD did not converge" on others), which cascaded into the
+    auto-center peak-pixel fallback "finding" the image corner and dragging
+    the scan frame half a width toward it.
+    """
+    from scanflow.automation.scan_metrics import _plane_subtract
+
+    rng = np.random.default_rng(3)
+    y, x = np.mgrid[:64, :64].astype(float)
+    img = 0.05 * x + 0.02 * y + rng.normal(0.0, 0.001, (64, 64))
+    img[40:, :] = np.nan  # interrupted frame
+
+    out = _plane_subtract(img)
+    finite = np.isfinite(out)
+    assert finite[:40].all(), "valid region must survive"
+    assert not finite[40:].any(), "NaN pixels stay NaN — callers decide filling"
+    assert np.abs(out[finite]).max() < 0.05, "tilt must actually be removed"
+
+
+def test_drift_tracker_survives_nan_frames():
+    """DriftTracker.add_scan must never raise or return non-finite values
+    when consecutive frames contain NaN rows."""
+    from scanflow.automation.scan_metrics import DriftTracker
+
+    rng = np.random.default_rng(5)
+    base = rng.normal(0.0, 0.01, (64, 64))
+    base[10:14, 20:24] += 1.0  # a feature to register on
+    a = base.copy()
+    a[50:, :] = np.nan
+    b = np.roll(base, (1, 2), axis=(0, 1))
+    b[50:, :] = np.nan
+
+    tracker = DriftTracker()
+    assert tracker.add_scan(a, nm_per_pixel=0.2) is None  # reference frame
+    record = tracker.add_scan(b, nm_per_pixel=0.2)        # must not raise
+    if record is not None:
+        assert np.isfinite(
+            [record.dx_nm, record.dy_nm, record.speed_nm_min]
+        ).all()
+
+
+def test_find_feature_center_offset_rejects_mostly_nan_image():
+    """The auto-center cascade must refuse an unusable quick scan instead
+    of returning a confident garbage correction (see feature_centerer)."""
+    from scanflow.automation.feature_centerer import find_feature_center_offset
+
+    img = np.full((64, 64), np.nan)
+    img[:8, :] = 0.0  # only 12.5% valid
+    dx, dy, method, quality = find_feature_center_offset(img, 0.2)
+    assert method == "invalid"
+    assert dx == 0.0 and dy == 0.0
+    assert quality == 0.0
