@@ -157,10 +157,14 @@ def tile_targets_nm(
     for idx, cx_px, cy_px in tile_centers_in_wide_pixels(cfg):
         # X: centre convention — straight pixel-from-centre conversion.
         dx_nm = (cx_px - wpx / 2.0) * nm_per_px_x
-        # Y: top-edge convention — subtract half a tile (in pixels) from
-        # the tile-centre row to get the tile's top-edge row, so
-        # dy = row * tile_h (0 for the top row).
-        dy_nm = (cy_px - wpy / (2.0 * max(cfg.grid_n, 1))) * nm_per_px_y
+        # Y: top-edge convention — the tile's top edge sits half a TILE
+        # height above the tile centre. Subtract tile_h/2 in nm, NOT half
+        # a grid cell in pixels: the two only coincide for the auto tile
+        # size (tile_h == wide_h/grid_n); with an overridden tile_size_nm
+        # (overlap/gaps) the grid-cell version shifted every tile in Y by
+        # (tile_h − wide_h/grid_n)/2. For the auto size this still reduces
+        # to dy = row · tile_h (0 for the top row).
+        dy_nm = cy_px * nm_per_px_y - tile_h / 2.0
         target_x = home_x_nm + dx_nm
         target_y = home_y_nm + dy_nm
         clamped_x, clamped_y = clamp_frame_to_wide_bounds(

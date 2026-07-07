@@ -213,6 +213,31 @@ def test_tile_targets_5x5_bottom_rows_not_clamped():
         assert y == pytest.approx(80.0), f"tile {idx}"
 
 
+def test_tile_targets_custom_tile_size_centres_on_grid_centres():
+    """An overridden tile_size_nm must keep tiles CENTRED on the grid centres.
+
+    Regression: the Y top-edge conversion subtracted half a GRID CELL
+    (wide/grid_n) instead of half a TILE height, so any custom tile size
+    (overlap or gaps) shifted every tile in Y by (tile_h − wide_h/n)/2 —
+    e.g. +5 nm for 40 nm tiles on a 90 nm / 3×3 mosaic.
+    """
+    from scanflow.automation.mosaic import tile_targets_nm
+    # 20 nm tiles on a 100 nm wide field, 3×3 → gaps, nothing clamps.
+    cfg = MosaicConfig(wide_size_nm=(100.0, 100.0), grid_n=3,
+                       tile_size_nm=(20.0, 20.0))
+    targets = list(tile_targets_nm(cfg, 0.0, 0.0))
+    assert all(not clamped for _, _, _, clamped in targets)
+    cell = 100.0 / 3.0
+    for idx, x, y, _ in targets:
+        row = (idx - 1) // 3
+        col = (idx - 1) % 3
+        grid_centre_y = (row + 0.5) * cell   # nm below the wide top edge
+        # Tile top edge = grid centre − tile_h/2 (top-edge convention).
+        assert y == pytest.approx(grid_centre_y - 10.0), f"tile {idx} Y"
+        # X unchanged by tile size: column centres from the wide centre.
+        assert x == pytest.approx((col - 1) * cell), f"tile {idx} X"
+
+
 def test_tile_targets_flag_clamp_for_oversized_tiles():
     """User-forced tile larger than wide/grid must clamp and say so."""
     from scanflow.automation.mosaic import tile_targets_nm
