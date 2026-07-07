@@ -25,9 +25,9 @@ from PySide6.QtCore import QThread, Signal
 from scanflow.core import (
     STMClient,
     ScanParams,
-    SafetyConfig,
     SafetyMonitor,
     TipMotionManager,
+    activity,
 )
 from scanflow.core.scan import (
     estimate_scan_duration_s as _estimate_scan_duration,
@@ -105,19 +105,19 @@ class FeatureGroupScanWorker(QThread):
     # ------------------------------------------------------------------
 
     def run(self) -> None:  # pragma: no cover — exercised on the rig
+        # Background pollers (Z monitor, status bar, temperature) stand
+        # down while this worker owns the COM link — same H7 contention
+        # rule the AutomationRunner follows.
+        activity.begin()
         try:
             if not self._stm.bind_thread():
                 raise RuntimeError("could not bind STM to group-scan worker thread")
 
+            # Default SafetyConfig: the lab's 1 nA tip-crash threshold and
+            # 10 nm retract live in ONE place (core.safety), not re-typed here.
             motion = TipMotionManager(
                 self._stm,
-                safety=SafetyMonitor(
-                    SafetyConfig(
-                        max_current_A=1e-9,
-                        enable_current_check=True,
-                        retract_on_violation_nm=10.0,
-                    )
-                ),
+                safety=SafetyMonitor(),
             )
 
             current = self._stm.scan.read()
@@ -168,6 +168,7 @@ class FeatureGroupScanWorker(QThread):
             log.exception("Group scan failed")
             self.failed.emit(str(exc))
         finally:
+            activity.end()
             try:
                 self._stm.unbind_thread()
             except Exception:

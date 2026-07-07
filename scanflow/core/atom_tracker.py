@@ -34,6 +34,7 @@ from typing import Optional, Tuple
 import numpy as np
 from PySide6.QtCore import QThread, Signal
 
+from . import activity
 from .motion import MotionConfig, MotionResult, TipMotionManager
 from .safety import SafetyMonitor
 
@@ -191,6 +192,11 @@ class _FivePointWorker(QThread):
         # return-to-reference recovery in the finally block.
         self._away_from_ref = False
         self._tip_at_known_position = False
+        # Background pollers (Z monitor, status bar, temperature) stand
+        # down while the probe sequence owns the COM link — same H7
+        # contention rule the AutomationRunner follows. Ends only after
+        # the recovery move, which is COM traffic too.
+        activity.begin()
         try:
             self._run_sequence(stm, motion)
             self._tip_at_known_position = True
@@ -201,6 +207,7 @@ class _FivePointWorker(QThread):
                 if self._away_from_ref and not self._tip_at_known_position:
                     self._recover_to_reference(motion)
             finally:
+                activity.end()
                 stm.unbind_thread()
 
     def _move(self, motion: TipMotionManager, x_nm: float, y_nm: float,
