@@ -149,14 +149,26 @@ class ZMonitor(QObject):
             return self._empty_stats(len(window))
         ts = np.asarray([t for t, _ in window], dtype=float)
         zs = np.asarray([raw * self._scale for _, raw in window], dtype=float)
-        # Least-squares slope, Å per second → Å per hour
-        slope_per_s = float(np.polyfit(ts - ts[0], zs, 1)[0])
+        # Least-squares slope, Å per second → Å per hour. A degenerate time
+        # base (samples closer together than the clock resolution) makes the
+        # fit singular — numpy's LAPACK then raises "SVD did not converge" on
+        # Windows and returns garbage on macOS. No time span means no slope
+        # is measurable, so report zero drift rather than crashing the panel.
+        span_s = float(ts[-1] - ts[0])
+        if span_s <= 1e-6:
+            slope_per_s = 0.0
+        else:
+            try:
+                slope_per_s = float(np.polyfit(ts - ts[0], zs, 1)[0])
+            except np.linalg.LinAlgError:
+                log.debug("window_stats slope fit failed (span=%.3g s)", span_s)
+                slope_per_s = 0.0
         return {
             "ptp_A": float(np.ptp(zs)),
             "std_A": float(np.std(zs)),
             "drift_A_per_h": slope_per_s * 3600.0,
             "n": int(len(window)),
-            "span_s": float(ts[-1] - ts[0]),
+            "span_s": span_s,
         }
 
     def get_samples(self) -> Tuple[np.ndarray, np.ndarray]:
