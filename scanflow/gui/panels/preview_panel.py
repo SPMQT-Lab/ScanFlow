@@ -3554,6 +3554,36 @@ class PreviewPanel(QWidget):
             self._show_status("Stop requested — will halt after current group.")
         self._stop_scan_btn.setEnabled(False)
 
+    def stop_for_close(self) -> None:
+        """Stop background workers when the application closes.
+
+        The scan workers move the tip and own a COM apartment: request a
+        stop, give them 8 s to finish the current scan cleanly, then
+        hard-terminate only as a last resort — terminate skips the COM
+        unbind and STMAFM may need a restart afterwards. The compute
+        workers (load / background / segmentation / classification) touch
+        no hardware; give each a short grace period so Qt does not tear
+        down a still-running thread at shutdown.
+        """
+        for name in ("_scan_worker", "_group_scan_worker"):
+            worker = getattr(self, name, None)
+            if worker is None or not worker.isRunning():
+                continue
+            log.info("Window closing — stopping %s", type(worker).__name__)
+            worker.stop()
+            if not worker.wait(8000):
+                log.warning(
+                    "%s did not exit after 8 s on close — terminating. "
+                    "STMAFM may need a restart.", type(worker).__name__,
+                )
+                worker.terminate()
+                worker.wait(1000)
+        for name in ("_load_worker", "_background_worker",
+                     "_segmentation_worker", "_classification_worker"):
+            worker = getattr(self, name, None)
+            if worker is not None and worker.isRunning():
+                worker.wait(2000)
+
     # ------------------------------------------------------------------
     # Scan status poller
     # ------------------------------------------------------------------

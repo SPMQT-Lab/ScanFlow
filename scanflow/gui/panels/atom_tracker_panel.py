@@ -290,6 +290,26 @@ class AtomTrackerPanel(QWidget):
         if self._auto_chk.isChecked():
             self._run_measurement()
 
+    def stop_for_close(self) -> None:
+        """Wait out a running 5-point sequence when the window closes.
+
+        The worker has no stop flag (a sequence lasts seconds, and aborting
+        mid-probe would leave the tip parked off-reference), so wait for it
+        to finish; hard-terminate only if it is truly stuck — terminate
+        skips the return-to-reference and the COM unbind, so verify the tip
+        position afterwards.
+        """
+        if self._worker is None or not self._worker.isRunning():
+            return
+        log.info("Window closing — waiting for atom-tracker sequence to finish")
+        if not self._worker.wait(10000):
+            log.warning(
+                "Atom-tracker worker did not exit after 10 s on close — "
+                "terminating. Verify the tip position; STMAFM may need a restart."
+            )
+            self._worker.terminate()
+            self._worker.wait(1000)
+
     def _on_result(self, result: TrackResult) -> None:
         self._measure_btn.setEnabled(True)
 

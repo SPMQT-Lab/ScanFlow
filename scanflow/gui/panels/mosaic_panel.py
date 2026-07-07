@@ -19,6 +19,7 @@ Workflow when Start is pressed:
 from __future__ import annotations
 
 import datetime
+import logging
 import time
 from pathlib import Path
 from typing import List
@@ -38,6 +39,8 @@ from scanflow.automation import (
 from scanflow.automation.recipe import format_duration
 from scanflow.gui.preflight import confirm_recipe_preflight
 from scanflow.gui.widgets.pixel_combo import PixelComboBox
+
+log = logging.getLogger(__name__)
 
 
 class MosaicPanel(QWidget):
@@ -560,6 +563,26 @@ class MosaicPanel(QWidget):
             self._runner.pause()
             self._pause_btn.setText("Resume")
             self.log_message.emit("Mosaic pause requested — will hold after current scan")
+
+    def stop_for_close(self) -> None:
+        """Gracefully stop a running mosaic when the main window closes.
+
+        Mirrors SweepPanel.stop_for_close: request a stop (the worker
+        thread sends scan.stop() to Createc), wait up to 8 s for a clean
+        exit, and hard-terminate only as a last resort — terminate skips
+        the COM finally block and STMAFM may need a restart afterwards.
+        """
+        if not self._runner or not self._runner.isRunning():
+            return
+        log.info("Window closing — requesting graceful mosaic stop")
+        self._runner.stop()
+        if not self._runner.wait(8000):
+            log.warning(
+                "Mosaic thread did not exit after 8 s on window close — "
+                "terminating. STMAFM may need a restart."
+            )
+            self._runner.terminate()
+            self._runner.wait(1000)
 
     def _stop_run(self) -> None:
         if not self._runner:

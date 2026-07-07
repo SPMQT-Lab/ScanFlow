@@ -364,8 +364,15 @@ class MainWindow(QMainWindow):
             self._log.close()
         # Stop any running automation first so Createc receives scan.stop()
         # before the COM apartment is torn down. Without this, Createc keeps
-        # scanning indefinitely after ScanFlow exits.
+        # scanning indefinitely after ScanFlow exits. Every panel that owns
+        # a worker thread gets the same treatment — a mosaic, a preview
+        # follow-up batch, or an atom-tracker probe left running at exit is
+        # exactly the 'STMAFM crashed after I closed ScanFlow' recipe.
         self._sweep.stop_for_close()
+        self._mosaic.stop_for_close()
+        self._atom_tracker.stop_for_close()
+        if self._preview_window is not None:
+            self._preview_window.panel.stop_for_close()
         self._temp_poller.stop()
         self._z_monitor.stop()
         self._session.save()
