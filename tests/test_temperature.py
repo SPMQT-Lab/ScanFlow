@@ -45,13 +45,33 @@ class _Client:
 def test_read_pokes_memo_via_setparam_first():
     """Regression (lab 2026-06-22 'no Temperature'): the refresh poke must use
     the real setparam COM method, since ScanFlow's setp does not trigger the
-    STMAFM 4.3+ readout refresh."""
+    STMAFM 4.3+ readout refresh — and it must land BEFORE any T_* read."""
     raw = _RawCom(values={"T_AUXADC6[K]": "4.83"})
     c = _Client(raw=raw)
     TemperatureMonitor(c).read()
-    assert raw.calls[0] == ("setparam", "MEMO_STMAFM", ""), (
-        f"first COM call must be the setparam refresh, got {raw.calls[0]}"
+    poke_idx = next(
+        (i for i, call in enumerate(raw.calls) if call[0] == "setparam"), None
     )
+    assert poke_idx is not None, "setparam refresh poke never happened"
+    assert raw.calls[poke_idx][1] == "MEMO_STMAFM"
+    first_temp_read = next(
+        i for i, call in enumerate(raw.calls)
+        if call[0] == "getparam" and call[1].startswith("T_")
+    )
+    assert poke_idx < first_temp_read, "poke must precede the T_* reads"
+
+
+def test_poke_preserves_scan_memo():
+    """Regression: the poke used to write '' — but MEMO_STMAFM is the same
+    key scan.apply() uses to label saved .dat files, so a temperature poll
+    landing between apply and save blanked the scan's memo. The refresh is
+    triggered by the WRITE, not the value: the poke must write back the
+    memo it just read."""
+    raw = _RawCom(values={"MEMO_STMAFM": "tile_02_iter3_+100mV",
+                          "T_AUXADC6[K]": "4.83"})
+    TemperatureMonitor(_Client(raw=raw)).read()
+    pokes = [c for c in raw.calls if c[0] == "setparam" and c[1] == "MEMO_STMAFM"]
+    assert pokes == [("setparam", "MEMO_STMAFM", "tile_02_iter3_+100mV")]
 
 
 def test_read_values_via_getparam():

@@ -56,16 +56,31 @@ class TemperatureMonitor:
         that does NOT trigger the refresh, which is why the tab stayed at
         "no data" even after the first poke attempt. Try the real
         ``setparam`` first, then fall back to ``setp``. Best-effort.
+
+        The poke VALUE matters: MEMO_STMAFM is the same key scan.apply()
+        uses to label saved .dat files, so a poll landing between apply and
+        save used to blank the scan's memo. The refresh is triggered by the
+        WRITE, not the value — read the current memo and write it back
+        unchanged.
         """
+        memo = ""
+        for reader in ("getparam", "getp"):
+            try:
+                v = self._read_via(reader, "MEMO_STMAFM")
+                if v not in (None, ""):
+                    memo = str(v)
+                    break
+            except Exception:
+                pass
         raw = self._raw()
         if raw is not None:
             try:
-                raw.setparam("MEMO_STMAFM", "")
+                raw.setparam("MEMO_STMAFM", memo)
                 return
             except Exception:
                 pass
         try:
-            self._c.setp("MEMO_STMAFM", "")
+            self._c.setp("MEMO_STMAFM", memo)
         except Exception:
             pass
 
